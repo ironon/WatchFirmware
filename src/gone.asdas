@@ -1,0 +1,50 @@
+// ============================================================
+//  wifi_test.cpp — minimal WiFi.mode() crash test
+//  To use: rename main.cpp to main.cpp.bak, then flash this.
+//  The buzzer will indicate progress:
+//    1 long beep  = reached WiFi.mode()
+//    2 long beeps = survived WiFi.mode()
+//    3 long beeps = survived WiFi.begin()
+//    continuous rapid beeping = made it all the way through
+// ============================================================
+#include <Arduino.h>
+#include <WiFi.h>
+
+#define BUZZER_PIN 21
+
+static void beep(int count) {
+    for (int i = 0; i < count; i++) {
+        digitalWrite(BUZZER_PIN, HIGH); delay(300);
+        digitalWrite(BUZZER_PIN, LOW);  delay(750);
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    delay(5000);  // let supply settle
+
+    // Step 1: about to call WiFi.mode()
+    beep(1);
+    delay(5000);
+
+    WiFi.mode(WIFI_STA);
+
+    // Step 2: survived WiFi.mode()
+    beep(2);
+    delay(500);
+
+    WiFi.begin("test_ssid", "test_pass");  // will fail to connect, that's fine
+    delay(2000);  // give it a moment
+
+    // Step 3: survived WiFi.begin()
+    beep(3);
+}
+
+void loop() {
+    // rapid beeping = made it to loop, all good
+    digitalWrite(BUZZER_PIN, HIGH); delay(80);
+    digitalWrite(BUZZER_PIN, LOW);  delay(80);
+}
