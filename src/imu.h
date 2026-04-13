@@ -22,6 +22,10 @@ extern volatile bool data_ready;
 // Returns true on success, false if the sensor is not detected.
 bool lis3dh_init();
 
+// ISR for the INT1 pin — sets data_ready. Exposed so main.cpp can
+// re-attach it after waking from light sleep.
+void IRAM_ATTR lis3dh_isr();
+
 // Read the latest X/Y/Z acceleration values (in g).
 Accel read_accel();
 

@@ -39,9 +39,8 @@
 // ============================================================
 //  Constants
 // ============================================================
-#define ENFORCEMENT_POLL_INTERVAL_S       5
+#define ENFORCEMENT_POLL_INTERVAL_S       6
 #define BLE_SCAN_INTERVAL_S               60
-#define BLE_SCAN_INTERVAL_INSTANT         300
 #define WIFI_SCAN_INTERVAL_S              60
 #define DORMANT_TO_SLEEP_IDLE_MS       10000
 #define ANCHOR_WIFI_RETRY_INTERVAL_S      30
@@ -83,7 +82,6 @@
 //  Battery event logger
 // ============================================================
 #define BATT_LOG_MAX_ENTRIES        128
-#define BATT_LOG_SAVE_INTERVAL_MS  30000UL   // flush to NVS if dirty, every 30 s
 #define BATT_HEARTBEAT_INTERVAL_MS 300000UL  // periodic voltage sample every 5 min
 
 // ============================================================
@@ -318,8 +316,6 @@ struct BattLogEntry {
 static BattLogEntry g_batt_log[BATT_LOG_MAX_ENTRIES];
 static uint8_t      g_batt_log_head          = 0;   // oldest entry index
 static uint8_t      g_batt_log_count         = 0;   // valid entry count (0–128)
-static bool         g_batt_log_dirty         = false;
-static uint32_t     g_batt_log_last_save_ms  = 0;
 static uint32_t     g_last_batt_heartbeat_ms = 0;
 
 // ============================================================
@@ -369,7 +365,7 @@ static bool uuid_is_zero(const uint8_t *a) {
 // ADC_11db attenuation → ~2450mV full scale at raw 4095.
 static uint16_t read_battery_mv() {
     int raw = analogRead(BATT_ADC_PIN);
-    uint32_t pin_mv = (uint32_t)raw * 2450 / 4095;
+    uint32_t pin_mv = (uint32_t)raw * 330 / 4095;
     return (uint16_t)(pin_mv * 2);
 }
 
@@ -385,7 +381,6 @@ static void outputs_off()       { set_motor(false); set_buzzer(false); }
 static void recalculate_and_rearm();
 static void push_watch_status();
 static void batt_log(const char *event);
-static void batt_log_save();
 static void notify_seen_anchors();
 static void enter_enforcement(Event *e);
 static void exit_enforcement();
@@ -719,7 +714,8 @@ void beep(int count) {
 
 class WatchScanCallbacks : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override {
-        
+        Serial.printf("[SCAN] Found device: %s\n", dev->getName().c_str());
+
         if (!dev->haveManufacturerData()) return;
 
         std::string mfr = dev->getManufacturerData();
@@ -773,7 +769,7 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
         memcpy(uuid, mfr.data() + 4, 16);
         Serial.printf("[SCAN] \"%s\" — Impulse anchor confirmed! RSSI=%d\n",
             dev->getName().c_str(), lastRssi);
-
+       
 #if DEBUG_MODE
         // 2 quick beeps = iBeacon confirmed
         digitalWrite(BUZZER_PIN, HIGH); delay(60);
@@ -794,7 +790,7 @@ static void start_ble_scan() {
     digitalWrite(BUZZER_PIN, HIGH); delay(80);
     digitalWrite(BUZZER_PIN, LOW);
 #endif
-    g_ble_scan->start(BLE_SCAN_INTERVAL_INSTANT, false);
+    g_ble_scan->start(0, false, true);
     g_last_ble_scan_ms = millis();
     batt_log("ble_scan_start");
 }
@@ -988,6 +984,8 @@ static void push_watch_status() {
     buf[pos++] = g_wifi_connected ? 1 : 0;
     buf[pos++] = g_worn           ? 1 : 0;
     uint16_t batt_mv = read_battery_mv();
+    Serial.printf("[STATUS] activity=%d  BT=%d  WiFi=%d  worn=%d  batt_mv=%d\n",
+        act, g_bt_connected, g_wifi_connected, g_worn, batt_mv);
     memcpy(buf + pos, &batt_mv, 2); pos += 2;  // battery millivolts, little-endian
 
     // active event UUID (zeros if none)
@@ -1079,6 +1077,7 @@ static bool is_enforcement_condition_met(const Event *e) {
 // ============================================================
 
 static void enforcement_start(EnforcementProfile prof) {
+ 
     const ProfileDefinition *def = find_profile(prof);
     g_enf.step_idx        = 0;
     g_enf.cycle_count     = 0;
@@ -1189,7 +1188,7 @@ static void exit_enforcement() {
 }
 
 static void recalculate_and_rearm() {
-    beep(1);
+  
     recalculate_day();
     arm_next_boundary();
 
@@ -1201,13 +1200,13 @@ static void recalculate_and_rearm() {
     uint32_t now_min = local_minutes_now();
     // Check if currently inside any event
     for (int i = 0; i < g_today_event_count; i++) {
-        beep(3);
+   
         Event &e = g_today_events[i];
         if (now_min >= e.startTime && now_min < e.endTime) {
             
             if (g_activity_state != STATE_ENFORCEMENT || g_active_event != &e) {
 
-                beep(1);
+               
                 enter_enforcement(&e);
             }
             return;
@@ -1239,14 +1238,32 @@ static void enter_dormant_sleep() {
     }
 
     esp_sleep_enable_timer_wakeup(sleep_us);
+
+    // Detach the edge-triggered ISR before arming level-triggered wakeup.
+    // Both use the same GPIO interrupt-type register; leaving attachInterrupt
+    // active would conflict with gpio_wakeup_enable(HIGH_LEVEL) and prevent
+    // the light-sleep wakeup from firing.
+    detachInterrupt(digitalPinToInterrupt(LIS3DH_INT1));
+
+    // Clear any latched interrupt so INT1 is LOW before we sleep.
+    // If INT1 is already HIGH the wakeup condition is met before we even
+    // sleep, making the motion-wakeup unreliable.
+    lis3dh_clear_int1();
+    data_ready = false;
+
     esp_sleep_enable_gpio_wakeup();
+    Serial.println("[SLEEP] Current interrupt pin level: " + String(digitalRead(LIS3DH_INT1)));
     gpio_wakeup_enable((gpio_num_t)LIS3DH_INT1, GPIO_INTR_HIGH_LEVEL);
     batt_log("pre_sleep");
-    batt_log_save();
-    // BLE wakeup (if supported on this chip)
+   
     esp_light_sleep_start();
 
-    // After wakeup
+    // After wakeup: clear the interrupt that woke us, then re-arm the ISR.
+    lis3dh_clear_int1();
+    data_ready = false;
+    attachInterrupt(digitalPinToInterrupt(LIS3DH_INT1), lis3dh_isr, RISING);
+
+ 
     Serial.println("[STATE] Woke from light sleep");
     batt_log("wake_from_sleep");
     g_activity_state   = STATE_DORMANT;
@@ -1525,28 +1542,15 @@ class WatchAnchorIpCallback : public NimBLECharacteristicCallbacks {
 // ============================================================
 
 static void batt_log_load() {
-    Preferences p;
-    p.begin("battlog", true);
-    g_batt_log_head  = p.getUChar("head",  0);
-    g_batt_log_count = p.getUChar("count", 0);
-    if (g_batt_log_count > BATT_LOG_MAX_ENTRIES) g_batt_log_count = BATT_LOG_MAX_ENTRIES;
-    if (g_batt_log_head  >= BATT_LOG_MAX_ENTRIES) g_batt_log_head = 0;
-    if (g_batt_log_count > 0)
-        p.getBytes("entries", g_batt_log, sizeof(g_batt_log));
-    p.end();
-    Log.notice("BATT loaded %d entries from NVS (head=%d)" CR,
-               (int)g_batt_log_count, (int)g_batt_log_head);
+    g_batt_log_head = 0;
+    g_batt_log_count = 0;
+    memset(g_batt_log, 0, sizeof(g_batt_log));
+    Log.notice("BATT NVS persistence disabled (RAM-only log)" CR);
 }
 
-static void batt_log_save() {
-    Preferences p;
-    p.begin("battlog", false);
-    p.putUChar("head",  g_batt_log_head);
-    p.putUChar("count", g_batt_log_count);
-    p.putBytes("entries", g_batt_log, sizeof(g_batt_log));
-    p.end();
-    g_batt_log_dirty        = false;
-    g_batt_log_last_save_ms = millis();
+static void batt_log_clear() {
+    g_batt_log_head  = 0;
+    g_batt_log_count = 0;
 }
 
 static void batt_log(const char *event) {
@@ -1570,7 +1574,6 @@ static void batt_log(const char *event) {
     e.event[sizeof(e.event) - 1] = '\0';
 
     Log.notice("BATT [%l ms] %DV %s" CR, (long)ts, (double)voltage, event);
-    g_batt_log_dirty = true;
 }
 
 // Send the full log over serial in response to the dump trigger (0xAB).
@@ -1625,6 +1628,7 @@ void setup() {
     Log.begin(LOG_LEVEL_VERBOSE, &Serial);
 
 
+    batt_log_clear();
     
 
     // Hardware pins first so buzzer works for crash reporting
@@ -1736,10 +1740,14 @@ void setup() {
     // CHK 9: BLE scanner setup
     chk_set(9);
     g_ble_scan = NimBLEDevice::getScan();
-    g_ble_scan->setScanCallbacks(&g_scan_cb);
+    g_ble_scan->setScanCallbacks(&g_scan_cb, true);
     g_ble_scan->setActiveScan(false);
-    g_ble_scan->setInterval(1000);
-    g_ble_scan->setWindow(100);
+    // Interval and window in ms. Window must be <= interval.
+    // Equal values = continuous scan (100% duty cycle). A small gap (e.g.
+    // 200/180) leaves the radio breathing room for the concurrent advertising
+    // role without meaningfully reducing detection rate.
+    g_ble_scan->setInterval(200);
+    g_ble_scan->setWindow(180);
     g_ble_scan->setMaxResults(0);
 
     // CHK 10: schedule calculation + boot-time recovery
@@ -1793,6 +1801,8 @@ static int g_last_mday = -1;
 void loop() {
     uint32_t now_ms  = millis();
     uint32_t now_min = local_minutes_now();
+
+  
 
     // ---- IMU motion interrupt ----
     if (data_ready) {
@@ -1857,7 +1867,7 @@ void loop() {
     // ---- BLE scan for anchors (DORMANT or ENFORCEMENT) ----
     if (g_activity_state == STATE_DORMANT || g_activity_state == STATE_ENFORCEMENT) {
         if (!g_ble_scan->isScanning() &&
-            (now_ms - g_last_ble_scan_ms) > (uint32_t)BLE_SCAN_INTERVAL_S * 1000UL) {
+            ((now_ms - g_last_ble_scan_ms) > (uint32_t)BLE_SCAN_INTERVAL_S * 1000UL) || g_last_ble_scan_ms == 0) {
             start_ble_scan();
             g_last_activity_ms = now_ms;
         }
@@ -1867,10 +1877,7 @@ void loop() {
     if (g_activity_state == STATE_DORMANT && g_next_boundary_min <= now_min) {
         // Check for an event starting now
         for (int i = 0; i < g_today_event_count; i++) {
-            if (g_today_events[i].startTime == now_min && should_enforce()) {
-                enter_enforcement(&g_today_events[i]);
-                break;
-            }
+            if (g_today_events[i].startTime == now_min & 
         }
         arm_next_boundary();
         g_last_activity_ms = now_ms;
@@ -1885,6 +1892,7 @@ void loop() {
             // Periodic condition poll
             if ((now_ms - g_last_enf_poll_ms) > (uint32_t)ENFORCEMENT_POLL_INTERVAL_S * 1000UL) {
                 g_last_enf_poll_ms = now_ms;
+               
                 check_enforcement_condition();
             } else {
                 // Advance profile playback between polls
@@ -1911,10 +1919,7 @@ void loop() {
         if (cmd == 0xAB) {
             batt_log_dump_serial();
         } else if (cmd == 0xAC) {
-            g_batt_log_head  = 0;
-            g_batt_log_count = 0;
-            g_batt_log_dirty = true;
-            batt_log_save();
+            batt_log_clear();
             Serial.println("BATTLOG_CLEARED");
         }
     }
@@ -1923,12 +1928,6 @@ void loop() {
     if (now_ms - g_last_batt_heartbeat_ms >= BATT_HEARTBEAT_INTERVAL_MS) {
         g_last_batt_heartbeat_ms = now_ms;
         batt_log("heartbeat");
-    }
-
-    // ---- Periodic NVS save ----
-    if (g_batt_log_dirty &&
-        (now_ms - g_batt_log_last_save_ms) >= BATT_LOG_SAVE_INTERVAL_MS) {
-        batt_log_save();
     }
 
     delay(10);
