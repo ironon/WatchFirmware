@@ -12,6 +12,7 @@
 #include <esp_crc.h>
 #include <esp_random.h>
 #include <esp_sleep.h>
+#include <esp_wifi.h>
 #include <time.h>
 #include <string.h>
 #include "imu.h"
@@ -39,12 +40,22 @@
 // ============================================================
 //  Constants
 // ============================================================
-#define ENFORCEMENT_POLL_INTERVAL_S       6
-#define BLE_SCAN_INTERVAL_S               60
+#define ENFORCEMENT_POLL_INTERVAL_S                60
+#define BLE_SCAN_INTERVAL_S                        60
+#define ENFORCEMENT_BLE_FALLBACK_SCAN_INTERVAL_S  20
+#define ENFORCEMENT_SCAN_DURATION_MS              300
+#define ENFORCEMENT_SCAN_INTERVAL_MS             1000  // BLE scanner slot interval during enforcement
+#define ENFORCEMENT_SCAN_WINDOW_MS                100  // BLE scanner active window (~10% duty cycle)
+#define ENFORCEMENT_IDLE_BEFORE_SLEEP_MS         60000
+#define MINIMUM_BLE_DELAY_DORMANT               5000  // ms before re-arming IMU interrupt in DORMANT
+#define MINIMUM_BLE_DELAY_ENFORCEMENT           3000  // ms before re-arming IMU interrupt in ENFORCEMENT
 #define WIFI_SCAN_INTERVAL_S              60
-#define DORMANT_TO_SLEEP_IDLE_MS       10000
+#define DORMANT_TO_SLEEP_IDLE_MS        5000
 #define ANCHOR_WIFI_RETRY_INTERVAL_S      30
 #define ANCHOR_SEEN_TIMEOUT_S             20
+
+#define DORMANT_SCAN_INTERVAL_MS         300
+#define DORMANT_SCAN_WINDOW_MS           200
 
 #define ANCHOR_UDP_PORT                 5555
 #define UDP_RETRY_COUNT                    3
@@ -77,6 +88,16 @@
 
 // Continuous enforcement flag value
 #define DURATION_CONTINUOUS       0xFFFFFFFFUL
+
+// ============================================================
+//  BLE advertising during dormant sleep
+//  When true: BLE radio stays active (modem sleep) so the
+//  mobile app can wake the watch via an incoming connection.
+//  Increases sleep current; use a long ad interval to mitigate.
+// ============================================================
+#define ADVERTISE_DURING_SLEEP    false
+#define SLEEP_ADV_MIN_INTERVAL_MS 1000   // ms  (1 s)
+#define SLEEP_ADV_MAX_INTERVAL_MS 2000   // ms  (2 s)
 
 // ============================================================
 //  Battery event logger
@@ -236,6 +257,9 @@ static bool          g_is_paired      = false;
 // Connectivity flags
 static bool g_bt_connected   = false;
 static bool g_wifi_connected = false;
+// Set when enforcement disconnects WiFi for an anchor-based event so exit_enforcement
+// knows to attempt reconnection and send_to_anchors knows to reconnect on-demand.
+static bool g_wifi_suspended_for_enforcement = false;
 
 // Settings
 static bool    g_disconnected_is_dormant = true;
@@ -292,6 +316,9 @@ static uint32_t g_last_wifi_scan_ms     = 0;
 static uint32_t g_last_enf_poll_ms      = 0;
 static uint32_t g_last_wifi_retry_ms    = 0;
 static uint32_t g_last_activity_ms      = 0;  // for DORMANT→SLEEP idle timer
+// Timestamp of the last processed motion interrupt. Non-zero means INT1 is still
+// latched HIGH and the re-arm is pending. Reset to 0 when lis3dh_clear_int1() fires.
+static uint32_t g_last_motion_ms        = 0;
 
 // BLE server / characteristics
 static NimBLEServer         *g_ble_server        = nullptr;
@@ -361,12 +388,62 @@ static bool uuid_is_zero(const uint8_t *a) {
 //  Hardware output helpers
 // ============================================================
 
+
+static uint32_t voltage_to_percentage(uint32_t mv) {
+    // Piecewise-linear lookup table mapping voltage (mV) to remaining capacity (%).
+    // Points are derived from a typical 3.7V Li-ion discharge curve at moderate load.
+    // The curve has a steep drop at full charge, a long flat plateau around 3.7–3.9V,
+    // and another steep drop near empty — so a simple linear voltage scale would be
+    // badly wrong. Interpolating between these points keeps the displayed percentage
+    // proportional to actual energy remaining.
+    static const struct { uint32_t mv; uint32_t pct; } curve[] = {
+        { 4200, 100 },
+        { 4150,  95 },
+        { 4110,  90 },
+        { 4080,  85 },
+        { 4020,  80 },
+        { 3980,  75 },
+        { 3950,  70 },
+        { 3910,  65 },
+        { 3870,  60 },
+        { 3830,  55 },
+        { 3790,  50 },
+        { 3750,  45 },
+        { 3710,  40 },
+        { 3670,  35 },
+        { 3630,  30 },
+        { 3590,  25 },
+        { 3550,  20 },
+        { 3510,  15 },
+        { 3450,  10 },
+        { 3370,   5 },
+        { 3270,   0 },
+    };
+    static const int N = sizeof(curve) / sizeof(curve[0]);
+
+    if (mv >= curve[0].mv)     return 100;
+    if (mv <= curve[N - 1].mv) return 0;
+
+    for (int i = 0; i < N - 1; i++) {
+        if (mv <= curve[i].mv && mv > curve[i + 1].mv) {
+            // Linear interpolation between the two surrounding points (integer only).
+            uint32_t v_hi  = curve[i].mv;
+            uint32_t v_lo  = curve[i + 1].mv;
+            uint32_t p_hi  = curve[i].pct;
+            uint32_t p_lo  = curve[i + 1].pct;
+            return p_lo + (mv - v_lo) * (p_hi - p_lo) / (v_hi - v_lo);
+        }
+    }
+    return 0;
+}
 // Returns battery voltage in millivolts. GPIO 3 carries Vbat/2.
 // ADC_11db attenuation → ~2450mV full scale at raw 4095.
 static uint16_t read_battery_mv() {
-    int raw = analogRead(BATT_ADC_PIN);
-    uint32_t pin_mv = (uint32_t)raw * 330 / 4095;
-    return (uint16_t)(pin_mv * 2);
+    int raw = analogRead(BATT_ADC_PIN) * 2;
+    uint32_t pin_mv = (uint32_t) (raw  * 4100/(5744)); 
+    Serial.println("Raw ADC: " + String(raw) + ", Pin mV: " + String(pin_mv));
+    uint32_t device_percentage = voltage_to_percentage(pin_mv);
+    return pin_mv;
 }
 
 static void set_motor(bool on)  { digitalWrite(VIBRO_PIN,  on ? HIGH : LOW); }
@@ -783,14 +860,16 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
 
 static WatchScanCallbacks g_scan_cb;
 
-static void start_ble_scan() {
+// duration_ms: 0 = scan indefinitely (used in DORMANT for thorough discovery).
+//              >0 = bounded scan (used in ENFORCEMENT; 300 ms covers 3 anchor ad windows).
+static void start_ble_scan(uint32_t duration_ms = 300) {
     if (!g_ble_scan) return;
     if (g_ble_scan->isScanning()) return;
 #if DEBUG_MODE
     digitalWrite(BUZZER_PIN, HIGH); delay(80);
     digitalWrite(BUZZER_PIN, LOW);
 #endif
-    g_ble_scan->start(0, false, true);
+    g_ble_scan->start(duration_ms, false, true);
     g_last_ble_scan_ms = millis();
     batt_log("ble_scan_start");
 }
@@ -911,6 +990,12 @@ static void queue_unreachable(const uint8_t *anchor_uuid, const char *name) {
 }
 
 static void send_to_anchors(uint8_t cmd, const Event *e) {
+    // WiFi may have been intentionally disconnected to cut radio contention during
+    // anchor-based enforcement. Reconnect on-demand so the UDP send can proceed.
+    if (!g_wifi_connected && g_wifi_suspended_for_enforcement) {
+        Serial.println("[WiFi] Reconnecting on-demand for anchor UDP send");
+        try_connect_saved_wifi();
+    }
     if (!g_wifi_connected) return;
     uint8_t pkt[33];
     encode_udp_cmd(pkt, cmd, g_watch_uuid, e->id);
@@ -1171,6 +1256,30 @@ static void enter_enforcement(Event *e) {
     g_activity_state = STATE_ENFORCEMENT;
     batt_log("enforcement_enter");
     g_active_event   = e;
+
+    // Reconfigure BLE scanner to low duty cycle to reduce radio-on time.
+    // Stop any running scan first — NimBLE requires the scanner to be idle
+    // before setInterval/setWindow take effect.
+    if (g_ble_scan->isScanning()) g_ble_scan->stop();
+    g_ble_scan->setInterval(ENFORCEMENT_SCAN_INTERVAL_MS);
+    g_ble_scan->setWindow(ENFORCEMENT_SCAN_WINDOW_MS);
+
+    bool anchor_based = (e->criteria == STAY_NEAR || e->criteria == GET_AWAY);
+    if (anchor_based && g_wifi_connected) {
+        // Disconnect WiFi entirely for anchor-based enforcement to eliminate
+        // concurrent BLE + WiFi radio contention. Reconnect on-demand in
+        // send_to_anchors() if a worn-state UDP send is needed.
+        WiFi.disconnect(true);
+        g_wifi_connected = false;
+        g_current_ssid[0] = 0;
+        g_wifi_suspended_for_enforcement = true;
+        batt_log("wifi_suspend_enf");
+    } else if (g_wifi_connected) {
+        // WiFi-based event: keep connected for condition checking but reduce
+        // radio power between DTIM beacon intervals.
+        esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    }
+
     g_enf.condition_met = is_enforcement_condition_met(e);
     if (!g_enf.condition_met) enforcement_start(e->profile);
     push_watch_status();
@@ -1182,6 +1291,20 @@ static void exit_enforcement() {
     batt_log("enforcement_exit");
     g_active_event   = nullptr;
     enforcement_stop();
+
+    // Restore DORMANT BLE scan duty cycle (90%).
+    if (g_ble_scan->isScanning()) g_ble_scan->stop();
+    g_ble_scan->setInterval(DORMANT_SCAN_INTERVAL_MS);
+    g_ble_scan->setWindow(DORMANT_SCAN_WINDOW_MS);
+
+    if (g_wifi_suspended_for_enforcement) {
+        g_wifi_suspended_for_enforcement = false;
+        try_connect_saved_wifi();
+        if (g_wifi_connected) recalculate_and_rearm();
+    } else if (g_wifi_connected) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+    }
+
     arm_next_boundary();
     g_last_activity_ms = millis();
     push_watch_status();
@@ -1249,27 +1372,127 @@ static void enter_dormant_sleep() {
     // If INT1 is already HIGH the wakeup condition is met before we even
     // sleep, making the motion-wakeup unreliable.
     lis3dh_clear_int1();
-    data_ready = false;
+    data_ready        = false;
+    g_last_motion_ms  = 0;   // re-arm was handled here; cancel any pending deferred re-arm
 
     esp_sleep_enable_gpio_wakeup();
     Serial.println("[SLEEP] Current interrupt pin level: " + String(digitalRead(LIS3DH_INT1)));
     gpio_wakeup_enable((gpio_num_t)LIS3DH_INT1, GPIO_INTR_HIGH_LEVEL);
+
+#if ADVERTISE_DURING_SLEEP
+    // Keep BLE radio alive (modem sleep) so the phone can connect and wake
+    // the CPU. Use a long advertising interval to minimise current draw.
+    {
+        NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+        // NimBLE interval units are 0.625 ms
+        pAdv->setMinInterval(SLEEP_ADV_MIN_INTERVAL_MS * 8 / 5);
+        pAdv->setMaxInterval(SLEEP_ADV_MAX_INTERVAL_MS * 8 / 5);
+        pAdv->start();
+    }
+    esp_ble_sleep_enable(); // not a real function
+#endif
+
     batt_log("pre_sleep");
-   
+
     esp_light_sleep_start();
 
     // After wakeup: clear the interrupt that woke us, then re-arm the ISR.
     lis3dh_clear_int1();
-    data_ready = false;
+    data_ready       = false;
+    g_last_motion_ms = 0;
     attachInterrupt(digitalPinToInterrupt(LIS3DH_INT1), lis3dh_isr, RISING);
 
- 
+#if ADVERTISE_DURING_SLEEP
+    // Restore normal advertising interval now that we're awake.
+    {
+        NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+        pAdv->setMinInterval(0);  // revert to NimBLE defaults
+        pAdv->setMaxInterval(0);
+    }
+#endif
+
     Serial.println("[STATE] Woke from light sleep");
     batt_log("wake_from_sleep");
     g_activity_state   = STATE_DORMANT;
     g_last_activity_ms = millis();
     NimBLEDevice::getAdvertising()->start();
     recalculate_and_rearm();
+}
+
+// ============================================================
+//  Enforcement light sleep
+// ============================================================
+
+static void enter_enforcement_sleep() {
+    // Preconditions: condition_met == true, user still, no scan in progress.
+    // Stays in STATE_ENFORCEMENT; wakes to re-check the condition.
+
+    // Stop any active BLE scan before sleeping.
+    if (g_ble_scan && g_ble_scan->isScanning()) g_ble_scan->stop();
+
+    // Sleep for ENFORCEMENT_POLL_INTERVAL_S, but cap at time until event end
+    // so the event never terminates late.
+    uint64_t sleep_us = (uint64_t)ENFORCEMENT_POLL_INTERVAL_S * 1000000ULL;
+    if (g_active_event) {
+        uint32_t now_min = local_minutes_now();
+        if (g_active_event->endTime > now_min) {
+            uint64_t us_to_end = (uint64_t)(g_active_event->endTime - now_min) * 60ULL * 1000000ULL;
+            if (us_to_end < sleep_us) sleep_us = us_to_end;
+        }
+    }
+    if (sleep_us < 1000000ULL) sleep_us = 1000000ULL; // minimum 1 s
+
+    esp_sleep_enable_timer_wakeup(sleep_us);
+
+    detachInterrupt(digitalPinToInterrupt(LIS3DH_INT1));
+    lis3dh_clear_int1();
+    data_ready       = false;
+    g_last_motion_ms = 0;   // cancel any pending deferred re-arm
+
+    esp_sleep_enable_gpio_wakeup();
+    gpio_wakeup_enable((gpio_num_t)LIS3DH_INT1, GPIO_INTR_HIGH_LEVEL);
+
+#if ADVERTISE_DURING_SLEEP
+    {
+        NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+        pAdv->setMinInterval(SLEEP_ADV_MIN_INTERVAL_MS * 8 / 5);
+        pAdv->setMaxInterval(SLEEP_ADV_MAX_INTERVAL_MS * 8 / 5);
+        pAdv->start();
+    }
+    esp_ble_sleep_enable();
+#endif
+
+    batt_log("enf_pre_sleep");
+    esp_light_sleep_start();
+
+    // Wakeup — re-arm ISR.
+    lis3dh_clear_int1();
+    data_ready       = false;
+    g_last_motion_ms = 0;
+    attachInterrupt(digitalPinToInterrupt(LIS3DH_INT1), lis3dh_isr, RISING);
+
+#if ADVERTISE_DURING_SLEEP
+    {
+        NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+        pAdv->setMinInterval(0);
+        pAdv->setMaxInterval(0);
+    }
+#endif
+
+    Serial.println("[STATE] Woke from enforcement sleep");
+    batt_log("enf_wake_from_sleep");
+    g_last_activity_ms = millis();
+    NimBLEDevice::getAdvertising()->start();
+
+    // Force an immediate condition re-check on the next loop iteration.
+    g_last_enf_poll_ms = 0;
+
+    // For anchor-based events, start a bounded scan so the upcoming condition
+    // check has current RSSI data.
+    if (g_active_event &&
+        (g_active_event->criteria == STAY_NEAR || g_active_event->criteria == GET_AWAY)) {
+        start_ble_scan(ENFORCEMENT_SCAN_DURATION_MS);
+    }
 }
 
 // ============================================================
@@ -1484,14 +1707,7 @@ class WatchSettingsCallback : public NimBLECharacteristicCallbacks {
 };
 
 void indicate_successful_boot() {
-    set_buzzer(true);
-    delay(200);
-    set_buzzer(false);
-
-    // delay(1000);
-    // set_motor(true);
-    // delay(50);
-    // set_motor(false);
+    beep(3);
 }
 class WatchAnchorIpCallback : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
@@ -1616,17 +1832,26 @@ static void chk_report_and_clear() {
     delay(800);
 }
 
+void beep_delay() {
+    return;
+}
+
+#define bp beep_delay()
 void setup() {
 
     // disable brownouts  
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
     
+
     Serial.begin(115200);
     uint32_t serialWait = millis();
     while (!Serial && millis() - serialWait < 2000) delay(10);
     delay(100);
     Log.begin(LOG_LEVEL_VERBOSE, &Serial);
 
+    delay(1000);
+
+    bp;
 
     batt_log_clear();
     
@@ -1638,6 +1863,9 @@ void setup() {
     pinMode(BATT_ADC_PIN, INPUT);
     analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);  // effective range 0–2.45V; Vbat/2 max ~2.1V
     outputs_off();
+
+
+    bp;
 
     // chk_report_and_clear();  // beep last crash step if any
 
@@ -1653,6 +1881,9 @@ void setup() {
     } else {
         Serial.println("[SYS] IMU initialized");
     }
+
+    bp;
+
 
     // CHK 2: NVS load
     chk_set(2);
@@ -1675,26 +1906,53 @@ void setup() {
     uuid_to_str(g_watch_uuid, g_watch_uuid_str);
     Serial.printf("[SYS] Watch UUID: %s\n", g_watch_uuid_str);
 
+
+    bp;
+
+
     // CHK 3: load WiFi creds + schedule blob
     chk_set(3);
+    bp;
+
     load_wifi_creds();
+    bp;
+
     load_schedule_blob();
+    bp;
+
     batt_log_load();
+    bp;
+
     g_activity_state = g_is_paired ? STATE_DORMANT : STATE_UNPAIRED;
+
+    
+    bp;
 
     // CHK 4: WiFi mode
     chk_set(4);
+    bp;
     delay(200);
+    bp;
     WiFi.mode(WIFI_STA);
+    
+
+
+    bp; 
 
     // CHK 4b: WiFi connect
     chk_set(14);
     if (g_wifi_cred_count > 0) try_connect_saved_wifi();
 
+
+    bp;
+
     // CHK 5: NimBLE init
     chk_set(5);
     delay(500);
     NimBLEDevice::init(g_watch_uuid_str);
+
+    bp;
+
 
     // CHK 6: GATT server + service
     chk_set(6);
@@ -1702,6 +1960,9 @@ void setup() {
     g_ble_server->setCallbacks(new WatchServerCallbacks());
     NimBLEService *svc = g_ble_server->createService(WATCH_SERVICE_UUID);
 
+
+    bp; 
+    
     // CHK 7: GATT characteristics
     chk_set(7);
     auto *wifiCredChar = svc->createCharacteristic(WATCH_WIFI_CRED_CHAR_UUID,
@@ -1729,6 +1990,7 @@ void setup() {
                                                     NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
     anchorIpChar->setCallbacks(new WatchAnchorIpCallback());
 
+    bp; 
     // CHK 8: start service + advertising
     chk_set(8);
     svc->start();
@@ -1746,8 +2008,8 @@ void setup() {
     // Equal values = continuous scan (100% duty cycle). A small gap (e.g.
     // 200/180) leaves the radio breathing room for the concurrent advertising
     // role without meaningfully reducing detection rate.
-    g_ble_scan->setInterval(200);
-    g_ble_scan->setWindow(180);
+    g_ble_scan->setInterval(DORMANT_SCAN_INTERVAL_MS);
+    g_ble_scan->setWindow(DORMANT_SCAN_WINDOW_MS);
     g_ble_scan->setMaxResults(0);
 
     // CHK 10: schedule calculation + boot-time recovery
@@ -1785,7 +2047,7 @@ void setup() {
 
     Serial.println("[SYS] Boot complete");
     batt_log("boot_complete");
-    indicate_successful_boot();
+    // indicate_successful_boot();
     delay(1000);
     while (!data_ready) delay(10);
     
@@ -1807,14 +2069,29 @@ void loop() {
     // ---- IMU motion interrupt ----
     if (data_ready) {
         data_ready = false;
-        lis3dh_clear_int1(); // clear latched activity interrupt
+        // Do NOT call lis3dh_clear_int1() here. INT1 stays latched HIGH, which
+        // prevents a new RISING edge and mutes the ISR for MINIMUM_BLE_DELAY_*.
+        // The deferred re-arm block below clears it after the delay elapses.
+        g_last_motion_ms   = now_ms;
         g_last_activity_ms = now_ms;
-// #if DEBUG_MODE
-//         digitalWrite(BUZZER_PIN, HIGH); delay(40);
-//         digitalWrite(BUZZER_PIN, LOW);
-// #endif
         if (g_activity_state == STATE_ENFORCEMENT) {
+            if (g_active_event &&
+                (g_active_event->criteria == STAY_NEAR ||
+                 g_active_event->criteria == GET_AWAY)) {
+                start_ble_scan(ENFORCEMENT_SCAN_DURATION_MS);
+            }
             check_enforcement_condition();
+        }
+    }
+
+    // ---- Deferred IMU interrupt re-arm ----
+    if (g_last_motion_ms != 0) {
+        uint32_t rearm_delay = (g_activity_state == STATE_ENFORCEMENT)
+                               ? MINIMUM_BLE_DELAY_ENFORCEMENT
+                               : MINIMUM_BLE_DELAY_DORMANT;
+        if (now_ms - g_last_motion_ms >= rearm_delay) {
+            lis3dh_clear_int1();
+            g_last_motion_ms = 0;
         }
     }
 
@@ -1839,7 +2116,10 @@ void loop() {
     update_worn_state();
 
     // ---- WiFi watchdog ----
-    if (g_wifi_connected && WiFi.status() != WL_CONNECTED) {
+    // Skip if WiFi was deliberately suspended for anchor-based enforcement —
+    // the disconnect is intentional and will be reversed on exit_enforcement.
+    if (!g_wifi_suspended_for_enforcement &&
+        g_wifi_connected && WiFi.status() != WL_CONNECTED) {
         g_wifi_connected = false;
         batt_log("wifi_disconnect");
         g_current_ssid[0] = 0;
@@ -1864,12 +2144,26 @@ void loop() {
         }
     }
 
-    // ---- BLE scan for anchors (DORMANT or ENFORCEMENT) ----
-    if (g_activity_state == STATE_DORMANT || g_activity_state == STATE_ENFORCEMENT) {
+    // ---- BLE scan for anchors ----
+    if (g_activity_state == STATE_DORMANT) {
+        // DORMANT: scan on a fixed interval for anchor discovery and RSSI updates.
         if (!g_ble_scan->isScanning() &&
-            ((now_ms - g_last_ble_scan_ms) > (uint32_t)BLE_SCAN_INTERVAL_S * 1000UL) || g_last_ble_scan_ms == 0) {
+            ((now_ms - g_last_ble_scan_ms) > (uint32_t)BLE_SCAN_INTERVAL_S * 1000UL || g_last_ble_scan_ms == 0)) {
             start_ble_scan();
             g_last_activity_ms = now_ms;
+        }
+    } else if (g_activity_state == STATE_ENFORCEMENT) {
+        // ENFORCEMENT: scan strategy depends on the active event's criteria type.
+        // WiFi-based events need no BLE scan — skip entirely.
+        // Anchor-based events: primary trigger is the IMU motion interrupt (handled
+        // above); this block provides a fallback scan for when the user is still.
+        if (g_active_event &&
+            (g_active_event->criteria == STAY_NEAR || g_active_event->criteria == GET_AWAY)) {
+            if (!g_ble_scan->isScanning() &&
+                ((now_ms - g_last_ble_scan_ms) > (uint32_t)ENFORCEMENT_BLE_FALLBACK_SCAN_INTERVAL_S * 1000UL || g_last_ble_scan_ms == 0)) {
+                
+                start_ble_scan(ENFORCEMENT_SCAN_DURATION_MS);
+            }
         }
     }
 
@@ -1877,7 +2171,10 @@ void loop() {
     if (g_activity_state == STATE_DORMANT && g_next_boundary_min <= now_min) {
         // Check for an event starting now
         for (int i = 0; i < g_today_event_count; i++) {
-            if (g_today_events[i].startTime == now_min & 
+            if (g_today_events[i].startTime == now_min && should_enforce()) {
+                enter_enforcement(&g_today_events[i]);
+                break;
+            }
         }
         arm_next_boundary();
         g_last_activity_ms = now_ms;
@@ -1899,6 +2196,16 @@ void loop() {
                 if (!g_enf.condition_met) enforcement_update();
             }
         }
+    }
+
+    // ---- Enforcement idle sleep ----
+    if (g_activity_state == STATE_ENFORCEMENT &&
+        g_enf.condition_met &&
+        !data_ready &&
+        !(g_ble_scan && g_ble_scan->isScanning()) &&
+        (now_ms - g_last_activity_ms) > ENFORCEMENT_IDLE_BEFORE_SLEEP_MS) {
+        enter_enforcement_sleep();
+        // Returns here after wakeup, still in STATE_ENFORCEMENT.
     }
 
     // ---- Transition to DORMANT_SLEEP ----
@@ -1930,5 +2237,7 @@ void loop() {
         batt_log("heartbeat");
     }
 
+    uint32_t battery_percentage = read_battery_mv();
+    Serial.println("Battery percentage: " + String(battery_percentage) + "%");
     delay(10);
 }
