@@ -1,6 +1,6 @@
 // ============================================================
 //  Watch Firmware  — ESP32-C3-WROOM
-//  See firmware_spec.md for full specification.
+//  See firmware_spec_v2.md for full specification.
 // ============================================================
 #include <Arduino.h>
 #include <NimBLEDevice.h>
@@ -16,6 +16,7 @@
 #include <time.h>
 #include <string.h>
 #include "imu.h"
+#include "proximity.h"
 #include <ArduinoLog.h>
 #include <esp_system.h>
 
@@ -27,8 +28,12 @@
 // ============================================================
 #define BUZZER_PIN    21
 #define VIBRO_PIN     10
-#define TOUCH_GPIO     1
-#define BATT_ADC_PIN   3   // ADC, Vbat/2
+// #define TOUCH_GPIO     1 the touch sensor was a previous version of this firmware, now we use a C81632
+
+#define BATT_ADC_PIN   5   // ADC, Vbat/2
+#define IR_REC 0
+#define IR_EMIT 1
+
 
 // ============================================================
 //  Debug mode  — set to 1 to enable audio debug indicators
@@ -70,9 +75,6 @@
 #define TOUCH_SAMPLE_INTERVAL_MS        1000
 #define TOUCH_CONFIRM_WORN_LEVEL         LOW
 
-// Anchor proximity
-#define ANCHOR_NEAR_RSSI_THRESHOLD_DBM   -78
-
 // Enforcement escalation
 #define INTERVAL_DECREMENT_MS           2000
 
@@ -108,7 +110,10 @@
 // ============================================================
 //  Shared UUIDs  (must match anchor firmware and mobile app)
 // ============================================================
-#define ANCHOR_SERVICE_UUID          "4A0F0001-F8CE-11EE-8001-020304050607"
+#define ANCHOR_SERVICE_UUID               "4A0F0001-F8CE-11EE-8001-020304050607"
+// Proximity engine characteristics (v2 — must match anchor firmware)
+#define ANCHOR_PROX_VECTOR_CHAR_UUID      "4A0F0008-F8CE-11EE-8001-020304050607"
+#define ANCHOR_PROX_SCORE_CHAR_UUID       "4A0F0009-F8CE-11EE-8001-020304050607"
 
 #define WATCH_SERVICE_UUID           "4A0F0010-F8CE-11EE-8001-020304050607"
 #define WATCH_WIFI_CRED_CHAR_UUID    "4A0F0011-F8CE-11EE-8001-020304050607"
@@ -160,11 +165,14 @@ struct Event {
 struct AnchorRecord {
     uint8_t  uuid[16];
     char     name[32];
+    uint8_t  bleMac[6];      // BLE MAC address, big-endian (on-air). Populated on first ad seen.
     int8_t   lastRSSI;
     uint32_t lastSeen;       // Unix timestamp (updated by BLE scan)
     uint32_t ipAddress;      // network byte order; 0 = unknown
     uint32_t ipLastUpdated;
+    uint8_t  lastProxScore;  // last proximity score from this anchor (not persisted)
     bool     valid;
+    bool     bleMacValid;    // true once bleMac has been populated
 };
 
 struct SeenAnchor {
@@ -257,9 +265,6 @@ static bool          g_is_paired      = false;
 // Connectivity flags
 static bool g_bt_connected   = false;
 static bool g_wifi_connected = false;
-// Set when enforcement disconnects WiFi for an anchor-based event so exit_enforcement
-// knows to attempt reconnection and send_to_anchors knows to reconnect on-demand.
-static bool g_wifi_suspended_for_enforcement = false;
 
 // Settings
 static bool    g_disconnected_is_dormant = true;
@@ -441,7 +446,7 @@ static uint32_t voltage_to_percentage(uint32_t mv) {
 static uint16_t read_battery_mv() {
     int raw = analogRead(BATT_ADC_PIN) * 2;
     uint32_t pin_mv = (uint32_t) (raw  * 4100/(5744)); 
-    Serial.println("Raw ADC: " + String(raw) + ", Pin mV: " + String(pin_mv));
+
     uint32_t device_percentage = voltage_to_percentage(pin_mv);
     return pin_mv;
 }
@@ -791,16 +796,23 @@ void beep(int count) {
 
 class WatchScanCallbacks : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override {
-        Serial.printf("[SCAN] Found device: %s\n", dev->getName().c_str());
+        int8_t rssi = (int8_t)dev->getRSSI();
 
+        // Convert NimBLE little-endian address to big-endian (on-air) format.
+        // getBase()->val holds the 6-byte address in NimBLE's internal (LE) order.
+        const uint8_t *native = dev->getAddress().getBase()->val;
+        uint8_t mac_be[6];
+        for (int i = 0; i < 6; i++) mac_be[i] = native[5 - i];
+
+        // Feed every BLE device into the proximity scan cache (§5.4 — ProxScanVector
+        // includes all observed BLE devices, not just Impulse anchors).
+        prox_update_ble_cache(mac_be, 0, rssi);
+
+        // ── Impulse anchor identification (unchanged logic) ──────
         if (!dev->haveManufacturerData()) return;
-
         std::string mfr = dev->getManufacturerData();
-        
-        #if DEBUG_MODE
-        // 1 tiny beep = scan callback firing and found a device with mfr data
-        // digitalWrite(BUZZER_PIN, HIGH); delay(20);
-        // digitalWrite(BUZZER_PIN, LOW);
+
+#if DEBUG_MODE
         Serial.printf("[SCAN] Device: \"%s\" (%s)  mfr_len=%d  bytes: %02X %02X %02X %02X\n",
             dev->getName().c_str(),
             dev->getAddress().toString().c_str(),
@@ -811,50 +823,38 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
             mfr.size() > 3 ? (uint8_t)mfr[3] : 0);
 #endif
 
-        if (mfr.size() < 25) {
-            Serial.printf("[SCAN] \"%s\" — skipping, mfr too short (%d < 25)\n",
-                dev->getName().c_str(), (int)mfr.size());
-          
-            return;
-        }
-        // Impulse company ID (0xFFFF) + type marker (0x02) + length marker (0x15)
-        if ((uint8_t)mfr[0] != 0xFF || (uint8_t)mfr[1] != 0xFF) {
-            Serial.printf("[SCAN] \"%s\" — skipping, not Impulse company ID (got %02X %02X)\n",
-                dev->getName().c_str(), (uint8_t)mfr[0], (uint8_t)mfr[1]);
-            
-            return;
-        }
-        if ((uint8_t)mfr[2] != 0x02 || (uint8_t)mfr[3] != 0x15) {
-            Serial.printf("[SCAN] \"%s\" — skipping, not iBeacon type/length (got %02X %02X)\n",
-                dev->getName().c_str(), (uint8_t)mfr[2], (uint8_t)mfr[3]);
-            
-            return;
-        }
+        if (mfr.size() < 25) return;
+        if ((uint8_t)mfr[0] != 0xFF || (uint8_t)mfr[1] != 0xFF) return;
+        if ((uint8_t)mfr[2] != 0x02 || (uint8_t)mfr[3] != 0x15) return;
+        // Major field must equal 0x4A0F — Impulse namespace fingerprint
+        if ((uint8_t)mfr[20] != 0x4A || (uint8_t)mfr[21] != 0x0F) return;
 
+        uint8_t anchor_uuid[16];
+        memcpy(anchor_uuid, mfr.data() + 4, 16);
 
+        Serial.printf("[SCAN] Impulse anchor confirmed! RSSI=%d\n", rssi);
 
-        // Major field (bytes 20–21) must equal 0x4A0F — Impulse namespace fingerprint.
-        // This filters out third-party iBeacons (AirTags, Tile, etc.).
-        if ((uint8_t)mfr[20] != 0x4A || (uint8_t)mfr[21] != 0x0F) {
-            Serial.printf("[SCAN] \"%s\" — skipping, not Impulse anchor (Major=%02X%02X)\n",
-                dev->getName().c_str(), (uint8_t)mfr[20], (uint8_t)mfr[21]);
-            return;
-        }
-
-        uint8_t uuid[16];
-        int8_t lastRssi = dev->getRSSI();
-        memcpy(uuid, mfr.data() + 4, 16);
-        Serial.printf("[SCAN] \"%s\" — Impulse anchor confirmed! RSSI=%d\n",
-            dev->getName().c_str(), lastRssi);
-       
 #if DEBUG_MODE
-        // 2 quick beeps = iBeacon confirmed
         digitalWrite(BUZZER_PIN, HIGH); delay(60);
         digitalWrite(BUZZER_PIN, LOW);  delay(80);
         digitalWrite(BUZZER_PIN, HIGH); delay(60);
         digitalWrite(BUZZER_PIN, LOW);
 #endif
-        update_seen_anchor(uuid, lastRssi);
+
+        // Populate bleMac in the AnchorRecord if we know this anchor
+        for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+            if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, anchor_uuid)) {
+                if (!g_anchor_records[i].bleMacValid) {
+                    memcpy(g_anchor_records[i].bleMac, mac_be, 6);
+                    g_anchor_records[i].bleMacValid = true;
+                }
+                g_anchor_records[i].lastRSSI = rssi;
+                g_anchor_records[i].lastSeen = (uint32_t)time(nullptr);
+                return;
+            }
+        }
+
+        update_seen_anchor(anchor_uuid, rssi);
     }
 };
 
@@ -990,12 +990,6 @@ static void queue_unreachable(const uint8_t *anchor_uuid, const char *name) {
 }
 
 static void send_to_anchors(uint8_t cmd, const Event *e) {
-    // WiFi may have been intentionally disconnected to cut radio contention during
-    // anchor-based enforcement. Reconnect on-demand so the UDP send can proceed.
-    if (!g_wifi_connected && g_wifi_suspended_for_enforcement) {
-        Serial.println("[WiFi] Reconnecting on-demand for anchor UDP send");
-        try_connect_saved_wifi();
-    }
     if (!g_wifi_connected) return;
     uint8_t pkt[33];
     encode_udp_cmd(pkt, cmd, g_watch_uuid, e->id);
@@ -1135,17 +1129,48 @@ static void notify_seen_anchors() {
 static bool is_enforcement_condition_met(const Event *e) {
     if (!e) return false;
     switch (e->criteria) {
-        case STAY_NEAR: {
-            int8_t rssi = get_anchor_rssi(e->anchorId);
-            Serial.print("[ENFORCEMENT] STAY_NEAR RSSI for the anchor ");
-            Serial.print(convertAnchoridToString(e->anchorId));
-            Serial.println(String(rssi));
-            return rssi != INT8_MIN && rssi >= ANCHOR_NEAR_RSSI_THRESHOLD_DBM;
-        }
+        case STAY_NEAR:
         case GET_AWAY: {
-            int8_t rssi = get_anchor_rssi(e->anchorId);
-                Serial.println("[ENFORCEMENT] GET_AWAY RSSI for the anchor "+ String(rssi));
-            return rssi == INT8_MIN || rssi < ANCHOR_NEAR_RSSI_THRESHOLD_DBM;
+            // Find the anchor record to get its BLE MAC
+            AnchorRecord *rec = nullptr;
+            for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+                Serial.printf("[PROX] Checking anchor record %d: valid=%d  uuid=%s\n", i, g_anchor_records[i].valid, convertAnchoridToString(g_anchor_records[i].uuid).c_str());
+                if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, e->anchorId)) {
+                    rec = &g_anchor_records[i];
+                    break;
+                }
+            }
+
+            if (!rec || !rec->bleMacValid) {
+                // Unknown anchor or no MAC yet — treat as AMBIGUOUS and apply fail-safe
+                Serial.println("[PROX] Anchor MAC unknown — treating as AMBIGUOUS");
+                return (e->criteria == STAY_NEAR); // stayNear: AMBIGUOUS→NEAR (met); getAway: AMBIGUOUS→AWAY (met)
+            }
+
+            // Build scan vector from BLE cache + WiFi AP scan
+            ProxScanVector vec;
+            prox_build_scan_vector(vec);
+
+            // Query the anchor via GATT
+            ProxScoreResult result;
+            bool ok = prox_query_anchor(rec->bleMac, vec, result);
+
+            if (!ok) {
+                Serial.println("[PROX] Anchor query failed — AMBIGUOUS fail-safe");
+                return (e->criteria == STAY_NEAR);
+            }
+
+            rec->lastProxScore = result.score;
+            Serial.printf("[PROX] Score=%d flags=0x%02X\n", result.score, result.flags);
+
+            ProxProximity prox = prox_interpret_score(result.score);
+            if (prox == PROX_AMBIGUOUS) {
+                // Fail-safe: stayNear→NEAR (condition met), getAway→AWAY (condition met)
+                prox = (e->criteria == STAY_NEAR) ? PROX_NEAR : PROX_AWAY;
+            }
+
+            if (e->criteria == STAY_NEAR) return (prox == PROX_NEAR);
+            else                          return (prox == PROX_AWAY);
         }
         case GET_ON_WIFI:
             return g_wifi_connected &&
@@ -1264,19 +1289,10 @@ static void enter_enforcement(Event *e) {
     g_ble_scan->setInterval(ENFORCEMENT_SCAN_INTERVAL_MS);
     g_ble_scan->setWindow(ENFORCEMENT_SCAN_WINDOW_MS);
 
-    bool anchor_based = (e->criteria == STAY_NEAR || e->criteria == GET_AWAY);
-    if (anchor_based && g_wifi_connected) {
-        // Disconnect WiFi entirely for anchor-based enforcement to eliminate
-        // concurrent BLE + WiFi radio contention. Reconnect on-demand in
-        // send_to_anchors() if a worn-state UDP send is needed.
-        WiFi.disconnect(true);
-        g_wifi_connected = false;
-        g_current_ssid[0] = 0;
-        g_wifi_suspended_for_enforcement = true;
-        batt_log("wifi_suspend_enf");
-    } else if (g_wifi_connected) {
-        // WiFi-based event: keep connected for condition checking but reduce
-        // radio power between DTIM beacon intervals.
+    if (g_wifi_connected) {
+        // Keep WiFi connected for all enforcement types.
+        // Anchor-based events need WiFi AP RSSI in the scan vector (§5.4.1).
+        // Use modem sleep between operations to reduce idle current.
         esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
     }
 
@@ -1297,11 +1313,7 @@ static void exit_enforcement() {
     g_ble_scan->setInterval(DORMANT_SCAN_INTERVAL_MS);
     g_ble_scan->setWindow(DORMANT_SCAN_WINDOW_MS);
 
-    if (g_wifi_suspended_for_enforcement) {
-        g_wifi_suspended_for_enforcement = false;
-        try_connect_saved_wifi();
-        if (g_wifi_connected) recalculate_and_rearm();
-    } else if (g_wifi_connected) {
+    if (g_wifi_connected) {
         esp_wifi_set_ps(WIFI_PS_NONE);
     }
 
@@ -1487,8 +1499,8 @@ static void enter_enforcement_sleep() {
     // Force an immediate condition re-check on the next loop iteration.
     g_last_enf_poll_ms = 0;
 
-    // For anchor-based events, start a bounded scan so the upcoming condition
-    // check has current RSSI data.
+    // For anchor-based events, run a bounded BLE scan to refresh the device
+    // cache, then the upcoming condition check will build a fresh ProxScanVector.
     if (g_active_event &&
         (g_active_event->criteria == STAY_NEAR || g_active_event->criteria == GET_AWAY)) {
         start_ble_scan(ENFORCEMENT_SCAN_DURATION_MS);
@@ -1854,7 +1866,8 @@ void setup() {
     bp;
 
     batt_log_clear();
-    
+
+    prox_init_watch();
 
     // Hardware pins first so buzzer works for crash reporting
     pinMode(BUZZER_PIN, OUTPUT);
@@ -2116,10 +2129,7 @@ void loop() {
     update_worn_state();
 
     // ---- WiFi watchdog ----
-    // Skip if WiFi was deliberately suspended for anchor-based enforcement —
-    // the disconnect is intentional and will be reversed on exit_enforcement.
-    if (!g_wifi_suspended_for_enforcement &&
-        g_wifi_connected && WiFi.status() != WL_CONNECTED) {
+    if (g_wifi_connected && WiFi.status() != WL_CONNECTED) {
         g_wifi_connected = false;
         batt_log("wifi_disconnect");
         g_current_ssid[0] = 0;
@@ -2237,7 +2247,6 @@ void loop() {
         batt_log("heartbeat");
     }
 
-    uint32_t battery_percentage = read_battery_mv();
-    Serial.println("Battery percentage: " + String(battery_percentage) + "%");
+
     delay(10);
 }
