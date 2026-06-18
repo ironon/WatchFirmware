@@ -28,11 +28,13 @@
 // ============================================================
 #define BUZZER_PIN    21
 #define VIBRO_PIN     10
-// #define TOUCH_GPIO     1 the touch sensor was a previous version of this firmware, now we use a C81632
 
-#define BATT_ADC_PIN   5   // ADC, Vbat/2
-#define IR_REC 0
-#define IR_EMIT 1
+#define BATT_ADC_PIN   3   // ADC, Vbat/2
+// Worn detection — ITR8307 reflective opto-interrupter (replaces the old
+// capacitive touch sensor). IR_EMIT drives the IR LED; IR_REC reads the
+// phototransistor on an ADC-capable pin.
+#define IR_REC  0          // ADC1_CH0 — phototransistor output
+#define IR_EMIT 1          // IR LED drive (active HIGH)
 
 
 // ============================================================
@@ -45,17 +47,26 @@
 // ============================================================
 //  Constants
 // ============================================================
-#define ENFORCEMENT_POLL_INTERVAL_S                60
+#define ENFORCEMENT_POLL_INTERVAL_S                60  // poll cadence while condition NOT met
+#define ENFORCEMENT_POLL_INTERVAL_MET_S           180  // backed-off cadence while condition IS met (§8.2)
 #define BLE_SCAN_INTERVAL_S                        60
-#define ENFORCEMENT_BLE_FALLBACK_SCAN_INTERVAL_S  20
 #define ENFORCEMENT_SCAN_DURATION_MS              300
 #define ENFORCEMENT_SCAN_INTERVAL_MS             1000  // BLE scanner slot interval during enforcement
 #define ENFORCEMENT_SCAN_WINDOW_MS                100  // BLE scanner active window (~10% duty cycle)
-#define ENFORCEMENT_IDLE_BEFORE_SLEEP_MS         60000
+#define ENFORCEMENT_QUERY_SCAN_DURATION_MS        700  // bounded scan run right before a proximity query
+                                                       // to refresh the cache (aligns scan with query)
+#define PROX_QUERY_SCAN_DUTY_MS                   100  // pre-query scan only: window == interval == ~100%
+                                                       // duty for dense device capture (restored after)
+#define ENFORCEMENT_IDLE_BEFORE_SLEEP_MS         30000
 #define MINIMUM_BLE_DELAY_DORMANT               5000  // ms before re-arming IMU interrupt in DORMANT
 #define MINIMUM_BLE_DELAY_ENFORCEMENT           3000  // ms before re-arming IMU interrupt in ENFORCEMENT
-#define WIFI_SCAN_INTERVAL_S              60
-#define DORMANT_TO_SLEEP_IDLE_MS        5000
+#define WIFI_SCAN_INTERVAL_S             120
+#define DORMANT_TO_SLEEP_IDLE_MS        1500
+// While disconnected, the watch surfaces from DORMANT_SLEEP at least this often
+// to advertise and accept a phone connection (§8.4). Motion is NOT a wake source
+// in DORMANT, so this heartbeat is the only way to reach a still, idle watch.
+// Lower = snappier app connect, higher = less battery. Tunable.
+#define DISCONNECTED_ADV_HEARTBEAT_MS   6000
 #define ANCHOR_WIFI_RETRY_INTERVAL_S      30
 #define ANCHOR_SEEN_TIMEOUT_S             20
 
@@ -70,10 +81,12 @@
 #define UNPAIRED_BEEP_DURATION_MS        200
 #define UNPAIRED_VIBRATE_DURATION_MS     300
 
-// Worn detection (tune per hardware)
-#define TOUCH_DEBOUNCE_SAMPLES             5
-#define TOUCH_SAMPLE_INTERVAL_MS        1000
-#define TOUCH_CONFIRM_WORN_LEVEL         LOW
+// Worn detection via ITR8307 reflective IR sensor (tune per hardware)
+#define IR_WORN_DEBOUNCE_SAMPLES           5     // consecutive equal samples to flip state
+#define IR_WORN_SAMPLE_INTERVAL_MS      1000     // ms between reflection samples
+#define IR_EMIT_SETTLE_US                500     // emitter rise/settle before ADC read
+#define IR_WORN_THRESHOLD                300     // min ambient-subtracted ADC delta to count as worn
+#define IR_WORN_HIGHER_MEANS_WORN       true     // false if the readout is inverted (skin lowers the delta)
 
 // Enforcement escalation
 #define INTERVAL_DECREMENT_MS           2000
@@ -166,6 +179,7 @@ struct AnchorRecord {
     uint8_t  uuid[16];
     char     name[32];
     uint8_t  bleMac[6];      // BLE MAC address, big-endian (on-air). Populated on first ad seen.
+    uint8_t  bleAddrType;    // NimBLE address type as advertised (PUBLIC/RANDOM); used for connect
     int8_t   lastRSSI;
     uint32_t lastSeen;       // Unix timestamp (updated by BLE scan)
     uint32_t ipAddress;      // network byte order; 0 = unknown
@@ -177,6 +191,9 @@ struct AnchorRecord {
 
 struct SeenAnchor {
     uint8_t  uuid[16];
+    uint8_t  bleMac[6];      // BLE MAC (big-endian, on-air) captured from advertisement
+    uint8_t  bleAddrType;    // NimBLE address type as advertised (PUBLIC/RANDOM)
+    bool     bleMacValid;
     int8_t   rssi;
     uint32_t lastSeenMs;
     bool     valid;
@@ -298,11 +315,11 @@ static UnreachableNotification g_unreachable_queue[MAX_UNREACHABLE_QUEUE];
 static int                     g_unreachable_count = 0;
 
 // Worn detection
-static bool    g_worn                                  = false;
-static uint8_t g_worn_buffer[TOUCH_DEBOUNCE_SAMPLES]  = {};
-static int     g_worn_buf_idx                          = 0;
-static int     g_worn_buf_fill                         = 0;
-static uint32_t g_last_touch_sample_ms                 = 0;
+static bool    g_worn                                    = false;
+static uint8_t g_worn_buffer[IR_WORN_DEBOUNCE_SAMPLES]   = {};
+static int     g_worn_buf_idx                            = 0;
+static int     g_worn_buf_fill                           = 0;
+static uint32_t g_last_worn_sample_ms                    = 0;
 
 // Enforcement profile playback state
 struct EnforcementState {
@@ -377,7 +394,7 @@ static void generate_uuid_v4(uint8_t *out) {
 static double get_battery_voltage() {
     // pin 3 is connected to a 1/2 voltage divider from the battery, so multiply ADC reading by 2
     uint16_t adc_reading = analogRead(BATT_ADC_PIN);
-    float voltage = adc_reading * (3.3 / 4095.0) * 2; // voltage divider
+    float voltage = adc_reading * (3.1 / 4095.0) * 2; // voltage divider
     return voltage;
 }
 static bool uuid_eq(const uint8_t *a, const uint8_t *b) {
@@ -445,7 +462,7 @@ static uint32_t voltage_to_percentage(uint32_t mv) {
 // ADC_11db attenuation → ~2450mV full scale at raw 4095.
 static uint16_t read_battery_mv() {
     int raw = analogRead(BATT_ADC_PIN) * 2;
-    uint32_t pin_mv = (uint32_t) (raw  * 4100/(5744)); 
+    uint32_t pin_mv = (uint32_t)(raw * (3100.0 / 4095.0));
 
     uint32_t device_percentage = voltage_to_percentage(pin_mv);
     return pin_mv;
@@ -465,6 +482,7 @@ static void push_watch_status();
 static void batt_log(const char *event);
 static void notify_seen_anchors();
 static void enter_enforcement(Event *e);
+static struct AnchorRecord *ensure_anchor_record(const uint8_t *uuid);
 static void exit_enforcement();
 static void check_enforcement_condition();
 static bool is_enforcement_condition_met(const Event *e);
@@ -689,6 +707,16 @@ static void recalculate_day() {
         }
         g_today_events[j + 1] = key;
     }
+
+    // Ensure an AnchorRecord exists for every anchor referenced by today's
+    // schedule, so the proximity engine and beep delivery can reach them over
+    // BLE without waiting on the app's IP push (§3.3). IP remains optional.
+    for (int i = 0; i < g_today_event_count; i++) {
+        const Event &e = g_today_events[i];
+        if (e.hasAnchorId) ensure_anchor_record(e.anchorId);
+        for (int j = 0; j < e.beepAnchorCount; j++)
+            ensure_anchor_record(e.beepAnchors[j]);
+    }
 }
 
 // ============================================================
@@ -749,13 +777,19 @@ static void arm_next_boundary() {
 
 static NimBLEScan *g_ble_scan = nullptr;
 
-static void update_seen_anchor(const uint8_t *uuid, int rssi) {
+static void update_seen_anchor(const uint8_t *uuid, const uint8_t *mac_be,
+                               uint8_t addr_type, int rssi) {
     uint32_t now_ts = (uint32_t)time(nullptr);
 
     // Update anchor_records if this UUID is known
     for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
         if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, uuid)) {
             Serial.println("[SCAN] Updating anchor record for " + String(g_anchor_records[i].name) + " with RSSI " + String(rssi));
+            if (mac_be && !g_anchor_records[i].bleMacValid) {
+                memcpy(g_anchor_records[i].bleMac, mac_be, 6);
+                g_anchor_records[i].bleAddrType = addr_type;
+                g_anchor_records[i].bleMacValid = true;
+            }
             g_anchor_records[i].lastRSSI = (int8_t)rssi;
             g_anchor_records[i].lastSeen = now_ts;
             return;
@@ -766,6 +800,11 @@ static void update_seen_anchor(const uint8_t *uuid, int rssi) {
     for (int i = 0; i < MAX_SEEN_ANCHORS; i++) {
         if (g_seen_anchors[i].valid && uuid_eq(g_seen_anchors[i].uuid, uuid)) {
             Serial.println("[SCAN] Updating seen anchor with RSSI "+ convertAnchoridToString(g_seen_anchors[i].uuid) + "   RSSI:" + String(rssi));
+            if (mac_be && !g_seen_anchors[i].bleMacValid) {
+                memcpy(g_seen_anchors[i].bleMac, mac_be, 6);
+                g_seen_anchors[i].bleAddrType = addr_type;
+                g_seen_anchors[i].bleMacValid = true;
+            }
             g_seen_anchors[i].rssi       = (int8_t)rssi;
             g_seen_anchors[i].lastSeenMs = millis();
             return;
@@ -777,12 +816,65 @@ static void update_seen_anchor(const uint8_t *uuid, int rssi) {
         if (!g_seen_anchors[i].valid) {
             g_seen_anchors[i].valid      = true;
             memcpy(g_seen_anchors[i].uuid, uuid, 16);
+            if (mac_be) {
+                memcpy(g_seen_anchors[i].bleMac, mac_be, 6);
+                g_seen_anchors[i].bleAddrType = addr_type;
+                g_seen_anchors[i].bleMacValid = true;
+            } else {
+                g_seen_anchors[i].bleMacValid = false;
+            }
             g_seen_anchors[i].rssi       = (int8_t)rssi;
             g_seen_anchors[i].lastSeenMs = millis();
             if (g_bt_connected) notify_seen_anchors();
             break;
         }
     }
+}
+
+// Ensure an AnchorRecord exists for the given anchor UUID, creating one in a
+// free slot if necessary. This decouples record existence from the app's IP
+// push (§3.3): any anchor the schedule references becomes a first-class record
+// so the proximity engine can connect to it over BLE. If the anchor's BLE MAC
+// was already captured during discovery (seen_anchors), copy it in immediately
+// so the first proximity poll doesn't have to wait for the next advertisement.
+// Returns the record, or nullptr if the record table is full.
+static AnchorRecord *ensure_anchor_record(const uint8_t *uuid) {
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, uuid))
+            return &g_anchor_records[i];
+    }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        if (!g_anchor_records[i].valid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        Serial.println("[PROX] ensure_anchor_record: record table full");
+        return nullptr;
+    }
+
+    AnchorRecord &r = g_anchor_records[slot];
+    r = AnchorRecord{};            // zero-init: ipAddress=0, bleMacValid=false, etc.
+    memcpy(r.uuid, uuid, 16);
+    r.valid = true;
+
+    // Promote a previously-seen anchor's captured MAC/RSSI, if available.
+    for (int i = 0; i < MAX_SEEN_ANCHORS; i++) {
+        if (g_seen_anchors[i].valid && uuid_eq(g_seen_anchors[i].uuid, uuid)) {
+            if (g_seen_anchors[i].bleMacValid) {
+                memcpy(r.bleMac, g_seen_anchors[i].bleMac, 6);
+                r.bleAddrType = g_seen_anchors[i].bleAddrType;
+                r.bleMacValid = true;
+            }
+            r.lastRSSI = g_seen_anchors[i].rssi;
+            r.lastSeen = (uint32_t)time(nullptr);
+            break;
+        }
+    }
+
+    Serial.println("[PROX] Created anchor record for " + convertAnchoridToString(uuid) +
+                   (r.bleMacValid ? " (MAC known)" : " (awaiting advertisement)"));
+    return &r;
 }
 
 void beep(int count) {
@@ -803,6 +895,7 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
         const uint8_t *native = dev->getAddress().getBase()->val;
         uint8_t mac_be[6];
         for (int i = 0; i < 6; i++) mac_be[i] = native[5 - i];
+        uint8_t addr_type = dev->getAddress().getType();
 
         // Feed every BLE device into the proximity scan cache (§5.4 — ProxScanVector
         // includes all observed BLE devices, not just Impulse anchors).
@@ -846,6 +939,7 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
             if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, anchor_uuid)) {
                 if (!g_anchor_records[i].bleMacValid) {
                     memcpy(g_anchor_records[i].bleMac, mac_be, 6);
+                    g_anchor_records[i].bleAddrType = addr_type;
                     g_anchor_records[i].bleMacValid = true;
                 }
                 g_anchor_records[i].lastRSSI = rssi;
@@ -854,7 +948,7 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
             }
         }
 
-        update_seen_anchor(anchor_uuid, rssi);
+        update_seen_anchor(anchor_uuid, mac_be, addr_type, rssi);
     }
 };
 
@@ -872,6 +966,35 @@ static void start_ble_scan(uint32_t duration_ms = 300) {
     g_ble_scan->start(duration_ms, false, true);
     g_last_ble_scan_ms = millis();
     batt_log("ble_scan_start");
+}
+
+// One-shot ACTIVE, full-duty BLE scan to densely populate the proximity cache
+// immediately before a query, then restore the low-power passive enforcement
+// scan settings. Active scanning (which transmits scan requests and costs more
+// power) is used ONLY here — never for the background discovery/duty-cycle scans.
+// Blocking: returns once the bounded scan completes.
+static void prox_aligned_active_scan(uint32_t duration_ms) {
+    if (!g_ble_scan) return;
+    if (g_ble_scan->isScanning()) g_ble_scan->stop();
+
+    // Temporarily crank to active + ~100% duty (window == interval).
+    g_ble_scan->setActiveScan(true);
+    g_ble_scan->setInterval(PROX_QUERY_SCAN_DUTY_MS);
+    g_ble_scan->setWindow(PROX_QUERY_SCAN_DUTY_MS);
+
+    g_ble_scan->start(duration_ms, false, true);
+    g_last_ble_scan_ms = millis();
+    batt_log("prox_active_scan");
+    uint32_t t0 = millis();
+    while (g_ble_scan->isScanning() && millis() - t0 < duration_ms + 200) {
+        delay(10);
+    }
+    if (g_ble_scan->isScanning()) g_ble_scan->stop();
+
+    // Restore the low-power passive enforcement scan configuration.
+    g_ble_scan->setActiveScan(false);
+    g_ble_scan->setInterval(ENFORCEMENT_SCAN_INTERVAL_MS);
+    g_ble_scan->setWindow(ENFORCEMENT_SCAN_WINDOW_MS);
 }
 
 // ============================================================
@@ -1065,6 +1188,58 @@ static void push_watch_status() {
     uint16_t batt_mv = read_battery_mv();
     Serial.printf("[STATUS] activity=%d  BT=%d  WiFi=%d  worn=%d  batt_mv=%d\n",
         act, g_bt_connected, g_wifi_connected, g_worn, batt_mv);
+    // print what time it is in local time, and events on the schedule today
+    {   
+        // if no wifi, we may not have a valid time yet, so local_now() may be wrong. print a warning about this
+        if (!g_wifi_connected) {
+            Serial.println("[STATUS] WARNING: WiFi not connected, local time may be inaccurate");
+        }
+
+        time_t lt = local_now();
+        struct tm ti;
+        gmtime_r(&lt, &ti);
+        Serial.printf("[STATUS] local %04d-%02d-%02d %02d:%02d:%02d\n",
+                      ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                      ti.tm_hour, ti.tm_min, ti.tm_sec);
+
+        if (g_today_event_count == 0) {
+            Serial.println("[SCHED] No events today");
+        } else {
+            for (int i = 0; i < g_today_event_count; i++) {
+                const Event &e = g_today_events[i];
+                int sh = e.startTime / 60;
+                int sm = e.startTime % 60;
+                int eh = e.endTime / 60;
+                int em = e.endTime % 60;
+                const char *crit = "?";
+                switch (e.criteria) {
+                    case GET_AWAY:    crit = "GET_AWAY"; break;
+                    case STAY_NEAR:   crit = "STAY_NEAR"; break;
+                    case GET_OFF_WIFI:crit = "GET_OFF_WIFI"; break;
+                    case GET_ON_WIFI: crit = "GET_ON_WIFI"; break;
+                }
+                char id_str[37]; uuid_to_str(e.id, id_str);
+                Serial.printf("[SCHED] %02d:%02d-%02d:%02d id=%s crit=%s prof=%d",
+                              sh, sm, eh, em, id_str, crit, (int)e.profile);
+                if (e.hasAnchorId) {
+                    Serial.print(" anchor=");
+                    Serial.println(convertAnchoridToString(e.anchorId));
+                } else if (e.criteria == GET_ON_WIFI || e.criteria == GET_OFF_WIFI) {
+                    Serial.print(" ssid="); Serial.println(e.wifiSSID);
+                } else {
+                    Serial.println();
+                }
+
+                if (e.beepAnchorCount > 0) {
+                    for (int j = 0; j < e.beepAnchorCount; j++) {
+                        char bstr[37]; uuid_to_str(e.beepAnchors[j], bstr);
+                        Serial.printf("[SCHED]   beep anchor %d: %s\n", j, bstr);
+                    }
+                }
+            }
+        }
+    }
+    
     memcpy(buf + pos, &batt_mv, 2); pos += 2;  // battery millivolts, little-endian
 
     // active event UUID (zeros if none)
@@ -1147,15 +1322,39 @@ static bool is_enforcement_condition_met(const Event *e) {
                 return (e->criteria == STAY_NEAR); // stayNear: AMBIGUOUS→NEAR (met); getAway: AMBIGUOUS→AWAY (met)
             }
 
+            // Align a fresh BLE scan with this query so the cache reflects 'now'
+            // rather than relying on a possibly-stale periodic fallback scan.
+            // Uses a one-shot active, full-duty scan for dense capture (restored
+            // to low-power passive afterward); runs once per poll, blocking.
+            prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+
             // Build scan vector from BLE cache + WiFi AP scan
             ProxScanVector vec;
             prox_build_scan_vector(vec);
 
+            // print amount of dimensions in vector
+            Serial.printf("[PROX] Scan vector has %d dimensions\n", vec.count);
+
             // Query the anchor via GATT
             ProxScoreResult result;
-            bool ok = prox_query_anchor(rec->bleMac, vec, result);
+            bool ok = prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result);
 
             if (!ok) {
+                // Connection establishment fails at much weaker RSSI (~-88 dBm)
+                // than advertisement reception, so a failed connect together
+                // with a weak recent advertisement RSSI is strong evidence the
+                // watch is FAR from the anchor. Use that rather than a blind
+                // AMBIGUOUS fail-safe (which would wrongly treat stayNear as met
+                // when the user has actually walked out of connection range).
+                uint32_t now_ts = (uint32_t)time(nullptr);
+                bool rssi_fresh = rec->lastSeen != 0 &&
+                                  (now_ts - rec->lastSeen) <= (uint32_t)ANCHOR_SEEN_TIMEOUT_S;
+                if (rssi_fresh && rec->lastRSSI <= PROX_FAR_RSSI_THRESHOLD_DBM) {
+                    Serial.printf("[PROX] Connect failed; recent ad RSSI %d <= %d → treating as AWAY (far)\n",
+                                  rec->lastRSSI, PROX_FAR_RSSI_THRESHOLD_DBM);
+                    // Far: stayNear → not near → enforce; getAway → away → met.
+                    return (e->criteria == GET_AWAY);
+                }
                 Serial.println("[PROX] Anchor query failed — AMBIGUOUS fail-safe");
                 return (e->criteria == STAY_NEAR);
             }
@@ -1249,6 +1448,16 @@ static void enforcement_update() {
     set_buzzer(next.buzzer_on);
 }
 
+// Adaptive enforcement poll cadence (§8.2): back off when the user is compliant
+// and stable, poll quickly when not. The IMU motion interrupt still forces an
+// immediate re-check, so this only suppresses redundant polling of a still,
+// compliant user.
+static uint32_t enforcement_poll_interval_ms() {
+    uint32_t s = g_enf.condition_met ? ENFORCEMENT_POLL_INTERVAL_MET_S
+                                     : ENFORCEMENT_POLL_INTERVAL_S;
+    return s * 1000UL;
+}
+
 static void check_enforcement_condition() {
     if (!g_active_event) return;
     bool met = is_enforcement_condition_met(g_active_event);
@@ -1259,6 +1468,7 @@ static void check_enforcement_condition() {
     } else if (!met && g_enf.condition_met) {
         // Condition became not-met → start enforcement
         g_enf.condition_met = false;
+        Serial.println("[ENF] Condition not met — starting enforcement");
         enforcement_start(g_active_event->profile);
     } else if (!met && !g_enf.condition_met) {
         // Still not met: advance profile playback
@@ -1372,24 +1582,24 @@ static void enter_dormant_sleep() {
         sleep_us = (uint64_t)(secs > 0 ? secs : 1) * 1000000ULL;
     }
 
+    // Heartbeat: while disconnected, never sleep past the advertise heartbeat so
+    // a still, idle watch periodically surfaces to advertise and accept a phone
+    // connection (§8.4). The caller only enters dormant sleep when disconnected.
+    uint64_t heartbeat_us = (uint64_t)DISCONNECTED_ADV_HEARTBEAT_MS * 1000ULL;
+    if (sleep_us > heartbeat_us) sleep_us = heartbeat_us;
+
     esp_sleep_enable_timer_wakeup(sleep_us);
 
-    // Detach the edge-triggered ISR before arming level-triggered wakeup.
-    // Both use the same GPIO interrupt-type register; leaving attachInterrupt
-    // active would conflict with gpio_wakeup_enable(HIGH_LEVEL) and prevent
-    // the light-sleep wakeup from firing.
+    // Motion is NOT a wake source in DORMANT (§8.4): outside an enforcement window
+    // there is nothing for motion to trigger, and waking on every wrist movement
+    // was the single largest battery drain. Wake on the timer only. Detach the
+    // edge ISR and disable the INT1 GPIO wake (an earlier enforcement sleep may
+    // have enabled it) so wrist motion stays muted until the next heartbeat.
     detachInterrupt(digitalPinToInterrupt(LIS3DH_INT1));
-
-    // Clear any latched interrupt so INT1 is LOW before we sleep.
-    // If INT1 is already HIGH the wakeup condition is met before we even
-    // sleep, making the motion-wakeup unreliable.
     lis3dh_clear_int1();
     data_ready        = false;
-    g_last_motion_ms  = 0;   // re-arm was handled here; cancel any pending deferred re-arm
-
-    esp_sleep_enable_gpio_wakeup();
-    Serial.println("[SLEEP] Current interrupt pin level: " + String(digitalRead(LIS3DH_INT1)));
-    gpio_wakeup_enable((gpio_num_t)LIS3DH_INT1, GPIO_INTR_HIGH_LEVEL);
+    g_last_motion_ms  = 0;
+    gpio_wakeup_disable((gpio_num_t)LIS3DH_INT1);
 
 #if ADVERTISE_DURING_SLEEP
     // Keep BLE radio alive (modem sleep) so the phone can connect and wake
@@ -1442,9 +1652,10 @@ static void enter_enforcement_sleep() {
     // Stop any active BLE scan before sleeping.
     if (g_ble_scan && g_ble_scan->isScanning()) g_ble_scan->stop();
 
-    // Sleep for ENFORCEMENT_POLL_INTERVAL_S, but cap at time until event end
-    // so the event never terminates late.
-    uint64_t sleep_us = (uint64_t)ENFORCEMENT_POLL_INTERVAL_S * 1000000ULL;
+    // Sleep until the next poll (adaptive cadence — this path runs only while
+    // compliant, so it uses the backed-off MET interval), capped at time until
+    // event end so the event never terminates late.
+    uint64_t sleep_us = (uint64_t)enforcement_poll_interval_ms() * 1000ULL;
     if (g_active_event) {
         uint32_t now_min = local_minutes_now();
         if (g_active_event->endTime > now_min) {
@@ -1522,21 +1733,48 @@ static void on_worn_state_changed(bool is_worn) {
     push_watch_status();
 }
 
+// Pulse the ITR8307 emitter and return the ambient-subtracted reflection level.
+// Reads the phototransistor with the IR LED off (ambient baseline) and on
+// (lit), returning (lit - ambient). With a non-inverting readout, skin contact
+// reflects more IR and raises this delta; an inverting readout lowers it.
+static int ir_sample_reflection() {
+    // Ambient baseline with emitter off
+    digitalWrite(IR_EMIT, LOW);
+    delayMicroseconds(IR_EMIT_SETTLE_US);
+    int ambient = analogRead(IR_REC);
+
+    // Lit reading with emitter on
+    digitalWrite(IR_EMIT, HIGH);
+    delayMicroseconds(IR_EMIT_SETTLE_US);
+    int lit = analogRead(IR_REC);
+
+    digitalWrite(IR_EMIT, LOW);
+    return lit - ambient;
+}
+
+// Decide whether a reflection delta indicates the watch is being worn.
+// IR_WORN_HIGHER_MEANS_WORN selects the circuit polarity.
+static bool ir_reflection_indicates_worn(int reflection) {
+    return IR_WORN_HIGHER_MEANS_WORN ? (reflection >=  IR_WORN_THRESHOLD)
+                                     : (reflection <= -IR_WORN_THRESHOLD);
+}
+
 static void update_worn_state() {
-    if (millis() - g_last_touch_sample_ms < TOUCH_SAMPLE_INTERVAL_MS) return;
-    g_last_touch_sample_ms = millis();
+    if (millis() - g_last_worn_sample_ms < IR_WORN_SAMPLE_INTERVAL_MS) return;
+    g_last_worn_sample_ms = millis();
 
-    uint8_t reading = (digitalRead(TOUCH_GPIO) == TOUCH_CONFIRM_WORN_LEVEL) ? 1 : 0;
+    int     reflection = ir_sample_reflection();
+    uint8_t reading    = ir_reflection_indicates_worn(reflection) ? 1 : 0;
     g_worn_buffer[g_worn_buf_idx] = reading;
-    g_worn_buf_idx = (g_worn_buf_idx + 1) % TOUCH_DEBOUNCE_SAMPLES;
-    if (g_worn_buf_fill < TOUCH_DEBOUNCE_SAMPLES) g_worn_buf_fill++;
+    g_worn_buf_idx = (g_worn_buf_idx + 1) % IR_WORN_DEBOUNCE_SAMPLES;
+    if (g_worn_buf_fill < IR_WORN_DEBOUNCE_SAMPLES) g_worn_buf_fill++;
 
-    if (g_worn_buf_fill < TOUCH_DEBOUNCE_SAMPLES) return;
+    if (g_worn_buf_fill < IR_WORN_DEBOUNCE_SAMPLES) return;
 
     // Check if all readings are the same
     bool all_same = true;
     uint8_t val   = g_worn_buffer[0];
-    for (int i = 1; i < TOUCH_DEBOUNCE_SAMPLES; i++) {
+    for (int i = 1; i < IR_WORN_DEBOUNCE_SAMPLES; i++) {
         if (g_worn_buffer[i] != val) { all_same = false; break; }
     }
     if (!all_same) return;
@@ -1674,7 +1912,7 @@ class WatchSchedCtrlCallback : public NimBLECharacteristicCallbacks {
 
 class WatchSchedDataCallback : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
-   
+       
         if (!g_sched_xfer_act || !g_sched_xfer_buf) return;
         std::string val = pChar->getValue();
         uint32_t remaining = g_sched_xfer_exp - g_sched_xfer_rcvd;
@@ -1735,6 +1973,7 @@ class WatchAnchorIpCallback : public NimBLECharacteristicCallbacks {
             uint32_t ts;
             memcpy(&ts, val.data() + pos, 4); pos += 4;
 
+            Serial.println("[ENF] Processing anchor IP update");
             // Find or create anchor record
             int slot = -1;
             for (int j = 0; j < MAX_ANCHOR_RECORDS; j++) {
@@ -1748,6 +1987,11 @@ class WatchAnchorIpCallback : public NimBLECharacteristicCallbacks {
                 }
             }
             if (slot >= 0) {
+                Serial.printf("[ENF] Anchor record slot %d updated: uuid=%s ip=%u.%u.%u.%u ts=%lu\n",
+                              slot, convertAnchoridToString(uuid).c_str(),
+                              (ip_nbo >> 24) & 0xFF, (ip_nbo >> 16) & 0xFF,
+                              (ip_nbo >> 8) & 0xFF, ip_nbo & 0xFF,
+                              (unsigned long)ts);
                 g_anchor_records[slot].valid         = true;
                 memcpy(g_anchor_records[slot].uuid, uuid, 16);
                 g_anchor_records[slot].ipAddress     = ip_nbo;
@@ -1872,7 +2116,11 @@ void setup() {
     // Hardware pins first so buzzer works for crash reporting
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(VIBRO_PIN,  OUTPUT);
-    pinMode(TOUCH_GPIO, INPUT);
+    // ITR8307 reflective IR worn sensor
+    pinMode(IR_EMIT, OUTPUT);
+    digitalWrite(IR_EMIT, LOW);                       // emitter off until sampled
+    pinMode(IR_REC, INPUT);
+    analogSetPinAttenuation(IR_REC, ADC_11db);        // full-range phototransistor readings
     pinMode(BATT_ADC_PIN, INPUT);
     analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);  // effective range 0–2.45V; Vbat/2 max ~2.1V
     outputs_off();
@@ -1963,6 +2211,11 @@ void setup() {
     chk_set(5);
     delay(500);
     NimBLEDevice::init(g_watch_uuid_str);
+    // Boost BLE TX power to extend usable connection range. Connection
+    // establishment fails at much weaker RSSI than advertisement reception, so
+    // the default (~0 dBm) leaves the proximity query failing while ads are
+    // still heard. (Boost the anchor's TX power the same way for full benefit.)
+    NimBLEDevice::setPower(9);  // +9 dBm (max on ESP32-C3)
 
     bp;
 
@@ -2062,6 +2315,9 @@ void setup() {
     batt_log("boot_complete");
     // indicate_successful_boot();
     delay(1000);
+    set_motor(true);
+    delay(500);
+    set_motor(false);
     while (!data_ready) delay(10);
     
 }
@@ -2082,18 +2338,21 @@ void loop() {
     // ---- IMU motion interrupt ----
     if (data_ready) {
         data_ready = false;
-        // Do NOT call lis3dh_clear_int1() here. INT1 stays latched HIGH, which
-        // prevents a new RISING edge and mutes the ISR for MINIMUM_BLE_DELAY_*.
-        // The deferred re-arm block below clears it after the delay elapses.
-        g_last_motion_ms   = now_ms;
-        g_last_activity_ms = now_ms;
         if (g_activity_state == STATE_ENFORCEMENT) {
-            if (g_active_event &&
-                (g_active_event->criteria == STAY_NEAR ||
-                 g_active_event->criteria == GET_AWAY)) {
-                start_ble_scan(ENFORCEMENT_SCAN_DURATION_MS);
-            }
+            // Motion is actionable only during enforcement (responsiveness).
+            // Do NOT clear INT1 here — it stays latched HIGH, muting the ISR for
+            // MINIMUM_BLE_DELAY_ENFORCEMENT; the deferred re-arm block clears it.
+            g_last_motion_ms   = now_ms;
+            g_last_activity_ms = now_ms;
+            // check_enforcement_condition() runs its own aligned active scan
+            // immediately before the query, so no separate scan is needed here.
             check_enforcement_condition();
+        } else {
+            // DORMANT / UNPAIRED: motion is not actionable and must not keep the
+            // watch awake or reset the idle timer (§8.4). Clear the latch and
+            // drop it so the next motion can re-fire harmlessly.
+            lis3dh_clear_int1();
+            g_last_motion_ms = 0;
         }
     }
 
@@ -2162,20 +2421,11 @@ void loop() {
             start_ble_scan();
             g_last_activity_ms = now_ms;
         }
-    } else if (g_activity_state == STATE_ENFORCEMENT) {
-        // ENFORCEMENT: scan strategy depends on the active event's criteria type.
-        // WiFi-based events need no BLE scan — skip entirely.
-        // Anchor-based events: primary trigger is the IMU motion interrupt (handled
-        // above); this block provides a fallback scan for when the user is still.
-        if (g_active_event &&
-            (g_active_event->criteria == STAY_NEAR || g_active_event->criteria == GET_AWAY)) {
-            if (!g_ble_scan->isScanning() &&
-                ((now_ms - g_last_ble_scan_ms) > (uint32_t)ENFORCEMENT_BLE_FALLBACK_SCAN_INTERVAL_S * 1000UL || g_last_ble_scan_ms == 0)) {
-                
-                start_ble_scan(ENFORCEMENT_SCAN_DURATION_MS);
-            }
-        }
     }
+    // ENFORCEMENT no longer runs a standalone periodic fallback scan (§8.2): each
+    // poll and each motion-triggered check refreshes the cache with an aligned
+    // active scan immediately before the query, and the watch light-sleeps
+    // between polls when compliant — so a separate background scan was redundant.
 
     // ---- Event boundary check ----
     if (g_activity_state == STATE_DORMANT && g_next_boundary_min <= now_min) {
@@ -2196,10 +2446,10 @@ void loop() {
         if (g_active_event && now_min >= g_active_event->endTime) {
             exit_enforcement();
         } else {
-            // Periodic condition poll
-            if ((now_ms - g_last_enf_poll_ms) > (uint32_t)ENFORCEMENT_POLL_INTERVAL_S * 1000UL) {
+            // Periodic condition poll (adaptive cadence — §8.2)
+            if ((now_ms - g_last_enf_poll_ms) > enforcement_poll_interval_ms()) {
                 g_last_enf_poll_ms = now_ms;
-               
+
                 check_enforcement_condition();
             } else {
                 // Advance profile playback between polls
@@ -2209,7 +2459,10 @@ void loop() {
     }
 
     // ---- Enforcement idle sleep ----
+    // Don't sleep while a phone is connected (§8.4) — light sleep drops the BLE
+    // link, which would kill an in-progress config session.
     if (g_activity_state == STATE_ENFORCEMENT &&
+        !g_bt_connected &&
         g_enf.condition_met &&
         !data_ready &&
         !(g_ble_scan && g_ble_scan->isScanning()) &&
@@ -2219,13 +2472,15 @@ void loop() {
     }
 
     // ---- Transition to DORMANT_SLEEP ----
+    // While connected, stay in DORMANT (modem sleep, link alive) so the app can
+    // configure the watch; resume sleeping once the phone disconnects (§8.4).
     if (g_activity_state == STATE_DORMANT &&
+        !g_bt_connected &&
         (now_ms - g_last_activity_ms) > DORMANT_TO_SLEEP_IDLE_MS) {
-        // Only sleep if IMU reports no significant motion
-        if (!data_ready) {
-            enter_dormant_sleep();
-            // Returns here after wakeup (already transitioned back to DORMANT)
-        }
+        // Motion no longer blocks DORMANT sleep — it is not a wake source here
+        // and is ignored above (§8.4), so the idle timer alone governs sleep.
+        enter_dormant_sleep();
+        // Returns here after wakeup (already transitioned back to DORMANT)
     }
 
     // ---- Serial command handler ----

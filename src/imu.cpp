@@ -3,18 +3,27 @@
 // ---- Register addresses ----
 #define REG_WHO_AM_I  0x0F
 #define REG_CTRL_REG1 0x20
+#define REG_CTRL_REG2 0x21
 #define REG_CTRL_REG3 0x22
 #define REG_CTRL_REG4 0x23
 #define REG_CTRL_REG5 0x24
+#define REG_REFERENCE 0x26
 #define REG_OUT_X_L   0x28
 #define REG_INT1_CFG  0x30
 #define REG_INT1_SRC  0x31
 #define REG_INT1_THS  0x32
 #define REG_INT1_DUR  0x33
 
-// Activity threshold in mg (16mg per LSB at ±2g).
-// Raise to reduce sensitivity; lower to increase it.
-#define MOTION_THRESHOLD_MG  1056   // 256mg ≈ light wrist movement
+// Motion-wake tuning. The interrupt generator runs the accelerometer through a
+// high-pass filter (CTRL_REG2 below), so the threshold is measured against
+// *dynamic* acceleration with gravity removed — i.e. it represents real motion
+// intensity and behaves the same in every wrist orientation. Without the HPF
+// the threshold competed with the ~1 g gravity vector, making sensitivity wildly
+// orientation-dependent and hair-trigger in common resting positions.
+#define MOTION_THRESHOLD_MG  320    // dynamic accel (gravity removed) to wake; 16 mg/LSB at ±2g.
+                                    // Deliberate handling, not micro-twitches. Raise to desensitize.
+#define MOTION_DURATION_MS   120    // motion must persist this long to count (filters brief jolts)
+#define IMU_ODR_HZ            50     // CTRL_REG1 ODR (1 INT1_DUR step = 1/ODR)
 
 // ---- SPI command bits ----
 #define SPI_READ  0x80
@@ -80,6 +89,12 @@ bool lis3dh_init() {
     // CTRL_REG1 = 0x47: ODR=50Hz, normal mode, all axes enabled
     write_reg(REG_CTRL_REG1, 0x47);
 
+    // CTRL_REG2 = 0x01: high-pass filter, normal mode (HPM=00), enabled for the
+    // AOI1 interrupt generator (HPIS1=1). Removes the gravity/DC component so the
+    // motion threshold reflects real movement intensity regardless of orientation.
+    // FDS=0 leaves the data registers (read_accel) unfiltered.
+    write_reg(REG_CTRL_REG2, 0x01);
+
     // CTRL_REG3 = 0x40: route IA1 (activity interrupt) to INT1 pin
     write_reg(REG_CTRL_REG3, 0x40);
 
@@ -89,17 +104,18 @@ bool lis3dh_init() {
     // CTRL_REG5 = 0x08: latch INT1 — stays HIGH until INT1_SRC is read
     write_reg(REG_CTRL_REG5, 0x08);
 
-    // INT1_THS: threshold in 16mg steps at ±2g
+    // INT1_THS: threshold in 16mg steps at ±2g (dynamic accel, post-HPF)
     write_reg(REG_INT1_THS, (uint8_t)(MOTION_THRESHOLD_MG / 16));
 
-    // INT1_DUR: minimum duration before interrupt fires (1 step = 1/ODR = 20ms at 50Hz)
-    // 2 steps = 40ms — filters out single-sample spikes
-    write_reg(REG_INT1_DUR, 0x02);
+    // INT1_DUR: motion must persist this many ODR samples before the interrupt
+    // fires (1 step = 1/ODR). Filters brief jolts so only sustained motion wakes.
+    write_reg(REG_INT1_DUR, (uint8_t)(MOTION_DURATION_MS * IMU_ODR_HZ / 1000));
 
     // INT1_CFG = 0x2A: high-event on X, Y, Z (OR combination)
     write_reg(REG_INT1_CFG, 0x2A);
 
-    // Clear any pending interrupt from init by reading INT1_SRC
+    // Initialise the high-pass filter reference and clear any pending interrupt.
+    read_reg(REG_REFERENCE);
     read_reg(REG_INT1_SRC);
 
     pinMode(LIS3DH_INT1, INPUT);

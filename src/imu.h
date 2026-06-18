@@ -4,7 +4,7 @@
 #include <SPI.h>
 
 // ---- Pin mapping ----
-#define LIS3DH_MOSI  20
+#define LIS3DH_MOSI  7 // is 7 on old boards, 20 on new
 #define LIS3DH_SCK   6
 #define LIS3DH_MISO  2
 #define LIS3DH_CS    8
