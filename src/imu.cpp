@@ -20,9 +20,13 @@
 // intensity and behaves the same in every wrist orientation. Without the HPF
 // the threshold competed with the ~1 g gravity vector, making sensitivity wildly
 // orientation-dependent and hair-trigger in common resting positions.
-#define MOTION_THRESHOLD_MG  320    // dynamic accel (gravity removed) to wake; 16 mg/LSB at ±2g.
-                                    // Deliberate handling, not micro-twitches. Raise to desensitize.
-#define MOTION_DURATION_MS   120    // motion must persist this long to count (filters brief jolts)
+// Motion only wakes/triggers the watch during ENFORCEMENT (it is ignored in
+// DORMANT), so sensitivity here is about catching the user moving — e.g. walking
+// away from a stayNear anchor between polls — not about idle battery. Keep it low
+// enough that normal-pace movement registers; brief gait peaks must still pass,
+// so the duration filter is short.
+#define MOTION_THRESHOLD_MG  100    // dynamic accel (gravity removed) to trigger; 16 mg/LSB at ±2g
+#define MOTION_DURATION_MS    40    // motion must persist this long to count (rejects single-sample spikes)
 #define IMU_ODR_HZ            50     // CTRL_REG1 ODR (1 INT1_DUR step = 1/ODR)
 
 // ---- SPI command bits ----

@@ -1508,7 +1508,7 @@ WIFI_SCAN_INTERVAL_S               = 120       // (tunable) DORMANT WiFi reconne
 
 Wrist-worn motion is the watch's largest *potential* battery drain: at the original sensitivity, casual movement woke the watch every few seconds, and each wake held the CPU awake long enough that an active user could keep it out of sleep most of the day (estimated tens to hundreds of mAh/day). The wakeups bought nothing outside an enforcement window. This is addressed in three parts:
 
-1. **Desensitized motion interrupt.** The LIS3DH interrupt generator runs through its high-pass filter (`CTRL_REG2` HPIS1), so `MOTION_THRESHOLD_MG` measures *dynamic* acceleration with gravity removed — consistent in every wrist orientation, instead of the original gravity-relative threshold that was hair-trigger in common resting positions. Threshold raised to deliberate-handling level and `MOTION_DURATION_MS` requires the motion to persist before it counts.
+1. **High-pass-filtered motion interrupt.** The LIS3DH interrupt generator runs through its high-pass filter (`CTRL_REG2` HPIS1), so `MOTION_THRESHOLD_MG` measures *dynamic* acceleration with gravity removed — consistent in every wrist orientation, instead of the original gravity-relative threshold that was hair-trigger in some resting positions and dead in others. Because motion now only matters during enforcement (part 2), the threshold and `MOTION_DURATION_MS` are tuned for *responsiveness* — low enough that normal-pace movement (e.g. walking away from a stayNear anchor) reliably triggers a re-check, with a short duration filter so brief gait peaks still register — rather than for idle battery, which motion no longer affects.
 
 2. **Motion is a wake source only during ENFORCEMENT.** In `DORMANT_SLEEP` the watch wakes on the RTC timer only (`gpio_wakeup_disable` on INT1); motion received while in DORMANT is cleared and ignored without resetting the idle timer. During an enforcement window, motion still wakes the watch and forces an immediate condition re-check (responsiveness preserved exactly).
 
@@ -1519,8 +1519,11 @@ Wrist-worn motion is the watch's largest *potential* battery drain: at the origi
 This is a **latency-vs-battery** tradeoff: a shorter heartbeat connects faster but costs more idle power (the watch is awake during each heartbeat window). A full BLE-controller-wake implementation via `esp_pm` automatic light sleep would make idle reachability essentially free (sub-mA, zero latency) and is the recommended future refactor.
 
 ```
-MOTION_THRESHOLD_MG                = 320       // (tunable, imu.cpp) dynamic accel to wake; raise to desensitize
-MOTION_DURATION_MS                 = 120       // (tunable, imu.cpp) motion must persist this long to count
+MOTION_THRESHOLD_MG                = 160       // (tunable, imu.cpp) dynamic accel to trigger; tuned to catch
+                                               // normal-pace movement during enforcement (motion is ignored in
+                                               // DORMANT, so this no longer affects idle battery)
+MOTION_DURATION_MS                 = 40        // (tunable, imu.cpp) motion must persist this long to count;
+                                               // short so brief gait peaks still register
 DISCONNECTED_ADV_HEARTBEAT_MS      = 6000      // (tunable) max DORMANT_SLEEP interval while disconnected, so the
                                                // watch periodically advertises and is reachable by the app
 ```

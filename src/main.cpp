@@ -745,6 +745,38 @@ static void load_schedule_blob() {
 }
 
 // ============================================================
+//  Anchor record NVS persistence
+// ============================================================
+// Persists the known-anchor table (UUID → bleMac/bleAddrType/name/IP) so the
+// watch can issue a directed proximity connect immediately on boot, instead of
+// having to re-discover each anchor's MAC from a fresh advertisement first.
+// Saved only on durable changes (MAC first captured, IP pushed) to limit flash
+// wear, not on transient RSSI updates.
+
+static void save_anchor_records() {
+    prefs.begin("anchors", false);
+    prefs.putBytes("recs", g_anchor_records, sizeof(g_anchor_records));
+    prefs.end();
+}
+
+static void load_anchor_records() {
+    prefs.begin("anchors", true);
+    size_t n = prefs.getBytesLength("recs");
+    if (n == sizeof(g_anchor_records)) {
+        prefs.getBytes("recs", g_anchor_records, sizeof(g_anchor_records));
+    }
+    prefs.end();
+    // Reset transient fields that aren't meaningful across a reboot, so freshness
+    // checks (e.g. the connect-fail RSSI fallback) don't trust stale values.
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        if (!g_anchor_records[i].valid) continue;
+        g_anchor_records[i].lastRSSI      = 0;
+        g_anchor_records[i].lastSeen      = 0;
+        g_anchor_records[i].lastProxScore = 0;
+    }
+}
+
+// ============================================================
 //  RTC / event boundary arming
 // ============================================================
 //
@@ -789,6 +821,7 @@ static void update_seen_anchor(const uint8_t *uuid, const uint8_t *mac_be,
                 memcpy(g_anchor_records[i].bleMac, mac_be, 6);
                 g_anchor_records[i].bleAddrType = addr_type;
                 g_anchor_records[i].bleMacValid = true;
+                save_anchor_records();  // durable: persist newly-captured MAC
             }
             g_anchor_records[i].lastRSSI = (int8_t)rssi;
             g_anchor_records[i].lastSeen = now_ts;
@@ -874,6 +907,7 @@ static AnchorRecord *ensure_anchor_record(const uint8_t *uuid) {
 
     Serial.println("[PROX] Created anchor record for " + convertAnchoridToString(uuid) +
                    (r.bleMacValid ? " (MAC known)" : " (awaiting advertisement)"));
+    save_anchor_records();  // persist new record (and any promoted MAC)
     return &r;
 }
 
@@ -941,6 +975,7 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
                     memcpy(g_anchor_records[i].bleMac, mac_be, 6);
                     g_anchor_records[i].bleAddrType = addr_type;
                     g_anchor_records[i].bleMacValid = true;
+                    save_anchor_records();  // durable: persist newly-captured MAC
                 }
                 g_anchor_records[i].lastRSSI = rssi;
                 g_anchor_records[i].lastSeen = (uint32_t)time(nullptr);
@@ -1306,10 +1341,20 @@ static bool is_enforcement_condition_met(const Event *e) {
     switch (e->criteria) {
         case STAY_NEAR:
         case GET_AWAY: {
-            // Find the anchor record to get its BLE MAC
+            // Align a fresh BLE scan with this query FIRST. Besides refreshing the
+            // RF cache, this is the only thing that (re)discovers the anchor's BLE
+            // MAC: the scan callbacks populate the AnchorRecord's bleMac as a side
+            // effect. It must run before the MAC check, otherwise an anchor whose
+            // MAC isn't known yet (e.g. booting straight into an enforcement window
+            // with no prior DORMANT discovery scan) can never be found — there is
+            // no longer a separate background scan during enforcement.
+            // One-shot active, full-duty for dense capture; restored to low-power
+            // passive afterward; runs once per poll, blocking.
+            prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+
+            // Find the anchor record (its bleMac may have just been captured above).
             AnchorRecord *rec = nullptr;
             for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
-                Serial.printf("[PROX] Checking anchor record %d: valid=%d  uuid=%s\n", i, g_anchor_records[i].valid, convertAnchoridToString(g_anchor_records[i].uuid).c_str());
                 if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, e->anchorId)) {
                     rec = &g_anchor_records[i];
                     break;
@@ -1317,16 +1362,11 @@ static bool is_enforcement_condition_met(const Event *e) {
             }
 
             if (!rec || !rec->bleMacValid) {
-                // Unknown anchor or no MAC yet — treat as AMBIGUOUS and apply fail-safe
-                Serial.println("[PROX] Anchor MAC unknown — treating as AMBIGUOUS");
+                // Anchor not seen in the scan (genuinely out of range / absent) —
+                // treat as AMBIGUOUS and apply fail-safe.
+                Serial.println("[PROX] Anchor MAC unknown after scan — treating as AMBIGUOUS");
                 return (e->criteria == STAY_NEAR); // stayNear: AMBIGUOUS→NEAR (met); getAway: AMBIGUOUS→AWAY (met)
             }
-
-            // Align a fresh BLE scan with this query so the cache reflects 'now'
-            // rather than relying on a possibly-stale periodic fallback scan.
-            // Uses a one-shot active, full-duty scan for dense capture (restored
-            // to low-power passive afterward); runs once per poll, blocking.
-            prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
 
             // Build scan vector from BLE cache + WiFi AP scan
             ProxScanVector vec;
@@ -1998,6 +2038,7 @@ class WatchAnchorIpCallback : public NimBLECharacteristicCallbacks {
                 g_anchor_records[slot].ipLastUpdated = ts;
             }
         }
+        save_anchor_records();  // persist updated UUID→IP table
         uint8_t resp = 0x01;
         pChar->setValue(&resp, 1);
         pChar->notify();
@@ -2060,32 +2101,9 @@ static void batt_log_dump_serial() {
     Serial.println("BATTLOG_END");
 }
 
-// --- Crash checkpoint helpers ---
-// Writes step number to NVS so next boot can report where we died.
-static void chk_set(uint8_t step) {
-    Preferences p;
-    p.begin("dbg", false);
-    p.putUChar("chk", step);
-    p.end();
-}
 static void print_debug(const char *msg) { // prints message only if debug mode is on
     if (!DEBUG_MODE) return;
     Serial.println(msg);
-}
-static void chk_report_and_clear() {
-    Preferences p;
-    p.begin("dbg", false);
-    uint8_t last = p.getUChar("chk", 0);
-    p.putUChar("chk", 0);
-    p.end();
-    if (last == 0) return;  // clean boot, nothing to report
-    // Beep the step number: e.g. step 7 = pause, then 7 short beeps
-    delay(1000);
-    for (uint8_t i = 0; i < last; i++) {
-        digitalWrite(BUZZER_PIN, HIGH); delay(200);
-        digitalWrite(BUZZER_PIN, LOW);  delay(750);
-    }
-    delay(800);
 }
 
 void beep_delay() {
@@ -2128,10 +2146,8 @@ void setup() {
 
     bp;
 
-    // chk_report_and_clear();  // beep last crash step if any
 
     // CHK 1: SPI / IMU init
-    chk_set(1);
     delay(100);
     pinMode(LIS3DH_CS, OUTPUT);
     digitalWrite(LIS3DH_CS, HIGH);
@@ -2147,7 +2163,6 @@ void setup() {
 
 
     // CHK 2: NVS load
-    chk_set(2);
     delay(100);
     prefs.begin("watch", true);
     g_is_paired       = prefs.getBool("paired", false);
@@ -2172,13 +2187,18 @@ void setup() {
 
 
     // CHK 3: load WiFi creds + schedule blob
-    chk_set(3);
     bp;
 
     load_wifi_creds();
     bp;
 
     load_schedule_blob();
+    bp;
+
+    // Restore the known-anchor table (UUID→MAC/IP) so proximity can connect on
+    // boot without re-discovering each anchor's MAC. Must precede the schedule
+    // recalc, whose ensure_anchor_record() dedups against these by UUID.
+    load_anchor_records();
     bp;
 
     batt_log_load();
@@ -2190,7 +2210,6 @@ void setup() {
     bp;
 
     // CHK 4: WiFi mode
-    chk_set(4);
     bp;
     delay(200);
     bp;
@@ -2201,14 +2220,12 @@ void setup() {
     bp; 
 
     // CHK 4b: WiFi connect
-    chk_set(14);
     if (g_wifi_cred_count > 0) try_connect_saved_wifi();
 
 
     bp;
 
     // CHK 5: NimBLE init
-    chk_set(5);
     delay(500);
     NimBLEDevice::init(g_watch_uuid_str);
     // Boost BLE TX power to extend usable connection range. Connection
@@ -2221,7 +2238,6 @@ void setup() {
 
 
     // CHK 6: GATT server + service
-    chk_set(6);
     g_ble_server = NimBLEDevice::createServer();
     g_ble_server->setCallbacks(new WatchServerCallbacks());
     NimBLEService *svc = g_ble_server->createService(WATCH_SERVICE_UUID);
@@ -2230,7 +2246,6 @@ void setup() {
     bp; 
     
     // CHK 7: GATT characteristics
-    chk_set(7);
     auto *wifiCredChar = svc->createCharacteristic(WATCH_WIFI_CRED_CHAR_UUID,
                                                     NIMBLE_PROPERTY::WRITE_NR);
     wifiCredChar->setCallbacks(new WatchWifiCredCallback());
@@ -2258,7 +2273,6 @@ void setup() {
 
     bp; 
     // CHK 8: start service + advertising
-    chk_set(8);
     svc->start();
     NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
     pAdv->addServiceUUID(WATCH_SERVICE_UUID);
@@ -2266,7 +2280,6 @@ void setup() {
     Serial.println("[BLE] Watch advertising started");
 
     // CHK 9: BLE scanner setup
-    chk_set(9);
     g_ble_scan = NimBLEDevice::getScan();
     g_ble_scan->setScanCallbacks(&g_scan_cb, true);
     g_ble_scan->setActiveScan(false);
@@ -2279,7 +2292,6 @@ void setup() {
     g_ble_scan->setMaxResults(0);
 
     // CHK 10: schedule calculation + boot-time recovery
-    chk_set(10);
     if (g_is_paired) {
         recalculate_and_rearm();
         uint32_t now_min = local_minutes_now();
