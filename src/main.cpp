@@ -16,7 +16,8 @@
 #include <time.h>
 #include <string.h>
 #include "imu.h"
-#include "proximity.h"
+#include "proximity.h"            // shared proximity engine (../proximity_engine)
+#include "watch_prox_transport.h" // re-homed transport/interpret + WiFi feeding
 #include <ArduinoLog.h>
 #include <esp_system.h>
 
@@ -899,7 +900,7 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
 
         // Feed every BLE device into the proximity scan cache (§5.4 — ProxScanVector
         // includes all observed BLE devices, not just Impulse anchors).
-        prox_update_ble_cache(mac_be, 0, rssi);
+        prox_ingest_scan_result(mac_be, PROX_TYPE_BLE, rssi);
 
         // ── Impulse anchor identification (unchanged logic) ──────
         if (!dev->haveManufacturerData()) return;
@@ -1328,9 +1329,12 @@ static bool is_enforcement_condition_met(const Event *e) {
             // to low-power passive afterward); runs once per poll, blocking.
             prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
 
-            // Build scan vector from BLE cache + WiFi AP scan
+            // Build scan vector. BLE devices were fed into the engine's scan
+            // buffer by the active scan above (via the scan callback); feed the
+            // WiFi APs now, then build (build DRAINS the engine's buffer).
+            prox_feed_wifi_aps();
             ProxScanVector vec;
-            prox_build_scan_vector(vec);
+            prox_build_scan_vector(&vec);
 
             // print amount of dimensions in vector
             Serial.printf("[PROX] Scan vector has %d dimensions\n", vec.count);
@@ -2111,7 +2115,7 @@ void setup() {
 
     batt_log_clear();
 
-    prox_init_watch();
+    prox_init();
 
     // Hardware pins first so buzzer works for crash reporting
     pinMode(BUZZER_PIN, OUTPUT);
