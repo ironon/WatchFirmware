@@ -12,6 +12,7 @@
 #define ANCHOR_SERVICE_UUID           "4A0F0001-F8CE-11EE-8001-020304050607"
 #define ANCHOR_PROX_VECTOR_CHAR_UUID  "4A0F0008-F8CE-11EE-8001-020304050607"
 #define ANCHOR_PROX_SCORE_CHAR_UUID   "4A0F0009-F8CE-11EE-8001-020304050607"
+#define ANCHOR_DOCK_STATUS_CHAR_UUID  "4A0F000D-F8CE-11EE-8001-020304050607"  // phone docking (§4.11)
 
 // WiFi APs are stationary, so we reuse cached scan results between queries and
 // only rescan when the cache is stale (a blocking, power-hungry scan). Re-homed
@@ -79,7 +80,9 @@ void prox_feed_wifi_aps() {
 bool prox_query_anchor(const uint8_t bleMac_be[6],
                        uint8_t addr_type,
                        const ProxScanVector &vec,
-                       ProxScoreResult &result) {
+                       ProxScoreResult &result,
+                       int8_t *out_dock) {
+    if (out_dock) *out_dock = -1;  // unknown until read (fail-open on the dock signal)
     // Convert big-endian MAC to NimBLE little-endian format
     // print everything about this query
     // Serial.printf("[PROX] Querying anchor %02X:%02X:%02X:%02X:%02X:%02X (addr_type=%d) with %d devices\n",
@@ -205,6 +208,22 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
     result.score = (uint8_t)score_val[0];
     result.flags = (uint8_t)score_val[1];
     Serial.printf("[PROX] SUCCESS: score=%d flags=0x%02X\n", result.score, result.flags);
+
+    // Phone docking (§4.11): for phoneAway the caller wants to know whether the
+    // phone is still docked at this anchor. Read the Dock Status characteristic
+    // on the same connection. Absent char / short read → leave as -1 (unknown),
+    // which the caller treats as docked (fail-open on the dock signal).
+    if (out_dock) {
+        NimBLERemoteCharacteristic *dockChar =
+            svc->getCharacteristic(ANCHOR_DOCK_STATUS_CHAR_UUID);
+        if (dockChar) {
+            std::string dv = dockChar->readValue();
+            if (dv.size() >= 1) {
+                *out_dock = (dv[0] != 0) ? 1 : 0;
+                Serial.printf("[PROX] Dock status: %s\n", *out_dock ? "docked" : "UNDOCKED");
+            }
+        }
+    }
 
     client->disconnect();
     NimBLEDevice::deleteClient(client);

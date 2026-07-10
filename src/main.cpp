@@ -12,10 +12,13 @@
 #include <esp_crc.h>
 #include <esp_random.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <time.h>
+#include <sys/time.h>   // settimeofday() for the Time characteristic (§5.6)
 #include <string.h>
 #include "imu.h"
+#include "led_status.h"           // LED status ring (§5.7)
 #include "proximity.h"            // shared proximity engine (../proximity_engine)
 #include "watch_prox_transport.h" // re-homed transport/interpret + WiFi feeding
 #include <ArduinoLog.h>
@@ -29,6 +32,15 @@
 // ============================================================
 #define BUZZER_PIN    21
 #define VIBRO_PIN     10
+
+// On the current hardware rev the vibration motor and the LED status ring share
+// GPIO 10 (the motor is disabled by a PCB switch). Set DISABLE_MOTOR to 1 to
+// compile the motor driver out entirely so it never drives GPIO 10 — FastLED
+// then owns the pin and the enforcement alarm blink renders cleanly. Set to 0
+// on the next rev (ring → GPIO 7, motor restored on GPIO 10). When 1, all motor
+// output (incl. enforcement vibration) is suppressed; buzzer behaviour is
+// unchanged.
+#define DISABLE_MOTOR 1
 
 #define BATT_ADC_PIN   3   // ADC, Vbat/2
 // Worn detection — ITR8307 reflective opto-interrupter (replaces the old
@@ -46,6 +58,27 @@
 #define DEBUG_MODE 0
 
 // ============================================================
+//  Battery usage measurement
+//  Set to 1 to accumulate sleep/awake timing and wakeup metrics
+//  for the overnight battery sanity check. See the "Battery usage
+//  instrumentation" section further down for what is measured and
+//  how to read it (serial 0xAD dump / 0xAE reset). Zero runtime cost
+//  when 0 — all instrumentation compiles out.
+// ============================================================
+#define MEASURE_USAGE 1
+
+// ============================================================
+//  Awake-burst diagnostics
+//  Set to 1 to log, over serial, how long the watch stays awake between
+//  DORMANT sleeps and to flag any single loop iteration that blocks for too
+//  long (e.g. a blocking call). Use this to chase battery/awake-time issues:
+//    [DIAG] slow loop iter=NNNNms ...   → something blocked this iteration
+//    [DIAG] DORMANT awake=NNNNms loops=N max_iter=NNms  → per-wake awake burst
+//  A healthy idle watch should show awake bursts well under ~1 s.
+// ============================================================
+#define DIAG_AWAKE 1
+
+// ============================================================
 //  Constants
 // ============================================================
 #define ENFORCEMENT_POLL_INTERVAL_S                60  // poll cadence while condition NOT met
@@ -59,17 +92,41 @@
 #define PROX_QUERY_SCAN_DUTY_MS                   100  // pre-query scan only: window == interval == ~100%
                                                        // duty for dense device capture (restored after)
 #define ENFORCEMENT_IDLE_BEFORE_SLEEP_MS         30000
+// Mode B (phoneAway): grace period the user may be NEAR the docked phone before
+// enforcement kicks in — "a quick check is fine." Uses wall-clock (time()) so it
+// survives enforcement light sleep. (Tunable; could become a per-event field.)
+#define PHONE_AWAY_TOLERANCE_S                     60
 #define MINIMUM_BLE_DELAY_DORMANT               5000  // ms before re-arming IMU interrupt in DORMANT
 #define MINIMUM_BLE_DELAY_ENFORCEMENT           3000  // ms before re-arming IMU interrupt in ENFORCEMENT
 #define WIFI_SCAN_INTERVAL_S             120
-#define DORMANT_TO_SLEEP_IDLE_MS        1500
+// Blocking WiFi connect wait — used only on the boot path and user-initiated
+// credential writes, never in the DORMANT heartbeat loop (that path is async).
+#define WIFI_CONNECT_TIMEOUT_MS         5000
+// Idle time in DORMANT before dropping back to light sleep. In a still, idle,
+// disconnected watch the wake exists only to emit the advertise heartbeat (~a
+// few adv events) and run any periodic scan that is due — there is no in-flight
+// work to settle — so this dwell is almost pure waste. Trimmed from 1500 ms to
+// keep the awake burst short (the dominant idle-drain term, see MEASURE_USAGE).
+// A BLE scan in progress separately holds the watch awake until it finishes
+// (see the DORMANT→SLEEP gate), so lowering this does not truncate scans.
+// Tradeoff (tunable): a phone scanning at the wrong instant may wait one extra
+// ~6 s heartbeat to connect.
+#define DORMANT_TO_SLEEP_IDLE_MS         250
 // While disconnected, the watch surfaces from DORMANT_SLEEP at least this often
 // to advertise and accept a phone connection (§8.4). Motion is NOT a wake source
 // in DORMANT, so this heartbeat is the only way to reach a still, idle watch.
 // Lower = snappier app connect, higher = less battery. Tunable.
 #define DISCONNECTED_ADV_HEARTBEAT_MS   6000
+// After a wrist-raise wakes the watch (LOOK_WAKEUP_ENABLED, imu.h), the LED ring
+// shows live status for this long before the watch is allowed back to sleep, so
+// the user has time to read it. Tunable.
+#define LOOK_DWELL_MS                   4000
 #define ANCHOR_WIFI_RETRY_INTERVAL_S      30
 #define ANCHOR_SEEN_TIMEOUT_S             20
+// Max time setup() waits for the IMU's first motion interrupt before continuing
+// boot. A watch placed down perfectly still emits no motion, so this must never
+// block unbounded or the CPU stays fully awake (watch unusable) until disturbed.
+#define IMU_FIRST_INT_TIMEOUT_MS        2000
 
 #define DORMANT_SCAN_INTERVAL_MS         300
 #define DORMANT_SCAN_WINDOW_MS           200
@@ -137,12 +194,15 @@
 #define WATCH_SEEN_ANCHORS_CHAR_UUID "4A0F0015-F8CE-11EE-8001-020304050607"
 #define WATCH_STATUS_CHAR_UUID       "4A0F0016-F8CE-11EE-8001-020304050607"
 #define WATCH_ANCHOR_IP_CHAR_UUID    "4A0F0017-F8CE-11EE-8001-020304050607"
+#define WATCH_LED_CONFIG_CHAR_UUID   "4A0F0018-F8CE-11EE-8001-020304050607"
+#define WATCH_TIME_CHAR_UUID         "4A0F0019-F8CE-11EE-8001-020304050607"
 
 // ============================================================
 //  Enumerations
 // ============================================================
 enum RecurrenceType          : uint8_t { ONCE=0, DAILY=1, WEEKLY=2, MONTHLY=3 };
-enum Criteria                : uint8_t { GET_AWAY=0, STAY_NEAR=1, GET_OFF_WIFI=2, GET_ON_WIFI=3 };
+enum Criteria                : uint8_t { GET_AWAY=0, STAY_NEAR=1, GET_OFF_WIFI=2, GET_ON_WIFI=3,
+                                          PHONE_AWAY=4 };  // Mode B: phone docked at anchorId; stay away from it
 enum EnforcementProfile      : uint8_t {
     STRICT_SILENT=0, NORMAL_SILENT=1, LOOSE_SILENT=2,
     STRICT_BOTH=3,   NORMAL_BOTH=4,   LOOSE_BOTH=5,
@@ -338,7 +398,20 @@ static uint32_t g_last_ble_scan_ms      = 0;
 static uint32_t g_last_wifi_scan_ms     = 0;
 static uint32_t g_last_enf_poll_ms      = 0;
 static uint32_t g_last_wifi_retry_ms    = 0;
+// phoneAway tolerance: wall-clock time() the watch first went NEAR the docked
+// phone in the active event (0 = currently away/compliant). See PHONE_AWAY_TOLERANCE_S.
+static uint32_t g_phone_near_since_ts   = 0;
 static uint32_t g_last_activity_ms      = 0;  // for DORMANT→SLEEP idle timer
+#if LOOK_WAKEUP_ENABLED
+static uint32_t g_look_dwell_until      = 0;  // keep awake showing status until this millis after a look wake
+static bool     g_look_consumed         = false;  // already showed the flourish for the current sustained raise
+#endif
+#if DIAG_AWAKE
+static uint32_t g_dbg_burst_start_ms = 0;   // millis the current awake burst began
+static uint32_t g_dbg_last_loop_ms   = 0;   // millis at the top of the previous loop iteration
+static uint32_t g_dbg_loop_count     = 0;   // loop iterations in the current awake burst
+static uint32_t g_dbg_max_iter_ms    = 0;   // longest single iteration in the current burst
+#endif
 // Timestamp of the last processed motion interrupt. Non-zero means INT1 is still
 // latched HIGH and the re-arm is pending. Reset to 0 when lis3dh_clear_int1() fires.
 static uint32_t g_last_motion_ms        = 0;
@@ -469,7 +542,36 @@ static uint16_t read_battery_mv() {
     return pin_mv;
 }
 
-static void set_motor(bool on)  { digitalWrite(VIBRO_PIN,  on ? HIGH : LOW); }
+// ---- LED status helpers (§5.7) ----
+// Snapshot current watch state for the LED renderer. Decouples led_status.cpp
+// from the state machine — it just gets the three bits it needs.
+static LedStatusInput led_status_input() {
+    LedStatusInput in;
+    in.unpaired      = (g_activity_state == STATE_UNPAIRED);
+    in.enforcing     = (g_activity_state == STATE_ENFORCEMENT);
+    in.condition_met = g_enf.condition_met;
+    return in;
+}
+
+// Map the ESP light-sleep wakeup cause to the LED wake-cause flash. In DORMANT
+// motion is not a wake source (§8.4), so a dormant wake is normally TIMER; an
+// enforcement wake may be TIMER or GPIO (motion). Anything else (e.g. a BLE
+// controller wake) shows the BLE flash.
+static LedWakeCause led_wake_cause_from_esp() {
+    switch (esp_sleep_get_wakeup_cause()) {
+        case ESP_SLEEP_WAKEUP_TIMER: return LED_WAKE_TIMER;
+        case ESP_SLEEP_WAKEUP_GPIO:  return LED_WAKE_MOTION;
+        default:                     return LED_WAKE_BLE;
+    }
+}
+
+static void set_motor(bool on)  {
+#if DISABLE_MOTOR
+    (void)on;  // motor compiled out — GPIO 10 is the LED ring this rev
+#else
+    digitalWrite(VIBRO_PIN, on ? HIGH : LOW);
+#endif
+}
 // set_motor should do nothing for now
 // static void set_motor(bool on)  { }
 static void set_buzzer(bool on) { digitalWrite(BUZZER_PIN, on ? HIGH : LOW); }
@@ -1061,23 +1163,50 @@ static int8_t get_anchor_rssi(const uint8_t *uuid) {
 //  WiFi helpers
 // ============================================================
 
+// Promote a freshly-associated WiFi link: record SSID, open the UDP socket, kick
+// off NTP, flag connected. Shared by the blocking boot path and the async
+// detector in loop() so both finish the connection identically.
+static void on_wifi_associated(const char *ssid) {
+    g_wifi_connected = true;
+    strlcpy(g_current_ssid, ssid, sizeof(g_current_ssid));
+    g_udp.begin(0); // any local port for sending
+    configTime((long)g_tz_offset_min * 60, 0, "pool.ntp.org");
+    Serial.printf("[WiFi] Connected to %s\n", g_current_ssid);
+    batt_log("wifi_connect");
+}
+
+// Blocking connect — boot / user-initiated only (never the DORMANT loop).
 static void try_connect_saved_wifi() {
     if (g_wifi_cred_count == 0) return;
     // Attempt each saved credential
     for (int i = 0; i < g_wifi_cred_count; i++) {
+        Serial.printf("[WiFi] Attempting to connect to saved SSID \"%s\"\n", g_wifi_creds[i].ssid);
+        Serial.printf("[WiFi] Password: \"%s\"\n", g_wifi_creds[i].pass);
         WiFi.begin(g_wifi_creds[i].ssid, g_wifi_creds[i].pass);
         uint32_t t = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t < 5000) delay(50);
+        while (WiFi.status() != WL_CONNECTED && millis() - t < WIFI_CONNECT_TIMEOUT_MS) delay(50);
         if (WiFi.status() == WL_CONNECTED) {
-            g_wifi_connected = true;
-            strlcpy(g_current_ssid, g_wifi_creds[i].ssid, sizeof(g_current_ssid));
-            g_udp.begin(0); // any local port for sending
-            configTime((long)g_tz_offset_min * 60, 0, "pool.ntp.org");
-            Serial.printf("[WiFi] Connected to %s\n", g_current_ssid);
-            batt_log("wifi_connect");
+            on_wifi_associated(g_wifi_creds[i].ssid);
+            Serial.printf("[WiFi] Connected to %s\n", g_wifi_creds[i].ssid);
+
             return;
         }
+        Serial.printf("[WiFi] Failed to connect to %s\n", g_wifi_creds[i].ssid);
     }
+}
+
+// Non-blocking reconnect for the DORMANT heartbeat path: kick off a single
+// association attempt (round-robin across saved creds) and return immediately.
+// Association completes asynchronously; the WiFi connect detector in loop()
+// calls on_wifi_associated() once WL_CONNECTED is observed. This keeps a still,
+// idle wake from busy-waiting up to WIFI_CONNECT_TIMEOUT_MS × creds.
+static uint8_t g_wifi_try_idx = 0;
+static void try_connect_saved_wifi_async() {
+    if (g_wifi_cred_count == 0) return;
+    if (WiFi.status() == WL_CONNECTED) return;
+    uint8_t i = g_wifi_try_idx % g_wifi_cred_count;
+    g_wifi_try_idx++;
+    WiFi.begin(g_wifi_creds[i].ssid, g_wifi_creds[i].pass);
 }
 
 static void save_wifi_creds() {
@@ -1253,6 +1382,7 @@ static void push_watch_status() {
                     case STAY_NEAR:   crit = "STAY_NEAR"; break;
                     case GET_OFF_WIFI:crit = "GET_OFF_WIFI"; break;
                     case GET_ON_WIFI: crit = "GET_ON_WIFI"; break;
+                    case PHONE_AWAY:  crit = "PHONE_AWAY"; break;
                 }
                 char id_str[37]; uuid_to_str(e.id, id_str);
                 Serial.printf("[SCHED] %02d:%02d-%02d:%02d id=%s crit=%s prof=%d",
@@ -1337,83 +1467,102 @@ static void notify_seen_anchors() {
 // ============================================================
 
 
+// Perform an anchor-based proximity query and return NEAR / AWAY / AMBIGUOUS.
+// AMBIGUOUS = "could not determine" (anchor not discovered, connect failed
+// without a clear far-RSSI signal, or a mid-range score). Callers map AMBIGUOUS
+// to their own fail-safe / fail-open direction. Shared by stayNear, getAway and
+// phoneAway (Mode B), which all reduce to "how close is the watch to anchorId?".
+// out_dock (optional): for phoneAway, receives the anchor's Dock Status
+// (1 docked / 0 undocked / -1 unknown). Left -1 if the query never reaches the
+// anchor (MAC unknown / connect fail) — callers treat unknown as docked.
+static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = nullptr) {
+    if (out_dock) *out_dock = -1;
+    // Align a fresh BLE scan with this query FIRST. Besides refreshing the RF
+    // cache, this is the only thing that (re)discovers the anchor's BLE MAC (the
+    // scan callbacks populate the AnchorRecord as a side effect), so it must run
+    // before the MAC check — there is no separate background scan in enforcement.
+    prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+
+    AnchorRecord *rec = nullptr;
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, e->anchorId)) {
+            rec = &g_anchor_records[i];
+            break;
+        }
+    }
+    if (!rec || !rec->bleMacValid) {
+        Serial.println("[PROX] Anchor MAC unknown after scan — AMBIGUOUS");
+        return PROX_AMBIGUOUS;
+    }
+
+    // BLE devices were fed into the engine's scan buffer by the aligned scan
+    // above; feed WiFi APs, then build (build DRAINS the engine's buffer).
+    prox_feed_wifi_aps();
+    ProxScanVector vec;
+    prox_build_scan_vector(&vec);
+    Serial.printf("[PROX] Scan vector has %d dimensions\n", vec.count);
+
+    ProxScoreResult result;
+    if (!prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result, out_dock)) {
+        // Connection establishment fails at much weaker RSSI (~-88 dBm) than
+        // advertisement reception, so a failed connect + a weak recent ad RSSI
+        // is strong evidence the watch is FAR from the anchor.
+        uint32_t now_ts = (uint32_t)time(nullptr);
+        bool rssi_fresh = rec->lastSeen != 0 &&
+                          (now_ts - rec->lastSeen) <= (uint32_t)ANCHOR_SEEN_TIMEOUT_S;
+        if (rssi_fresh && rec->lastRSSI <= PROX_FAR_RSSI_THRESHOLD_DBM) {
+            Serial.printf("[PROX] Connect failed; recent ad RSSI %d <= %d → AWAY (far)\n",
+                          rec->lastRSSI, PROX_FAR_RSSI_THRESHOLD_DBM);
+            return PROX_AWAY;
+        }
+        Serial.println("[PROX] Anchor query failed — AMBIGUOUS");
+        return PROX_AMBIGUOUS;
+    }
+
+    rec->lastProxScore = result.score;
+    Serial.printf("[PROX] Score=%d flags=0x%02X\n", result.score, result.flags);
+    return prox_interpret_score(result.score);
+}
+
 static bool is_enforcement_condition_met(const Event *e) {
     if (!e) return false;
     switch (e->criteria) {
         case STAY_NEAR:
         case GET_AWAY: {
-            // Align a fresh BLE scan with this query FIRST. Besides refreshing the
-            // RF cache, this is the only thing that (re)discovers the anchor's BLE
-            // MAC: the scan callbacks populate the AnchorRecord's bleMac as a side
-            // effect. It must run before the MAC check, otherwise an anchor whose
-            // MAC isn't known yet (e.g. booting straight into an enforcement window
-            // with no prior DORMANT discovery scan) can never be found — there is
-            // no longer a separate background scan during enforcement.
-            // One-shot active, full-duty for dense capture; restored to low-power
-            // passive afterward; runs once per poll, blocking.
-            prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
-
-            // Find the anchor record (its bleMac may have just been captured above).
-            AnchorRecord *rec = nullptr;
-            for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
-                if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, e->anchorId)) {
-                    rec = &g_anchor_records[i];
-                    break;
-                }
-            }
-
-            if (!rec || !rec->bleMacValid) {
-                // Anchor not seen in the scan (genuinely out of range / absent) —
-                // treat as AMBIGUOUS and apply fail-safe.
-                Serial.println("[PROX] Anchor MAC unknown after scan — treating as AMBIGUOUS");
-                return (e->criteria == STAY_NEAR); // stayNear: AMBIGUOUS→NEAR (met); getAway: AMBIGUOUS→AWAY (met)
-            }
-
-            // BLE devices were fed into the engine's scan buffer by the aligned
-            // active scan above (scan-first, via the scan callback). Feed the
-            // WiFi APs now, then build (build DRAINS the engine's buffer).
-            prox_feed_wifi_aps();
-            ProxScanVector vec;
-            prox_build_scan_vector(&vec);
-
-            // print amount of dimensions in vector
-            Serial.printf("[PROX] Scan vector has %d dimensions\n", vec.count);
-
-            // Query the anchor via GATT
-            ProxScoreResult result;
-            bool ok = prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result);
-
-            if (!ok) {
-                // Connection establishment fails at much weaker RSSI (~-88 dBm)
-                // than advertisement reception, so a failed connect together
-                // with a weak recent advertisement RSSI is strong evidence the
-                // watch is FAR from the anchor. Use that rather than a blind
-                // AMBIGUOUS fail-safe (which would wrongly treat stayNear as met
-                // when the user has actually walked out of connection range).
-                uint32_t now_ts = (uint32_t)time(nullptr);
-                bool rssi_fresh = rec->lastSeen != 0 &&
-                                  (now_ts - rec->lastSeen) <= (uint32_t)ANCHOR_SEEN_TIMEOUT_S;
-                if (rssi_fresh && rec->lastRSSI <= PROX_FAR_RSSI_THRESHOLD_DBM) {
-                    Serial.printf("[PROX] Connect failed; recent ad RSSI %d <= %d → treating as AWAY (far)\n",
-                                  rec->lastRSSI, PROX_FAR_RSSI_THRESHOLD_DBM);
-                    // Far: stayNear → not near → enforce; getAway → away → met.
-                    return (e->criteria == GET_AWAY);
-                }
-                Serial.println("[PROX] Anchor query failed — AMBIGUOUS fail-safe");
-                return (e->criteria == STAY_NEAR);
-            }
-
-            rec->lastProxScore = result.score;
-            Serial.printf("[PROX] Score=%d flags=0x%02X\n", result.score, result.flags);
-
-            ProxProximity prox = prox_interpret_score(result.score);
-            if (prox == PROX_AMBIGUOUS) {
-                // Fail-safe: stayNear→NEAR (condition met), getAway→AWAY (condition met)
+            ProxProximity prox = query_anchor_proximity(e);
+            if (prox == PROX_AMBIGUOUS)  // fail-safe toward the compliant outcome
                 prox = (e->criteria == STAY_NEAR) ? PROX_NEAR : PROX_AWAY;
-            }
-
             if (e->criteria == STAY_NEAR) return (prox == PROX_NEAR);
             else                          return (prox == PROX_AWAY);
+        }
+        case PHONE_AWAY: {
+            // Mode B: the phone is docked at anchorId, so proximity to that anchor
+            // ≈ proximity to the phone. The user must stay away from it.
+            //  - The anchor reports whether the phone is still docked (§4.11). The
+            //    phone is "with the user" if the user went to the dock (prox NEAR)
+            //    OR the phone left the dock (undocked). dock==-1 (unknown) → docked
+            //    (fail-open on the dock signal).
+            //  - Fail OPEN: an uncertain/degraded watch↔anchor link (AMBIGUOUS)
+            //    resolves to compliant — never false-alarm on a bad connection.
+            //  - Tolerance: a brief NEAR or brief undock ("a quick check is fine")
+            //    is allowed; only sustained access past PHONE_AWAY_TOLERANCE_S enforces.
+            int8_t dock = -1;
+            ProxProximity prox = query_anchor_proximity(e, &dock);
+            bool undocked   = (dock == 0);
+            bool near_phone = undocked || (prox == PROX_NEAR);
+            if (!near_phone) { g_phone_near_since_ts = 0; return true; }  // compliant; reset grace
+
+            uint32_t now_ts = (uint32_t)time(nullptr);
+            if (g_phone_near_since_ts == 0) g_phone_near_since_ts = now_ts;
+            uint32_t near_for = now_ts - g_phone_near_since_ts;
+            if (near_for < (uint32_t)PHONE_AWAY_TOLERANCE_S) {
+                Serial.printf("[PROX] phoneAway: near-phone (%s) for %us < %ds grace — compliant\n",
+                              undocked ? "undocked" : "at dock", (unsigned)near_for, PHONE_AWAY_TOLERANCE_S);
+                return true;   // within grace → treat as met
+            }
+            Serial.printf("[PROX] phoneAway: near-phone (%s) for %us >= grace — enforcing\n",
+                          undocked ? "undocked" : "at dock", (unsigned)near_for);
+            return false;      // grace exceeded → enforce
         }
         case GET_ON_WIFI:
             return g_wifi_connected &&
@@ -1535,6 +1684,7 @@ static void enter_enforcement(Event *e) {
     g_activity_state = STATE_ENFORCEMENT;
     batt_log("enforcement_enter");
     g_active_event   = e;
+    g_phone_near_since_ts = 0;   // reset phoneAway tolerance grace for the new event
 
     // Reconfigure BLE scanner to low duty cycle to reduce radio-on time.
     // Stop any running scan first — NimBLE requires the scanner to be idle
@@ -1606,11 +1756,270 @@ static void recalculate_and_rearm() {
 }
 
 // ============================================================
+//  Battery usage instrumentation  (MEASURE_USAGE)
+// ============================================================
+// Sanity-check tooling for the overnight battery test. When MEASURE_USAGE is 1
+// the firmware accumulates:
+//   • total time in light sleep vs awake vs deep sleep (deep sleep is never used
+//     by this firmware, so that bucket stays 0 — its presence confirms that).
+//   • the average wake-to-wake interval — the full sleep+work cycle period. With
+//     the disconnected heartbeat this is expected near DISCONNECTED_ADV_HEARTBEAT_MS
+//     (6 s) PLUS the forced awake time before re-sleep, so a value materially
+//     above 6 s is itself the signal that awake overhead is inflating the cycle.
+//   • the average per-sleep duration (should sit at the ~6 s heartbeat target).
+//   • the average and maximum awake-burst duration — how long the CPU stays awake
+//     between sleeps. In steady DORMANT idle this is governed by
+//     DORMANT_TO_SLEEP_IDLE_MS (1500 ms): the watch cannot re-sleep until it has
+//     been idle that long after each wake, so ~1.5 s awake per ~7.5 s cycle (~20%
+//     awake duty) is expected — this is the proposed drain-diagnostic metric.
+//   • what woke the watch from each sleep (timer vs GPIO/motion). In DORMANT,
+//     motion must NOT be a wake source (§8.4); any dormant GPIO wake means the
+//     INT1 mute leaked and is flagged loudly.
+//
+// Timing uses esp_timer_get_time(), which ESP-IDF advances across light sleep by
+// the real time slept, so the delta around esp_light_sleep_start() is the actual
+// sleep duration even if the watch woke early.
+//
+// Read it over serial: send 0xAD to dump a summary, 0xAE to reset the counters.
+// A summary is also printed automatically on every battery heartbeat (5 min).
+#if MEASURE_USAGE
+static uint64_t g_use_start_us             = 0;  // esp_timer at this boot's measurement start
+static uint64_t g_use_elapsed_base_us      = 0;  // elapsed wall-time carried over from prior boots (NVS)
+static uint64_t g_use_light_sleep_us       = 0;  // total actual light-sleep time
+static uint64_t g_use_deep_sleep_us        = 0;  // total deep-sleep time (always 0 here)
+static uint32_t g_use_sleep_count          = 0;  // completed sleeps (= wakeups)
+static uint64_t g_use_dormant_sleep_us     = 0;
+static uint32_t g_use_dormant_sleep_count  = 0;
+static uint64_t g_use_enf_sleep_us         = 0;
+static uint32_t g_use_enf_sleep_count      = 0;
+
+// Awake-burst tracking: wake-out-of-sleep → entry-into-next-sleep.
+static uint64_t g_use_awake_since_us       = 0;  // start of current burst (0 = none open)
+static uint64_t g_use_awake_burst_total_us = 0;
+static uint64_t g_use_awake_burst_max_us   = 0;
+static uint32_t g_use_awake_burst_count    = 0;
+
+// Wake-to-wake interval (full sleep+work cycle period).
+static uint64_t g_use_last_wake_us           = 0;
+static uint64_t g_use_wake_interval_total_us = 0;
+static uint32_t g_use_wake_interval_count    = 0;
+
+// Wake-cause tally. In DORMANT we expect TIMER only (motion muted per §8.4).
+static uint32_t g_use_wake_timer        = 0;
+static uint32_t g_use_wake_gpio         = 0;
+static uint32_t g_use_wake_other        = 0;
+static uint32_t g_use_dormant_gpio_wake = 0;  // motion leaking through in DORMANT
+
+// ── NVS persistence ───────────────────────────────────────────────────────
+// So the overnight totals survive an unexpected reset (brownout/watchdog) and
+// the "plug in afterwards" workflow. NVS footprint is held CONSTANT and tiny:
+// a single namespace ("usage") with a single fixed key ("m") holding one packed
+// struct. Re-writing the same key overwrites in place — NVS marks the prior copy
+// stale and garbage-collects it, so this never accumulates new entries or grows
+// the partition. Written only on the 5-min heartbeat (≈288 writes/night), never
+// per sleep, to keep flash wear negligible.
+#define USAGE_NVS_MAGIC 0x55534731UL   // 'USG1' — struct version marker
+
+struct UsagePersist {
+    uint32_t magic;
+    uint64_t elapsed_us;
+    uint64_t light_sleep_us;
+    uint64_t deep_sleep_us;
+    uint32_t sleep_count;
+    uint64_t dormant_sleep_us;
+    uint32_t dormant_sleep_count;
+    uint64_t enf_sleep_us;
+    uint32_t enf_sleep_count;
+    uint64_t awake_burst_total_us;
+    uint64_t awake_burst_max_us;
+    uint32_t awake_burst_count;
+    uint64_t wake_interval_total_us;
+    uint32_t wake_interval_count;
+    uint32_t wake_timer;
+    uint32_t wake_gpio;
+    uint32_t wake_other;
+    uint32_t dormant_gpio_wake;
+};
+
+// Total wall time measured, spanning prior boots: persisted base + time this boot.
+static uint64_t usage_elapsed_us() {
+    return g_use_elapsed_base_us + (esp_timer_get_time() - g_use_start_us);
+}
+
+static void usage_load() {
+    UsagePersist p;
+    prefs.begin("usage", true);
+    size_t n  = prefs.getBytesLength("m");
+    bool   ok = (n == sizeof(p)) &&
+                (prefs.getBytes("m", &p, sizeof(p)) == sizeof(p)) &&
+                (p.magic == USAGE_NVS_MAGIC);
+    prefs.end();
+    if (!ok) { g_use_elapsed_base_us = 0; return; }   // first run / stale layout
+
+    g_use_elapsed_base_us        = p.elapsed_us;
+    g_use_light_sleep_us         = p.light_sleep_us;
+    g_use_deep_sleep_us          = p.deep_sleep_us;
+    g_use_sleep_count            = p.sleep_count;
+    g_use_dormant_sleep_us       = p.dormant_sleep_us;
+    g_use_dormant_sleep_count    = p.dormant_sleep_count;
+    g_use_enf_sleep_us           = p.enf_sleep_us;
+    g_use_enf_sleep_count        = p.enf_sleep_count;
+    g_use_awake_burst_total_us   = p.awake_burst_total_us;
+    g_use_awake_burst_max_us     = p.awake_burst_max_us;
+    g_use_awake_burst_count      = p.awake_burst_count;
+    g_use_wake_interval_total_us = p.wake_interval_total_us;
+    g_use_wake_interval_count    = p.wake_interval_count;
+    g_use_wake_timer             = p.wake_timer;
+    g_use_wake_gpio              = p.wake_gpio;
+    g_use_wake_other             = p.wake_other;
+    g_use_dormant_gpio_wake      = p.dormant_gpio_wake;
+}
+
+static void usage_save() {
+    UsagePersist p;
+    memset(&p, 0, sizeof(p));
+    p.magic                  = USAGE_NVS_MAGIC;
+    p.elapsed_us             = usage_elapsed_us();
+    p.light_sleep_us         = g_use_light_sleep_us;
+    p.deep_sleep_us          = g_use_deep_sleep_us;
+    p.sleep_count            = g_use_sleep_count;
+    p.dormant_sleep_us       = g_use_dormant_sleep_us;
+    p.dormant_sleep_count    = g_use_dormant_sleep_count;
+    p.enf_sleep_us           = g_use_enf_sleep_us;
+    p.enf_sleep_count        = g_use_enf_sleep_count;
+    p.awake_burst_total_us   = g_use_awake_burst_total_us;
+    p.awake_burst_max_us     = g_use_awake_burst_max_us;
+    p.awake_burst_count      = g_use_awake_burst_count;
+    p.wake_interval_total_us = g_use_wake_interval_total_us;
+    p.wake_interval_count    = g_use_wake_interval_count;
+    p.wake_timer             = g_use_wake_timer;
+    p.wake_gpio              = g_use_wake_gpio;
+    p.wake_other             = g_use_wake_other;
+    p.dormant_gpio_wake      = g_use_dormant_gpio_wake;
+
+    prefs.begin("usage", false);
+    prefs.putBytes("m", &p, sizeof(p));   // same key → overwrite, constant footprint
+    prefs.end();
+}
+
+static void usage_init() {
+    g_use_start_us       = esp_timer_get_time();
+    g_use_awake_since_us = g_use_start_us;   // boot opens the first awake burst
+    // g_use_last_wake_us stays 0 so the first wake after a reboot does not record
+    // a bogus wake-interval spanning the downtime.
+    usage_load();                            // resume prior totals if present
+}
+
+static void usage_reset() {
+    uint64_t now = esp_timer_get_time();
+    g_use_start_us = now;
+    g_use_elapsed_base_us = 0;
+    g_use_light_sleep_us = g_use_deep_sleep_us = 0;
+    g_use_sleep_count = 0;
+    g_use_dormant_sleep_us = g_use_enf_sleep_us = 0;
+    g_use_dormant_sleep_count = g_use_enf_sleep_count = 0;
+    g_use_awake_burst_total_us = g_use_awake_burst_max_us = 0;
+    g_use_awake_burst_count = 0;
+    g_use_awake_since_us = now;
+    g_use_last_wake_us = 0;
+    g_use_wake_interval_total_us = 0;
+    g_use_wake_interval_count = 0;
+    g_use_wake_timer = g_use_wake_gpio = g_use_wake_other = 0;
+    g_use_dormant_gpio_wake = 0;
+    usage_save();   // overwrite the persisted snapshot with the cleared counters
+}
+
+// Call immediately before esp_light_sleep_start(): closes the current awake burst.
+static void usage_before_sleep() {
+    uint64_t now = esp_timer_get_time();
+    if (g_use_awake_since_us != 0) {
+        uint64_t burst = now - g_use_awake_since_us;
+        g_use_awake_burst_total_us += burst;
+        if (burst > g_use_awake_burst_max_us) g_use_awake_burst_max_us = burst;
+        g_use_awake_burst_count++;
+        g_use_awake_since_us = 0;
+    }
+}
+
+// Call immediately after esp_light_sleep_start() with the measured sleep time.
+static void usage_after_sleep(uint64_t slept_us, bool is_enforcement) {
+    uint64_t now = esp_timer_get_time();
+    g_use_light_sleep_us += slept_us;
+    g_use_sleep_count++;
+    if (is_enforcement) { g_use_enf_sleep_us += slept_us; g_use_enf_sleep_count++; }
+    else                { g_use_dormant_sleep_us += slept_us; g_use_dormant_sleep_count++; }
+
+    switch (esp_sleep_get_wakeup_cause()) {
+        case ESP_SLEEP_WAKEUP_TIMER: g_use_wake_timer++; break;
+        case ESP_SLEEP_WAKEUP_GPIO:  g_use_wake_gpio++;
+            if (!is_enforcement) g_use_dormant_gpio_wake++;
+            break;
+        default:                     g_use_wake_other++; break;
+    }
+
+    if (g_use_last_wake_us != 0) {
+        g_use_wake_interval_total_us += (now - g_use_last_wake_us);
+        g_use_wake_interval_count++;
+    }
+    g_use_last_wake_us   = now;
+    g_use_awake_since_us = now;   // open the next awake burst
+}
+
+static void usage_report() {
+    uint64_t elapsed = usage_elapsed_us();   // spans prior boots (persisted base + this boot)
+    if (elapsed == 0) elapsed = 1;
+    uint64_t sleep_us = g_use_light_sleep_us + g_use_deep_sleep_us;
+    uint64_t awake_us = (elapsed > sleep_us) ? (elapsed - sleep_us) : 0;
+
+    double avg_sleep_s = g_use_sleep_count
+        ? (g_use_light_sleep_us / 1e6 / g_use_sleep_count) : 0.0;
+    double avg_wake_int_s = g_use_wake_interval_count
+        ? (g_use_wake_interval_total_us / 1e6 / g_use_wake_interval_count) : 0.0;
+    double avg_burst_s = g_use_awake_burst_count
+        ? (g_use_awake_burst_total_us / 1e6 / g_use_awake_burst_count) : 0.0;
+
+    Serial.println("USAGE_START");
+    Serial.printf("elapsed_s=%.1f\n", elapsed / 1e6);
+    Serial.printf("light_sleep_s=%.1f (%.1f%%)\n",
+                  g_use_light_sleep_us / 1e6, 100.0 * g_use_light_sleep_us / (double)elapsed);
+    Serial.printf("awake_s=%.1f (%.1f%%)\n",
+                  awake_us / 1e6, 100.0 * awake_us / (double)elapsed);
+    Serial.printf("deep_sleep_s=%.1f (deep sleep is never used by this firmware)\n",
+                  g_use_deep_sleep_us / 1e6);
+    Serial.printf("sleeps=%lu  dormant=%lu  enforcement=%lu\n",
+                  (unsigned long)g_use_sleep_count,
+                  (unsigned long)g_use_dormant_sleep_count,
+                  (unsigned long)g_use_enf_sleep_count);
+    Serial.printf("avg_sleep_duration_s=%.2f  (heartbeat target ~%.1f)\n",
+                  avg_sleep_s, DISCONNECTED_ADV_HEARTBEAT_MS / 1000.0);
+    Serial.printf("avg_wakeup_interval_s=%.2f  (sleep+awake cycle period)\n", avg_wake_int_s);
+    Serial.printf("avg_awake_burst_s=%.2f  max_awake_burst_s=%.2f\n",
+                  avg_burst_s, g_use_awake_burst_max_us / 1e6);
+    Serial.printf("wake_cause: timer=%lu gpio=%lu other=%lu\n",
+                  (unsigned long)g_use_wake_timer,
+                  (unsigned long)g_use_wake_gpio,
+                  (unsigned long)g_use_wake_other);
+    if (g_use_dormant_gpio_wake > 0)
+        Serial.printf("WARNING: %lu DORMANT GPIO wakeups — motion is leaking through "
+                      "as a wake source (should be 0 per spec 8.4)\n",
+                      (unsigned long)g_use_dormant_gpio_wake);
+    Serial.println("USAGE_END");
+}
+#endif // MEASURE_USAGE
+
+// ============================================================
 //  Light sleep
 // ============================================================
 
 static void enter_dormant_sleep() {
     Serial.println("[STATE] DORMANT_SLEEP");
+#if DIAG_AWAKE
+    if (g_dbg_burst_start_ms != 0)
+        Serial.printf("[DIAG] DORMANT awake=%lums loops=%lu max_iter=%lums\n",
+                      (unsigned long)(millis() - g_dbg_burst_start_ms),
+                      (unsigned long)g_dbg_loop_count,
+                      (unsigned long)g_dbg_max_iter_ms);
+#endif
     g_activity_state = STATE_DORMANT_SLEEP;
     push_watch_status();
 
@@ -1634,16 +2043,35 @@ static void enter_dormant_sleep() {
 
     esp_sleep_enable_timer_wakeup(sleep_us);
 
-    // Motion is NOT a wake source in DORMANT (§8.4): outside an enforcement window
-    // there is nothing for motion to trigger, and waking on every wrist movement
-    // was the single largest battery drain. Wake on the timer only. Detach the
-    // edge ISR and disable the INT1 GPIO wake (an earlier enforcement sleep may
-    // have enabled it) so wrist motion stays muted until the next heartbeat.
+    // General motion is NOT a wake source in DORMANT (§8.4): outside an
+    // enforcement window there is nothing for it to trigger, and waking on every
+    // wrist movement was the single largest battery drain. Detach the edge ISR;
+    // the actual wake source is configured below per the look-to-wake feature.
     detachInterrupt(digitalPinToInterrupt(LIS3DH_INT1));
-    lis3dh_clear_int1();
     data_ready        = false;
     g_last_motion_ms  = 0;
+#if LOOK_WAKEUP_ENABLED
+    // Look-to-wake: the INT1 GPIO wake stays armed, but WHICH generator drives it
+    // depends on whether we've already shown a raise:
+    //   consumed == false (armed for a raise): route IA2 (Z-low / face-up) only.
+    //       A wrist-raise wakes the watch immediately; general motion stays muted
+    //       for battery (§8.4).
+    //   consumed == true (raise already shown): route IA1 (motion) only — NOT the
+    //       face-up level interrupt, which would re-latch every LOOK_DURATION_MS
+    //       and spin the CPU while the watch is held up. Instead the motion of
+    //       LOWERING the wrist wakes us promptly to re-check orientation and
+    //       re-arm — so the next glance is responsive instead of waiting for a
+    //       heartbeat. Held perfectly still it makes no motion, so it still
+    //       sleeps the full heartbeat.
+    lis3dh_set_int1_routing(/*motion_ia1=*/g_look_consumed, /*look_ia2=*/!g_look_consumed);
+    lis3dh_read_clear_sources();   // clear latches so INT1 starts LOW (level wake)
+    esp_sleep_enable_gpio_wakeup();
+    gpio_wakeup_enable((gpio_num_t)LIS3DH_INT1, GPIO_INTR_HIGH_LEVEL);
+#else
+    // Feature off: mute the INT1 GPIO wake entirely; wake on the timer only.
+    lis3dh_clear_int1();
     gpio_wakeup_disable((gpio_num_t)LIS3DH_INT1);
+#endif
 
 #if ADVERTISE_DURING_SLEEP
     // Keep BLE radio alive (modem sleep) so the phone can connect and wake
@@ -1660,10 +2088,26 @@ static void enter_dormant_sleep() {
 
     batt_log("pre_sleep");
 
-    esp_light_sleep_start();
+    // Ring off through sleep so no LED is left lit (§5.7 priority 1).
+    led_off();
 
-    // After wakeup: clear the interrupt that woke us, then re-arm the ISR.
+#if MEASURE_USAGE
+    usage_before_sleep();
+    uint64_t _use_t0 = esp_timer_get_time();
+#endif
+    esp_light_sleep_start();
+#if MEASURE_USAGE
+    usage_after_sleep(esp_timer_get_time() - _use_t0, /*is_enforcement=*/false);
+#endif
+
+    // After wakeup: read which generator woke us (this clears the latches), then
+    // re-arm the ISR and restore general-motion routing for the awake/enforce path.
+#if LOOK_WAKEUP_ENABLED
+    uint8_t wake_src = lis3dh_read_clear_sources();  // clears both latches (kept for diagnostics)
+    lis3dh_set_int1_routing(/*motion_ia1=*/true, /*look_ia2=*/true);  // both live while awake; pre-sleep re-selects
+#else
     lis3dh_clear_int1();
+#endif
     data_ready       = false;
     g_last_motion_ms = 0;
     attachInterrupt(digitalPinToInterrupt(LIS3DH_INT1), lis3dh_isr, RISING);
@@ -1678,11 +2122,67 @@ static void enter_dormant_sleep() {
 #endif
 
     Serial.println("[STATE] Woke from light sleep");
+#if LOOK_WAKEUP_ENABLED
+    // Trust the HARDWARE for the raise. IA2 only latches its Z-low (face-up) bit
+    // after the condition has held for LOOK_DURATION_MS, so a set LOOK bit means a
+    // genuine sustained face-up — not the transient of the swing. A single
+    // post-wake accelerometer read can't be trusted for this: the orientation has
+    // usually moved on by the time we read it (that mismatch was what kept
+    // flashing green instead of the rainbow). The accel read is used only to
+    // detect the steadier "wrist lowered" state, to re-arm the one-shot.
+    bool look_fired = (wake_src & LIS3DH_SRC_LOOK) != 0;
+    bool lowered    = lis3dh_is_look_lowered();
+    if (lowered) {
+        Serial.printf("[LOOK] Wrist-lowered (src=0x%02x) — re-arm one-shot\n", wake_src);
+    }
+#if DIAG_AWAKE
+    {
+        Accel _a = read_accel();
+        Serial.printf("[DIAG] wake az=%.2fg look_fired=%d lowered=%d consumed=%d src=0x%02x cause=%d\n",
+                      _a.z, (int)look_fired, (int)lowered, (int)g_look_consumed, wake_src,
+                      (int)esp_sleep_get_wakeup_cause());
+    }
+#endif
+    if (look_fired && !g_look_consumed) {
+        // Genuine wrist-raise → play the full startup animation, then dwell on
+        // live status. consumed stops it replaying while the wrist stays up.
+        g_look_consumed = true;
+      
+        Serial.printf("[LOOK] Wrist-raise (src=0x%02x) — animation + status\n", wake_src);
+        time_t lt = local_now();
+        struct tm ti;
+        gmtime_r(&lt, &ti);
+        int hour = ti.tm_hour;
+        int min  = ti.tm_min;
+        Serial.printf("[LOOK] Time %02d:%02d\n", hour, min);
+        led_show_time(hour, min, ti.tm_sec);
+        g_look_dwell_until = millis() + LOOK_DWELL_MS;
+    } else {
+        // Re-arm the one-shot only once the wrist is clearly lowered again
+        // (hysteresis), so holding the watch up doesn't replay it.
+      
+        Serial.printf("[LOOK] Rejected because %s (src=0x%02x)\n",
+                      g_look_consumed ? "already consumed" : (look_fired ? "transient" : "not face-up"),
+                      wake_src);
+        if (lowered) g_look_consumed = false;
+      
+        // led_note_wake(led_wake_cause_from_esp());  // momentary wake-cause flash (§5.7)
+    }
+#else
+    led_note_wake(led_wake_cause_from_esp());  // momentary wake-cause flash (§5.7)
+#endif
     batt_log("wake_from_sleep");
     g_activity_state   = STATE_DORMANT;
     g_last_activity_ms = millis();
     NimBLEDevice::getAdvertising()->start();
     recalculate_and_rearm();
+#if DIAG_AWAKE
+    // Start tracking the new awake burst that begins now.
+    g_dbg_burst_start_ms = millis();
+    g_dbg_last_loop_ms   = 0;
+    g_dbg_loop_count     = 0;
+    g_dbg_max_iter_ms    = 0;
+#endif
 }
 
 // ============================================================
@@ -1730,7 +2230,18 @@ static void enter_enforcement_sleep() {
 #endif
 
     batt_log("enf_pre_sleep");
+
+    // Ring off through enforcement sleep too (§5.7 priority 1).
+    led_off();
+
+#if MEASURE_USAGE
+    usage_before_sleep();
+    uint64_t _use_t0 = esp_timer_get_time();
+#endif
     esp_light_sleep_start();
+#if MEASURE_USAGE
+    usage_after_sleep(esp_timer_get_time() - _use_t0, /*is_enforcement=*/true);
+#endif
 
     // Wakeup — re-arm ISR.
     lis3dh_clear_int1();
@@ -1747,6 +2258,7 @@ static void enter_enforcement_sleep() {
 #endif
 
     Serial.println("[STATE] Woke from enforcement sleep");
+    led_note_wake(led_wake_cause_from_esp());  // momentary wake-cause flash (§5.7)
     batt_log("enf_wake_from_sleep");
     g_last_activity_ms = millis();
     NimBLEDevice::getAdvertising()->start();
@@ -1757,7 +2269,8 @@ static void enter_enforcement_sleep() {
     // For anchor-based events, run a bounded BLE scan to refresh the device
     // cache, then the upcoming condition check will build a fresh ProxScanVector.
     if (g_active_event &&
-        (g_active_event->criteria == STAY_NEAR || g_active_event->criteria == GET_AWAY)) {
+        (g_active_event->criteria == STAY_NEAR || g_active_event->criteria == GET_AWAY ||
+         g_active_event->criteria == PHONE_AWAY)) {
         start_ble_scan(ENFORCEMENT_SCAN_DURATION_MS);
     }
 }
@@ -1892,6 +2405,8 @@ class WatchWifiCredCallback : public NimBLECharacteristicCallbacks {
         save_wifi_creds();
 
         // Attempt connection immediately
+        Serial.printf("[WIFI] Attempting connection to SSID: %s\n", ssid);
+        Serial.printf("[WIFI] Password: %s\n", pass);
         WiFi.begin(ssid, pass);
         uint32_t t = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t < 8000) delay(50);
@@ -2000,6 +2515,45 @@ class WatchSettingsCallback : public NimBLECharacteristicCallbacks {
     }
 };
 
+// Time characteristic (§5.6): the app sets the watch's absolute UTC clock over
+// BLE, since NTP requires WiFi. Payload: [utc_epoch int64][tz_offset_minutes int16].
+class WatchTimeCallback : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
+        std::string val = pChar->getValue();
+        if (val.size() < 10) return;   // 8 (epoch) + 2 (tz)
+        int64_t utc_epoch;
+        memcpy(&utc_epoch, val.data(), 8);
+        int16_t new_tz;
+        memcpy(&new_tz, val.data() + 8, 2);
+
+        g_tz_offset_min = new_tz;
+        prefs.begin("watch", false);
+        prefs.putShort("tz_off", g_tz_offset_min);
+        prefs.end();
+
+        // Apply the tz offset for localtime conversion. configTime also (re)starts
+        // SNTP, which is harmless: it only overrides our clock if WiFi NTP later
+        // succeeds (more accurate), and never does so on a WiFi-less watch.
+        configTime((long)g_tz_offset_min * 60, 0, "pool.ntp.org");
+
+        // Set the absolute UTC system clock.
+        struct timeval tv;
+        tv.tv_sec  = (time_t)utc_epoch;
+        tv.tv_usec = 0;
+        settimeofday(&tv, nullptr);
+
+        Serial.printf("[TIME] Set via BLE: epoch=%lld tz=%d\n", (long long)utc_epoch, (int)new_tz);
+
+        // Recompute today's schedule and re-arm RTC boundaries against the new time.
+        recalculate_and_rearm();
+
+        uint8_t resp = 0x01;
+        pChar->setValue(&resp, 1);
+        pChar->notify();
+        g_last_activity_ms = millis();
+    }
+};
+
 void indicate_successful_boot() {
     beep(3);
 }
@@ -2046,6 +2600,27 @@ class WatchAnchorIpCallback : public NimBLECharacteristicCallbacks {
         uint8_t resp = 0x01;
         pChar->setValue(&resp, 1);
         pChar->notify();
+        g_last_activity_ms = millis();
+    }
+};
+
+// LED Configuration characteristic (§5.6): recolour/retune the status ring at
+// runtime. Apply + persist the write, then refresh the readable value to the
+// full live config so a subsequent Read reflects what was applied.
+static NimBLECharacteristic *g_led_cfg_char = nullptr;
+
+static void led_cfg_publish_value() {
+    if (!g_led_cfg_char) return;
+    uint8_t buf[2 + LED_SLOT_COUNT * 8];
+    size_t n = led_serialize_config(buf, sizeof(buf));
+    if (n) g_led_cfg_char->setValue(buf, n);
+}
+
+class WatchLedConfigCallback : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
+        std::string val = pChar->getValue();
+        led_apply_config((const uint8_t*)val.data(), val.size());
+        led_cfg_publish_value();  // Read now returns the live config
         g_last_activity_ms = millis();
     }
 };
@@ -2137,7 +2712,9 @@ void setup() {
 
     // Hardware pins first so buzzer works for crash reporting
     pinMode(BUZZER_PIN, OUTPUT);
-    pinMode(VIBRO_PIN,  OUTPUT);
+#if !DISABLE_MOTOR
+    pinMode(VIBRO_PIN,  OUTPUT);  // skipped when disabled so GPIO 10 is left for the LED ring
+#endif
     // ITR8307 reflective IR worn sensor
     pinMode(IR_EMIT, OUTPUT);
     digitalWrite(IR_EMIT, LOW);                       // emitter off until sampled
@@ -2146,6 +2723,11 @@ void setup() {
     pinMode(BATT_ADC_PIN, INPUT);
     analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);  // effective range 0–2.45V; Vbat/2 max ~2.1V
     outputs_off();
+
+    // LED status ring (§5.7). Loads persisted colours from NVS and clears the
+    // ring. On this hardware rev the ring shares GPIO 10 with the (PCB-disabled)
+    // vibration motor; see led_status.cpp. Motor code is left untouched.
+    led_init();
 
 
     bp;
@@ -2275,7 +2857,16 @@ void setup() {
                                                     NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
     anchorIpChar->setCallbacks(new WatchAnchorIpCallback());
 
-    bp; 
+    g_led_cfg_char = svc->createCharacteristic(WATCH_LED_CONFIG_CHAR_UUID,
+                                               NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    g_led_cfg_char->setCallbacks(new WatchLedConfigCallback());
+    led_cfg_publish_value();  // seed the readable value with the current config
+
+    auto *timeChar = svc->createCharacteristic(WATCH_TIME_CHAR_UUID,
+                                               NIMBLE_PROPERTY::WRITE);
+    timeChar->setCallbacks(new WatchTimeCallback());
+
+    bp;
     // CHK 8: start service + advertising
     svc->start();
     NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
@@ -2329,13 +2920,38 @@ void setup() {
 
     Serial.println("[SYS] Boot complete");
     batt_log("boot_complete");
+#if MEASURE_USAGE
+    usage_init();
+    usage_report();
+#endif
     // indicate_successful_boot();
     delay(1000);
+#if !DISABLE_MOTOR
     set_motor(true);
     delay(500);
     set_motor(false);
-    while (!data_ready) delay(10);
-    
+#endif
+    // Wait briefly for the IMU's first interrupt as a liveness check, but never
+    // block boot on it — a still watch produces no motion, and an unbounded wait
+    // here pins the CPU fully awake until the watch is disturbed (this was the
+    // ~60 s boot awake-burst seen in MEASURE_USAGE). Time out and continue; the
+    // motion ISR works normally once we're in loop().
+    {
+        uint32_t t0 = millis();
+        while (!data_ready && millis() - t0 < IMU_FIRST_INT_TIMEOUT_MS) delay(10);
+        if (!data_ready)
+            Serial.println("[SYS] No IMU interrupt within timeout — continuing boot");
+    }
+
+    // Boot flourish on the LED ring, then paint the initial status (blue
+    // dormant, orange enforcing, or off if unpaired) so the ring reflects state
+    // immediately after boot. Done after the motor pulse above, which briefly
+    // drives the shared GPIO 10.
+    led_startup_animation();
+    led_update(led_status_input());
+#if DIAG_AWAKE
+    g_dbg_burst_start_ms = millis();
+#endif
 }
 
 // ============================================================
@@ -2349,7 +2965,22 @@ void loop() {
     uint32_t now_ms  = millis();
     uint32_t now_min = local_minutes_now();
 
-  
+#if DIAG_AWAKE
+    // Per-iteration timing: a healthy loop turns over in ~10–20 ms (the trailing
+    // delay(10) plus light work). A much longer gap means a blocking call ran
+    // this iteration — the prime suspect for unexpected awake time / battery.
+    {
+        uint32_t iter = (g_dbg_last_loop_ms == 0) ? 0 : (now_ms - g_dbg_last_loop_ms);
+        g_dbg_last_loop_ms = now_ms;
+        if (iter > g_dbg_max_iter_ms) g_dbg_max_iter_ms = iter;
+        g_dbg_loop_count++;
+        if (iter > 150)
+            Serial.printf("[DIAG] slow loop iter=%lums state=%d (a blocking call ran)\n",
+                          (unsigned long)iter, (int)g_activity_state);
+    }
+#endif
+
+
 
     // ---- IMU motion interrupt ----
     if (data_ready) {
@@ -2384,9 +3015,17 @@ void loop() {
     }
 
     // ---- Midnight rollover ----
+    // Use a NON-BLOCKING local-time read here. getLocalTime() blocks for up to
+    // 5 s while the RTC is unset (no WiFi/NTP sync yet) — and being on the hot
+    // loop path it stalled EVERY iteration, pinning the CPU awake for seconds
+    // each heartbeat (a major battery drain, unrelated to the look feature).
+    // local_now() is time()-based and returns immediately; we just gate on a
+    // plausibly-set clock (year > 2016) so an unsynced clock is a no-op.
     {
+        time_t lt = local_now();
         struct tm ti;
-        if (getLocalTime(&ti) && ti.tm_mday != g_last_mday) {
+        gmtime_r(&lt, &ti);
+        if (ti.tm_year > (2016 - 1900) && ti.tm_mday != g_last_mday) {
             if (g_last_mday != -1) {
                 Serial.println("[SCHED] Midnight — recalculating");
                 recalculate_and_rearm();
@@ -2396,6 +3035,7 @@ void loop() {
     }
 
     if (g_activity_state == STATE_UNPAIRED) {
+        led_update(led_status_input());  // ring stays off until paired (§5.7)
         delay(10);
         return;
     }
@@ -2413,19 +3053,29 @@ void loop() {
         push_watch_status();
     }
 
+    // ---- WiFi connect detector (async reconnect completed) ----
+    // The DORMANT reconnect path (below) kicks off WiFi.begin() without blocking;
+    // the association lands here on a later loop iteration once WL_CONNECTED.
+    if (!g_wifi_connected && WiFi.status() == WL_CONNECTED) {
+        on_wifi_associated(WiFi.SSID().c_str());
+        recalculate_and_rearm();
+        push_watch_status();
+        g_last_activity_ms = now_ms;
+    }
+
     // ---- WiFi scan / reconnect (DORMANT) ----
     if (g_activity_state == STATE_DORMANT) {
         if (!g_wifi_connected &&
             (now_ms - g_last_wifi_retry_ms) > (uint32_t)ANCHOR_WIFI_RETRY_INTERVAL_S * 1000UL) {
             g_last_wifi_retry_ms = now_ms;
-            try_connect_saved_wifi();
-            if (g_wifi_connected) recalculate_and_rearm();
-            g_last_activity_ms = now_ms;
+            // Non-blocking: success is promoted by the connect detector above, so
+            // the heartbeat wake is not stalled busy-waiting on association.
+            try_connect_saved_wifi_async();
         }
         // Periodic WiFi scan  (for SSID discovery — triggers reconnect)
         if ((now_ms - g_last_wifi_scan_ms) > (uint32_t)WIFI_SCAN_INTERVAL_S * 1000UL) {
             g_last_wifi_scan_ms = now_ms;
-            if (!g_wifi_connected) try_connect_saved_wifi();
+            if (!g_wifi_connected) try_connect_saved_wifi_async();
         }
     }
 
@@ -2434,8 +3084,11 @@ void loop() {
         // DORMANT: scan on a fixed interval for anchor discovery and RSSI updates.
         if (!g_ble_scan->isScanning() &&
             ((now_ms - g_last_ble_scan_ms) > (uint32_t)BLE_SCAN_INTERVAL_S * 1000UL || g_last_ble_scan_ms == 0)) {
+            // Do NOT reset g_last_activity_ms here: the scan runs async and the
+            // DORMANT→SLEEP gate already blocks sleep while a scan is in flight,
+            // so the watch stays awake exactly for the ~300 ms scan and then
+            // sleeps — instead of being pinned awake for a full idle dwell after.
             start_ble_scan();
-            g_last_activity_ms = now_ms;
         }
     }
     // ENFORCEMENT no longer runs a standalone periodic fallback scan (§8.2): each
@@ -2492,9 +3145,15 @@ void loop() {
     // configure the watch; resume sleeping once the phone disconnects (§8.4).
     if (g_activity_state == STATE_DORMANT &&
         !g_bt_connected &&
-        (now_ms - g_last_activity_ms) > DORMANT_TO_SLEEP_IDLE_MS) {
+        !(g_ble_scan && g_ble_scan->isScanning()) &&
+        (now_ms - g_last_activity_ms) > DORMANT_TO_SLEEP_IDLE_MS &&
+#if LOOK_WAKEUP_ENABLED
+        (int32_t)(g_look_dwell_until - now_ms) <= 0 &&  // stay awake during a look dwell
+#endif
+        true) {
         // Motion no longer blocks DORMANT sleep — it is not a wake source here
         // and is ignored above (§8.4), so the idle timer alone governs sleep.
+        // An in-flight discovery scan does block sleep so it can finish (§ above).
         enter_dormant_sleep();
         // Returns here after wakeup (already transitioned back to DORMANT)
     }
@@ -2502,6 +3161,7 @@ void loop() {
     // ---- Serial command handler ----
     // 0xAB  → dump full battery log as CSV over serial
     // 0xAC  → clear the battery log
+    
     while (Serial.available() > 0) {
         uint8_t cmd = (uint8_t)Serial.read();
         if (cmd == 0xAB) {
@@ -2510,14 +3170,30 @@ void loop() {
             batt_log_clear();
             Serial.println("BATTLOG_CLEARED");
         }
+#if MEASURE_USAGE
+        else if (cmd == 0xAD) {
+            usage_report();
+        } else if (cmd == 0xAE) {
+            usage_reset();
+            Serial.println("USAGE_RESET");
+        }
+#endif
     }
 
     // ---- Battery heartbeat (periodic voltage sample) ----
     if (now_ms - g_last_batt_heartbeat_ms >= BATT_HEARTBEAT_INTERVAL_MS) {
         g_last_batt_heartbeat_ms = now_ms;
         batt_log("heartbeat");
+#if MEASURE_USAGE
+        usage_report();
+        usage_save();   // persist snapshot (single fixed NVS key, overwritten in place)
+#endif
     }
 
+    // ---- LED status tick (§5.7) ----
+    // Resolve the current slot, advance the alarm blink, and expire any wake
+    // flash. Output-only; never affects enforcement/sleep/radio behaviour.
+    led_update(led_status_input());
 
     delay(10);
 }

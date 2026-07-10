@@ -120,6 +120,13 @@ The anchor returns a `uint8` score; the watch maps it to a three-way decision:
 
 **Goal:** decide, with minimal false positives and false negatives, whether the user is within ~1–3 ft of their phone. Used to enforce phone-free blocks of time. This is *easier* than Mode A because it is binary and there is a direct ranging signal between watch and phone.
 
+**Shipped implementation (docked variant).** The primary product scenario docks the phone at an anchor, which reduces Mode B to Mode A plus a docking check, and avoids the phone's RF-scanning limits entirely (§3.5):
+- The watch enforces distance from the **docking anchor** using the Mode A query (proximity to the anchor ≈ proximity to the docked phone). This is the `phoneAway` criterion (firmware spec §5.4.1).
+- The **anchor** confirms the phone is docked by holding a persistent BLE link to it and thresholding that link's RSSI (firmware spec §4.11), reporting a `docked` flag the watch reads during its query. The watch fuses them as `near_phone = undocked OR (prox == NEAR)`, so both "user goes to the dock" and "phone leaves the dock" are caught.
+- Fail-open on a degraded watch↔anchor link; a brief approach *or* brief undock is tolerated (`PHONE_AWAY_TOLERANCE_S`).
+
+The full two-factor fusion below (direct watch↔phone RSSI + environment co-location) is the fallback for a *bare-phone* Mode B (no docking anchor) and the foundation Mode C builds on.
+
 ### 3.1 Two independent factors
 
 The detector fuses two signals that fail in different ways:

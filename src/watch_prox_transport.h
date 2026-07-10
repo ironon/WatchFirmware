@@ -44,10 +44,14 @@ void prox_feed_wifi_aps();
 // as it was advertised — PUBLIC vs RANDOM must match or the connect fails),
 // write the scan vector, read the score. Blocks until complete or timed out.
 // Returns true on success; result is valid only if true is returned.
+// out_dock (optional, phoneAway/Mode B): if non-null, also reads the anchor's
+// Dock Status characteristic and sets *out_dock to 1 (docked), 0 (undocked), or
+// -1 (unknown — char absent or read failed; caller treats unknown as docked).
 bool prox_query_anchor(const uint8_t bleMac_be[6],
                        uint8_t addr_type,
                        const ProxScanVector &vec,
-                       ProxScoreResult &result);
+                       ProxScoreResult &result,
+                       int8_t *out_dock = nullptr);
 
 // Interpret a raw score as NEAR / AWAY / AMBIGUOUS using the threshold rule.
 ProxProximity prox_interpret_score(uint8_t score);

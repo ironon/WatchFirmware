@@ -1,7 +1,53 @@
 # ADHD Habit Enforcement Watch & Anchor — Firmware Specification
 
-**Version:** 0.2 (Draft — adds proximity engine, replaces RSSI threshold classification)
+**Version:** 0.6 (Draft — see Section 0 for spec status, firmware parity, and the change log)
 **Scope:** Firmware for the ESP32-C3-WROOM Watch and ESP32-C3-WROOM Anchor devices, intended as a complete reference for a coding agent.
+
+---
+
+## 0. Spec Status, Versioning & Change Log
+
+This spec changes rapidly. Rules for maintaining this section:
+- **Bump the version** (0.x → 0.x+1) on any normative change — behavior, wire format, constant defaults — and add a change-log entry (date + bullet list) at the same time.
+- **Keep the parity table current:** update statuses whenever firmware work lands or an audit is performed, and stamp the audit date. The table tracks *spec vs. code*, not aspirations.
+- Wire-format changes that require the app and firmware to move in lockstep must be **flagged as lockstep** in both the change log and MOBILE_APP_SPEC §0.
+
+### 0.1 Spec ↔ firmware parity
+
+Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proximity `proximity_engine`. **Last audited: 2026-07-10.**
+
+| Spec area | Watch | Anchor | Notes |
+|---|---|---|---|
+| Schedule system + recurrence (§5.3) | ✅ | ⚠️ | Watch verified: `recalculate_day()` with daily/weekly/monthly, NVS blob persistence, midnight re-arm. Anchor **diverges**: events held in RAM only (lost on reboot) and the active-event check ignores recurrence day — a weekly event matches *every* day. Must implement §4.7 (NVS persist + local `recalculate_day`). |
+| GATT surface (§4.4, §5.6) | ✅ `…0011`–`…0019` present | ✅ `…0002`–`…000D` present | Verified by UUID grep; payload-level parity not re-audited this pass. |
+| Schedule transfer (§6.2) | ✅ v1 blob | ✅ v1 blob | **Format version byte (spec v0.5) not implemented anywhere** — lockstep change with the app's `ScheduleEncoder`. Same lockstep batch: extended Settings payloads (watch §5.6 +`settle_window_min`; anchor §4.4 +`tz_offset`) and Emergency Pass opcodes. |
+| Proximity engine (§4.10, §5.4.1) | ✅ | ✅ | Shared module, working per commit history. |
+| Enforcement / worn / LED / look-to-wake (§5.2–§5.7) | 🟡 | — | Believed implemented; not re-audited line-by-line this pass. |
+| Phone docking (§4.11, `phoneAway` §5.4.1) | 🟡 | 🟡 | Dock characteristics present in code; behavior unaudited. |
+| **Commitment integrity (§9)** | ❌ | ❌ | New in v0.5. Nothing implemented. Phase 1 (§9.9) is the priority slice. |
+| Donning grace + window-start unworn beep (§5.4.4) | ❌ | ❌ (blob parse) | New in v0.6. Event/blob field `donning_grace_s` + Watch Status `condition_met` byte — same lockstep batch. |
+| Anchor schedule persistence + midnight recalc (§4.7 as of v0.5) | — | ❌ | New in v0.5 (replaces the midnight app-push design). |
+
+Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠️ diverges from spec · ❌ not started
+
+### 0.2 Change log
+
+**v0.6 — 2026-07-10**
+- **New §5.4.4 "Donning Grace & Window-Start Worn Handling"** (unblocks the Sunrise Lock template): the watch sends WATCH_REMOVED at window start if already unworn (transition-independent), and a new per-event **`donningGraceS`** field (uint16 seconds, 0 = none) suppresses watch-side enforcement for N seconds after the watch is put on.
+- §3.2 / §6.2: Event struct and schedule blob gain `donning_grace_s` (inserted after `negate`). The v2 blob layout has never been implemented, so `SCHEDULE_FORMAT_VERSION` stays `0x02` — the field ships in the same lockstep batch.
+- §5.6: Watch Status payload gains a **`condition_met`** byte (after `active_event_id`) so the app can distinguish "actively alarming" from "in-window, compliant" — lockstep.
+- §9.1: classification row for `donningGraceS` (decrease = tightening, increase = loosening).
+
+**v0.5 — 2026-07-10**
+- **New §9 "Commitment Integrity — The Watch as Root of Trust":** on-watch schedule-diff gate (tighten = immediate, loosen = quarantined 24 h), canonical tighten/loosen classification shared with the app, on-watch settle timers + settled baselines, pending queue with autonomous promotion, **Pending Changes** characteristic (`…001A`), on-watch **emergency-pass ledger** + characteristic (`…001B`), time-write hardening, settings gating, and a 3-phase rollout plan.
+- §4.7 rewritten: the anchor **persists the full schedule blob to NVS** and recomputes today's event list locally (on receipt / boot / midnight). The app's **midnight push is removed** (a phone cannot reliably run at midnight); replaced by staleness-based foreground push.
+- §5.1.4: mid-day schedule pushes now route through the §9.3 diff gate instead of blind replacement.
+- §6.2: schedule blob gains a leading **format version byte** (`0x02`) — **lockstep** with app + anchor; schedule END responses extended (`0x03` partial-quarantine, `0x04` active-event rejection).
+- §5.6 watch Settings payload extended: +`settle_window_min u16` (clamped 30–240, gated per §9.8); §4.4 anchor Settings payload extended: +`tz_offset_minutes int16` (needed for §4.7 local midnight recalc) — both **lockstep** with the app.
+- §9.6/§5.6: Emergency Pass characteristic gains a SET_ALLOWANCE opcode (`0x02`). §9.3: pending entries store the full proposed state; a newer accepted edit to the same event cancels its pending entries. §9.4: expired pending entries are dropped. §9.7: guard extended to timezone changes via Settings.
+- Audit: watch recurrence support **verified present** (no watch work needed); anchor recurrence/persistence divergence logged in §0.1.
+
+**v0.4 and earlier** — pre-changelog; see git history. (v0.4 added the proximity engine, LED status ring, look-to-wake, analog-clock ring mode.)
 
 ---
 
@@ -18,8 +64,11 @@
    - 5.4 Enforcement
    - 5.5 Anchor Communication
    - 5.6 BLE GATT Service (Watch ↔ Phone)
+   - 5.7 LED Status Indicator
 6. Inter-Device Communication Protocols
 7. Constants & Tunables
+8. Power & Radio Optimization (Watch)
+9. Commitment Integrity — The Watch as Root of Trust
 
 ---
 
@@ -42,10 +91,14 @@
 | IR worn emitter       | GPIO 1   | IR LED drive; HIGH = on                             |
 | IR worn receiver      | GPIO 0   | ADC; phototransistor reflection level              |
 | Vibration motor       | GPIO 10  | HIGH = on                                          |
+| LED status ring       | GPIO 10  | Addressable LED data line. See note below.         |
 | Battery voltage sense | GPIO 3   | ADC, Vbat/2 (non-functional, reserved for future) |
 
 **IMU:** LIS3DHTR, connected via SPI.
 **Worn sensor:** ITR8307/S17/TR8 (C81632) reflective opto-interrupter — a GaAs IR LED emitter (GPIO 1) paired with an NPN phototransistor receiver read on the ADC (GPIO 0). Skin held against the sensor reflects the emitted IR back into the phototransistor.
+**LED status ring:** 12× SK6805-EC15 addressable LEDs in a ring, WS2812-compatible (800 kHz, GRB byte order), driven on a single data line via FastLED. Used purely as a status indicator (Section 5.7); it never affects enforcement logic.
+
+**LED data-pin note (load-bearing — read before wiring the firmware):** On the current hardware revision the ring shares **GPIO 10** with the vibration motor, which is disabled by a PCB switch — so on this revision the motor is non-functional and GPIO 10 carries LED data. The next hardware revision moves the ring to **GPIO 7** (currently SPI MOSI) and restores the vibration motor on GPIO 10. The data pin is therefore a single named constant `LED_RING_DATA_PIN` (Section 7) that is the only thing that changes between revisions. **The LED feature must not modify, gate, or otherwise interfere with the vibration motor driver code on GPIO 10** — on hardware where the motor is active the LED ring is simply not wired to that pin.
 
 ### Anchor (ESP32-C3-WROOM)
 
@@ -88,6 +141,8 @@ enum Criteria {
     stayNear    = 1,   // User must be near anchorId
     getOffWifi  = 2,   // User must disconnect from wifiSSID
     getOnWifi   = 3,   // User must connect to wifiSSID
+    phoneAway   = 4,   // Mode B: the user's phone is docked at anchorId; the user
+                       // must stay away from it (phone-distance commitment).
 }
 
 // EnforcementProfile defines the watch's behavior during enforcement.
@@ -130,6 +185,9 @@ struct Event {
     EnforcementProfile profile;
     bool    negate;                 // If true, this event cancels a recurring event for
                                     // one specific day. See Section 5.3.
+    uint16  donningGraceS;          // Seconds of watch-side enforcement suppression after the
+                                    // watch is put on during this event's window (0 = none).
+                                    // See Section 5.4.4.
     String? anchorId;               // UUID of target anchor. Null if WiFi-based criteria.
     String? wifiSSID;               // Target WiFi network name. Null if anchor-based criteria.
 
@@ -147,6 +205,7 @@ struct Event {
 - Exactly one of `anchorId` or `wifiSSID` must be non-null, except when `negate == true`, in which case both may be null.
 - If `beepAnchors` is non-empty, `anchorProfile` must be non-null.
 - `endTime > startTime` (events may not span midnight).
+- `donningGraceS` must be 0–1800 (app-enforced clamp; the firmware does not correct out-of-range values).
 
 ### 3.3 Anchor Device Record
 
@@ -270,11 +329,16 @@ The anchor stores only one WiFi credential pair. Writing new credentials overwri
 **Payload (binary, little-endian):**
 ```
 [2 bytes: max_beep_minutes (uint16)]
+[2 bytes: tz_offset_minutes (int16, signed, minutes east of UTC)]
 ```
 
 `max_beep_minutes` is the maximum number of minutes the anchor will beep continuously for a single watch-removed event, regardless of event end time. Default: 30. This is a device-level setting, not per-event.
 
-On write: stores setting to NVS, responds with `0x01`.
+`tz_offset_minutes` gives the anchor the timezone it needs to compute local midnight and day-of-week/day-of-month for its local schedule recalculation (§4.7). Wall-clock time itself comes from SNTP once WiFi-connected.
+
+On write: stores settings to NVS, responds with `0x01`.
+
+> **Lockstep note:** the payload grew from 2 to 4 bytes in spec v0.5 — update the app in the same batch as the schedule version byte.
 
 #### Characteristic: Schedule Transfer Control (Write, With Response)
 
@@ -360,6 +424,26 @@ Controls the SG90 servo that mechanically locks or releases the anchor's strap. 
 - `0x01` — Command accepted and executed.
 - `0x02` — Command rejected: an enforcement event is currently active that involves this anchor (see Section 4.9 for the exact check). Only open commands can be rejected; close commands are always accepted.
 
+#### Characteristic: Dock Register (Write, With Response) **(phone docking, §4.11)**
+
+**UUID:** `ANCHOR_DOCK_REGISTER_CHAR_UUID` (`4A0F000C-F8CE-11EE-8001-020304050607`)
+
+Written by the **mobile app** after the phone connects to this anchor, to mark *its own* BLE connection as "the docking phone." The anchor records that connection's handle and thereafter monitors its link RSSI to decide whether the phone is docked (§4.11). This is required because the anchor also accepts transient connections from watches (proximity queries) and from the setup app — it must know which connection to measure.
+
+**Payload (1 byte):** `0x01` — register the writing connection as the docking phone. `0x00` — unregister. Responds `0x01`.
+
+#### Characteristic: Dock Status (Read + Notify) **(phone docking, §4.11)**
+
+**UUID:** `ANCHOR_DOCK_STATUS_CHAR_UUID` (`4A0F000D-F8CE-11EE-8001-020304050607`)
+
+Read by the **watch** during a `phoneAway` proximity query (§5.4.1) to learn whether the phone is still docked at this anchor. The anchor notifies on change.
+
+**Payload (2 bytes):**
+```
+[1 byte: docked   (0x01 = phone docked, 0x00 = undocked / no registered phone)]
+[1 byte: rssi      (last anchor↔phone link RSSI, encoded as rssi + 128; 0 if none)]
+```
+
 ### 4.5 WiFi Operation
 
 After successfully connecting to WiFi, the anchor:
@@ -399,18 +483,20 @@ All UDP datagrams received on `ANCHOR_UDP_PORT` are parsed as follows:
 
 ### 4.7 Anchor Schedule Management
 
-The anchor stores the current day's schedule in RAM after receiving it from the mobile app. The schedule is a sorted list of `Event` structs for today, computed identically to the watch (see Section 5.3). The anchor uses the schedule only to:
+The anchor receives the same full schedule blob as the watch (recurring + one-time events, Section 6.2), **persists it to NVS** on successful receipt, and computes the current day's sorted event list locally via `recalculate_day` (Section 5.3) — on receipt, on boot, and at each local midnight. The anchor never depends on a nightly push to know today's schedule. It uses the day's list only to:
 - Determine whether it should respond to a WATCH_REMOVED command (by checking if its UUID is in `beepAnchors` of the current event).
 - Know when to stop beeping (event `endTime`).
 
+**Local-time dependency:** computing "today" (day-of-week / day-of-month) and local midnight requires wall-clock time plus a timezone offset. The anchor obtains time via SNTP once WiFi-connected and receives `tz_offset_minutes` in its Settings write (§4.4). If the anchor has no valid time (never synced since boot), it behaves as if it has no schedule — no beep windows (fail-open).
+
 The schedule is pushed by the mobile app over WiFi using an HTTP POST to `http://<anchor-ip>/schedule`. See Section 6.2 for the schedule encoding.
 
-The app pushes the schedule to all known anchor IPs unconditionally — it does not wait for or check whether any anchor is online before sending. If an anchor is offline at push time, it simply misses the update. The app pushes the schedule in the following situations:
-- Once daily at midnight (to all known anchors).
+The app pushes the schedule to all known anchor IPs unconditionally — it does not wait for or check whether any anchor is online before sending. If an anchor is offline at push time, it simply misses the update; its persisted schedule keeps recurring events correct until the next successful push. The app pushes the schedule in the following situations:
 - Whenever the user modifies the schedule in the app (to all known anchors).
 - Whenever a new anchor IP is added to the app's anchor table.
+- Opportunistically when the app comes to the foreground and the last successful push to an anchor is stale (older than ~12 h). (There is deliberately **no midnight push** — a mobile app cannot reliably execute at midnight; the anchor's local midnight recalculation replaces it.)
 
-Every day at midnight, the anchor clears its current schedule and waits for the app's push. If no schedule has been received for the current day by the time an event window would begin, the anchor treats `beepAnchors` as empty for all events and will not beep.
+If the anchor has no stored schedule at all (factory-fresh, or NVS cleared), it treats `beepAnchors` as empty for all events and will not beep.
 
 ### 4.8 Anchor Beeping Patterns
 
@@ -567,6 +653,18 @@ This completely replaces the in-memory fingerprint and device registry with the 
 
 The anchor must remain connectable at all times (per Section 4.3). When the watch connects for a proximity query, the anchor services the GATT operations in parallel with its background scan tasks — the connection does not pause or interrupt the scan loop. MTU negotiation to `BLE_REQUESTED_MTU` (512 bytes) is initiated by the watch immediately after connection; the anchor accepts whatever MTU the stack negotiates.
 
+### 4.11 Phone Docking Detection
+
+Used only for `phoneAway` (Mode B) commitments. The anchor confirms the phone is physically docked at it, so the watch can distinguish "user is away from the docked phone" (compliant) from "the phone left the dock with the user" (a violation the watch↔anchor proximity alone cannot see).
+
+**Mechanism:**
+1. The mobile app connects the phone to the anchor and writes `0x01` to `ANCHOR_DOCK_REGISTER_CHAR_UUID`. The anchor stores that connection's handle as the docking-phone handle. The app keeps this connection alive for the whole window (the user is told to leave the app open and disable low-power mode; maintaining the link is the user's responsibility).
+2. The anchor polls the RSSI of the registered connection every `DOCK_RSSI_POLL_MS` (default 2000 ms) via the host `ble_gap_conn_rssi()` call.
+3. **`docked` = (a docking-phone connection is registered and live) AND (its RSSI ≥ `DOCK_RSSI_THRESHOLD_DBM`, default −60 dBm).** A docked phone sits on/beside the anchor, so its link RSSI is very strong; the phone moving even a few feet away, or the connection dropping (weak link / app closed / low-power), drops `docked` to false.
+4. The anchor writes `{docked, rssi}` to `ANCHOR_DOCK_STATUS_CHAR_UUID` and notifies on change. On disconnect of the docking-phone handle, the anchor clears it and reports undocked.
+
+Because a lost/weak link is reported as *undocked* (not "unknown"), the burden is on the user to keep the phone docked and the app healthy — consistent with the product's honesty framing (the anchor-docking path is the reliable one).
+
 ---
 
 ## 5. Watch Firmware
@@ -680,12 +778,13 @@ On every boot:
 #### 5.1.4 Mid-Day Schedule Update
 
 When the app pushes a new schedule while the watch is active:
-1. Deserialize and validate the new schedule.
-2. Store to flash, replacing the previous schedule.
-3. Call `recalculate_day(today)`.
-4. Cancel all existing RTC callbacks.
-5. Re-arm RTC callbacks for all future event boundaries in the updated schedule. Boundaries whose time has already passed today are skipped.
-6. Check whether current time falls in an active event window and enter or exit ENFORCEMENT accordingly.
+1. Deserialize and validate the new schedule — this is the **proposed** schedule.
+2. Run the **commitment-integrity diff gate** (§9.3): tightening changes and new events are accepted into the stored schedule immediately; loosening changes to settled events are quarantined into the pending queue instead of applied. (Until §9 ships, per the §9.9 phasing, this step degrades to Phase-1 active-event protection, and before that to a straight replacement.)
+3. Store the resulting schedule to flash.
+4. Call `recalculate_day(today)`.
+5. Cancel all existing RTC callbacks.
+6. Re-arm RTC callbacks for all future event boundaries in the updated schedule. Boundaries whose time has already passed today are skipped.
+7. Check whether current time falls in an active event window and enter or exit ENFORCEMENT accordingly.
 
 #### 5.1.5 Midnight Initialization
 
@@ -763,6 +862,8 @@ function on_worn_state_changed(is_worn: bool):
 ```
 
 **Note:** The debounce applies symmetrically to both the removal and re-engagement transitions. A 5-second sustained reading change is required in both directions before the worn state changes.
+
+See §5.4.4 for the **window-start worn check** (beep-anchors are notified immediately if the watch is already unworn when a window begins — transitions alone are not sufficient) and the **donning-grace** mechanic.
 
 ---
 
@@ -860,6 +961,17 @@ During ENFORCEMENT state, the watch checks whether the active event's criteria i
 10. For `getAway`: condition is met if watch is AWAY or AMBIGUOUS.
 
 If the BLE connection to the anchor fails or times out, treat as AMBIGUOUS and apply the fail-safe rule above. Do not retry in the same poll cycle; the next scheduled poll or motion interrupt will retry.
+
+**Phone-distance criterion (`phoneAway`) — Mode B **(proximity.cpp):**
+
+`phoneAway` is a phone-distance commitment: the user's phone is docked at `anchorId`, so proximity to that anchor is a proxy for proximity to the phone. It reuses the exact anchor proximity query above (steps 1–8), reads the anchor's **Dock Status** in the same connection (§4.11), and fuses the two:
+
+1. Run the proximity query to `anchorId`, yielding NEAR / AWAY / AMBIGUOUS, and read the Dock Status characteristic → `docked` ∈ {docked, undocked, unknown}.
+2. Compute **`near_phone`** = `undocked` **OR** (`prox == NEAR`). The phone is "with the user" whether the user went to the dock (NEAR) *or* the phone left the dock (undocked). `unknown` docking (anchor didn't report, e.g. old firmware or read failure) is treated as *docked* — a dock read-failure must not by itself trigger enforcement (fail-open on the dock signal).
+3. **Fail-open (reliability rule).** Unlike `getAway`/`stayNear`, if the watch↔anchor query itself is AMBIGUOUS (degraded/failed link) the result resolves to **compliant** — the product must never fire a phone-distance alarm on an uncertain connection (overview §3.2/§8). Only a confident `near_phone` is actionable.
+4. **Tolerance.** A confident `near_phone` does not enforce immediately — "a quick check is fine." The watch records the wall-clock time it first went NEAR (`g_phone_near_since_ts`, using `time()` so the grace survives enforcement light sleep). The condition is met (compliant) until `near_phone` has held continuously for `PHONE_AWAY_TOLERANCE_S` (default 60 s); past that, enforcement begins. Any not-`near_phone` reading resets the grace timer. (A brief undock — picking the phone up to glance at it — is therefore tolerated exactly like a brief approach.)
+
+The anchor treats a `phoneAway` window like any other event for beeping/servo purposes; the distinct interpretation lives on the watch, aside from the docking detection the anchor performs (§4.11).
 
 **WiFi-based criteria (`getOnWifi`, `getOffWifi`):**
 
@@ -1040,6 +1152,25 @@ Example for Normal Silent:
 
 ---
 
+#### 5.4.4 Donning Grace & Window-Start Worn Handling
+
+Two rules (added in v0.6) that make wake-up-style events (Sunrise Lock) work. Both are generic Event mechanics, not a special mode.
+
+**Window-start worn check:** on entering ENFORCEMENT for an event with non-empty `beepAnchors`, the watch immediately evaluates the current worn state. If the watch is **not worn** at window start, it sends WATCH_REMOVED to the event's `beepAnchors` right away — it does not wait for a worn *transition*. (Rationale: a watch charging on the nightstand has been unworn all night; the transition-based path in §5.2 alone would never fire, and the anchor would stay silent through the wake-up window.) The anchor needs no new behavior: it already validates the event window on receipt (§4.6).
+
+**Donning grace (`donningGraceS`):** if an event has `donningGraceS > 0`, the watch suppresses its own enforcement for that many seconds after the watch is put on:
+
+- Compute `grace_deadline = donned_at + donningGraceS`, where `donned_at` is the time of the most recent not-worn → worn transition — or the window start, if the watch is already worn when the window begins (donning the watch just before the window shouldn't be punished).
+- While `now < grace_deadline`, the enforcement condition check (§5.4.1) short-circuits to **met** (the same pattern as the `phoneAway` tolerance): no motor/buzzer output, and the watch may enter enforcement light sleep as usual (cap the sleep at the grace deadline so expiry is not slept through). Anchor beeping is independently quieted by the WATCH_WORN transition (§5.2).
+- When the grace expires, force an immediate condition re-check — do not wait for the next poll boundary.
+- Taking the watch off during grace cancels it (and triggers WATCH_REMOVED as normal); putting it back on starts a fresh grace period.
+
+**Worked example** (Sunrise Lock: `getAway` from the bedroom anchor, beep on the nightstand anchor, `donningGraceS = 300`): at wake time the window opens with the watch on the charger → unworn at window start → the nightstand anchor sounds. The user puts the watch on → WATCH_WORN quiets the anchor and the 300 s grace begins. Still in the bedroom when the grace ends → the watch's `getAway` enforcement starts (vibration/buzzer per profile), and removing the watch again re-triggers the anchor. Out of the bedroom → condition met → quiet. Every parameter is user-set the night before.
+
+**Classification (§9.1):** decreasing `donningGraceS` is a tightening; increasing it is a loosening.
+
+---
+
 ### 5.5 Anchor Communication (Watch Side)
 
 #### 5.5.1 Sending Watch-Removed / Watch-Worn
@@ -1147,9 +1278,14 @@ See Section 6.2 for the full schedule transfer protocol.
 [1 byte:  DISCONNECTED_IS_DORMANT (0 or 1)]
 [1 byte:  AWAY_IS_DORMANT (0 or 1)]
 [2 bytes: timezone_offset_minutes (int16, signed, e.g. -300 for UTC-5)]
+[2 bytes: settle_window_min (uint16, minutes; clamped to 30–240, §9.8)]
 ```
 
 On write: stores all settings to NVS, responds with `0x01`. If a timezone change occurs, re-arm all RTC callbacks using the new offset.
+
+**Gating (§9.7/§9.8):** dormancy-flag changes `true→false` and `settle_window_min` increases are loosenings — quarantined into the pending queue rather than applied; a write containing any quarantined field responds `0x03` (the other fields apply immediately). A timezone change that would place the current local time outside the **currently active** event's window is rejected with `0x02` (§9.7).
+
+> **Lockstep note:** the payload grew from 4 to 6 bytes in spec v0.5 — update the app in the same batch as the schedule version byte.
 
 ---
 
@@ -1184,6 +1320,8 @@ The watch pushes a notification any time any field in this payload changes.
 [1 byte:  worn (0 or 1)]
 [1 byte:  battery_pct (0–100; 0xFF if not yet available)]
 [16 bytes: active_event_id (UUID of current enforcement event; zero-filled if none)]
+[1 byte:  condition_met (1 = enforcement condition currently met, grace active, or not
+          enforcing; 0 = actively alarming. Added v0.6 — lockstep.)]
 [1 byte:  unreachable_anchor_count N]
 for each unreachable notification (N entries):
     [16 bytes: anchor UUID]
@@ -1212,6 +1350,177 @@ for each entry (N entries):
 ```
 
 On write: updates the watch's `AnchorRecord` table entries. Responds with `0x01`.
+
+---
+
+#### Characteristic: Time (Write, With Response)
+
+**UUID:** `WATCH_TIME_CHAR_UUID` (`4A0F0019-F8CE-11EE-8001-020304050607`)
+
+Lets the mobile app set the watch's absolute wall-clock time over BLE. This is required because the watch otherwise obtains time only from NTP, which needs an active WiFi connection; in WiFi-less setups the clock would never be set (schedule windows, `phoneAway` grace, and logging all depend on correct time).
+
+**Payload (binary, little-endian):**
+```
+[8 bytes: utc_epoch (int64, Unix seconds, UTC)]
+[2 bytes: tz_offset_minutes (int16, signed, minutes east of UTC, e.g. -300 for UTC-5)]
+```
+
+On write: the watch sets its system clock (`settimeofday`) to `utc_epoch` and updates `timezone_offset_minutes` (equivalent to the timezone field of the Settings characteristic, §5.6). It then re-arms RTC callbacks and runs `recalculate_day(today)` so schedule boundaries reflect the corrected time. Responds with `0x01`.
+
+The app pushes time on pairing, on every app-foreground while connected, and after any timezone change. The `tz_offset_minutes` here and in the Settings characteristic must be kept consistent; a write to either updates the same stored offset.
+
+---
+
+#### Characteristic: LED Configuration (Write With Response, Read)
+
+**UUID:** `WATCH_LED_CONFIG_CHAR_UUID`
+
+The app uses this characteristic to recolour and re-tune the LED status ring at runtime (Section 5.7). Every visible status (dormant, enforcement-idle, enforcement-alarm, and the per-wake-cause flashes) is a configurable *slot*; the colour and blink timing of any slot can be changed without a firmware update. The watch persists the configuration to NVS and applies it immediately.
+
+**Write payload (binary, little-endian):**
+```
+[1 byte:  global_brightness (0–255; passed to FastLED.setBrightness)]
+[1 byte:  slot count N]
+for each slot (N entries):
+    [1 byte:  slot_id        (see LedStatusSlot enum, Section 5.7)]
+    [1 byte:  R]
+    [1 byte:  G]
+    [1 byte:  B]
+    [2 bytes: blink_on_ms    (uint16; 0 = steady, no blink)]
+    [2 bytes: blink_off_ms   (uint16; ignored when blink_on_ms == 0)]
+```
+
+A write may carry any subset of slots (`N` from 0 to the number of slots); unlisted slots keep their current values. A slot listed with `blink_on_ms == 0` is rendered as a steady colour. `global_brightness` is always applied. Unknown `slot_id` values are skipped.
+
+On write: clamp/store the listed slots and brightness to NVS, re-render the ring against the current status, respond `0x01`. Respond `0x00` if the payload is malformed (length shorter than `2 + N*8`).
+
+**Read payload:** the current full configuration, in the same layout as a write that lists **every** slot (i.e. `N` = total slot count), so the app can read back the live colours.
+
+---
+
+#### Characteristic: Pending Changes (Read + Notify) **(commitment integrity, §9.5)**
+
+**UUID:** `WATCH_PENDING_CHAR_UUID` (`4A0F001A-F8CE-11EE-8001-020304050607`)
+
+Exposes the watch's authoritative queue of quarantined loosening changes (§9.3–9.5), so the app can render pending state truthfully and recover it after a reinstall.
+
+**Payload (little-endian):**
+```
+[1 byte: pending count N]
+for each entry (N entries):
+    [16 bytes: event UUID (zero-filled for non-event entries)]
+    [1 byte:   change type (0=delete, 1=loosen-modify, 2=negate-day, 3=setting change)]
+    [4 bytes:  seconds until apply (uint32, elapsed-time basis)]
+```
+
+Notifies whenever the queue changes (entry added, promoted, or rejected).
+
+---
+
+#### Characteristic: Emergency Pass (Write With Response + Read) **(commitment integrity, §9.6)**
+
+**UUID:** `WATCH_PASS_CHAR_UUID` (`4A0F001B-F8CE-11EE-8001-020304050607`)
+
+The rolling emergency-pass ledger lives on the watch (§9.6). The app spends and inspects passes through this characteristic.
+
+**Write payload (spend):**
+```
+[1 byte:   0x01 (SPEND)]
+[16 bytes: event UUID]
+[4 bytes:  local date as YYYYMMDD (uint32)]
+```
+**Response:** `0x01` + `[1 byte: passes remaining]` on success; `0x02` + `[0x00]` if the budget is exhausted; `0x00` on malformed payload.
+
+**Write payload (set allowance):**
+```
+[1 byte: 0x02 (SET_ALLOWANCE)]
+[1 byte: new allowance]
+```
+**Response:** `0x01` — applied immediately (allowance lowered or unchanged); `0x03` — quarantined (an allowance raise is a loosening → pending queue, §9.6).
+
+**Read payload:**
+```
+[1 byte: allowance]
+[1 byte: remaining]
+for each spent pass still inside the rolling window:
+    [4 bytes: seconds until it regenerates (uint32, elapsed-time basis)]
+```
+
+---
+
+### 5.7 LED Status Indicator
+
+The watch carries a ring of 12 SK6805 addressable LEDs (hardware: Section 1) used as a passive status indicator. It conveys, at a glance, what the watch is doing — whether it is asleep, resting, or actively enforcing — and *why* it last woke. The ring is **output-only**: nothing in this section may change enforcement, sleep, scanning, or radio behaviour. All colours and blink timings are runtime-configurable by the app via `WATCH_LED_CONFIG_CHAR_UUID` (Section 5.6) and persisted to NVS; the values below are defaults only.
+
+The ring is driven through FastLED at `LED_RING_DEFAULT_BRIGHTNESS`, on `LED_RING_DATA_PIN` (Section 1 / Section 7). All twelve LEDs always show the same colour (the ring is a single logical indicator, not a progress dial), with the sole exception of the blink behaviour described below.
+
+#### 5.7.1 Status Slots
+
+Each distinct thing the ring can show is a **slot**. A slot has an RGB colour and an optional blink (`on_ms` / `off_ms`); the app addresses slots by `slot_id`.
+
+```
+enum LedStatusSlot {
+    LED_SLOT_DORMANT        = 0,   // awake, DORMANT, nothing else to show       (default: blue)
+    LED_SLOT_ENFORCE_IDLE   = 1,   // awake, ENFORCEMENT, condition currently met (default: orange)
+    LED_SLOT_ENFORCE_ALARM  = 2,   // ENFORCEMENT, condition NOT met (alarming)   (default: red, blinking)
+    LED_SLOT_WAKE_MOTION    = 3,   // momentary flash: woke on IMU motion         (default: green)
+    LED_SLOT_WAKE_TIMER     = 4,   // momentary flash: woke on RTC/timer          (default: light blue)
+    LED_SLOT_WAKE_BLE       = 5,   // momentary flash: woke on incoming BLE        (default: white)
+}
+```
+
+**Default slot table** (RGB before global brightness scaling):
+
+| Slot                   | Default RGB     | Blink (on/off ms) | Meaning                                                     |
+|------------------------|-----------------|-------------------|------------------------------------------------------------|
+| `LED_SLOT_DORMANT`     | `0,   0,   255` | steady            | Awake and dormant (the nominal resting "I'm here" colour).  |
+| `LED_SLOT_ENFORCE_IDLE`| `255, 90,  0`   | steady            | In an enforcement window, condition met — no output needed. |
+| `LED_SLOT_ENFORCE_ALARM`| `255, 0,   0`  | `250 / 250`       | In enforcement, condition not met — actively enforcing.     |
+| `LED_SLOT_WAKE_MOTION` | `0,   255, 0`   | steady*           | Just woke from light sleep because of motion.               |
+| `LED_SLOT_WAKE_TIMER`  | `0,   180, 255` | steady*           | Just woke from light sleep on the RTC/event timer.          |
+| `LED_SLOT_WAKE_BLE`    | `255, 255, 255` | steady*           | Just woke from light sleep on an incoming BLE packet.       |
+
+\* Wake-cause slots are shown as a momentary flash of `LED_WAKE_FLASH_MS` (Section 7), not continuously; see resolution rules below.
+
+#### 5.7.2 Rendering Resolution
+
+The ring shows exactly one slot at any instant. The watch re-evaluates which slot to display on every relevant event (sleep entry, wake, activity-state change, enforcement condition transition) using this fixed priority — highest first:
+
+1. **Asleep → ring OFF.** Whenever the watch is in `DORMANT_SLEEP` or enforcement light sleep (Section 5.4.2), all LEDs are cleared (`FastLED.clear()` + `show()`) *immediately before* the `esp_light_sleep_start()` call. "Off" means every pixel black; there is no separate power-enable line (GPIO 21 is the buzzer and is owned by existing firmware — the LED feature must not touch it). The ring draws only its quiescent leakage while asleep.
+
+2. **Active enforcement alarm.** While `activity_state == ENFORCEMENT` **and** the enforcement condition is **not met** (i.e. a profile pattern from Section 5.4.3 is running), the ring shows `LED_SLOT_ENFORCE_ALARM`, blinking per its `on_ms`/`off_ms`. This overrides the steady state colour so the visual alarm tracks the buzzer/motor alarm. The instant the condition transitions back to met, the ring drops to priority 4.
+
+3. **Wake-cause flash (momentary).** On any transition *out of* light sleep into an awake state, the watch flashes the slot for the wake source that fired, for `LED_WAKE_FLASH_MS`:
+   - IMU motion interrupt (GPIO 4) → `LED_SLOT_WAKE_MOTION` (green).
+   - RTC / event-boundary timer → `LED_SLOT_WAKE_TIMER` (light blue).
+   - Incoming BLE packet/connection → `LED_SLOT_WAKE_BLE` (white).
+
+   The flash is non-blocking: it does not delay scanning, the proximity query, or condition evaluation — it is a colour the renderer holds until `LED_WAKE_FLASH_MS` has elapsed, after which the ring falls through to priority 4 (or to priority 2 if by then the watch is in an active alarm). If the watch goes back to sleep before the flash elapses, priority 1 wins and the ring goes off.
+
+   Note on wake sources by state: per Section 8.4, motion is a wake source **only during ENFORCEMENT**; in `DORMANT_SLEEP` the watch wakes on the RTC timer (and BLE, when reachable) only. The renderer simply colours whichever source actually woke it, so a dormant wake is normally light blue (timer) or white (BLE), and a green motion flash appears only inside enforcement.
+
+4. **Steady activity colour.** When awake with none of the above active, the ring shows the colour for the current activity state:
+   - `DORMANT` → `LED_SLOT_DORMANT` (blue).
+   - `ENFORCEMENT`, condition met → `LED_SLOT_ENFORCE_IDLE` (orange).
+   - `UNPAIRED` → ring off (no status to show until paired). This is a rendering choice, not a separate slot.
+
+So a typical enforcement wake looks like: green flash (motion) → settles to orange (in-window, compliant) → turns red-blinking the moment the condition is found not met → back to orange when the user complies → off when the watch light-sleeps again. A typical dormant wake looks like: light-blue flash (timer) → blue (dormant) → off on return to sleep.
+
+#### 5.7.3 Implementation Notes
+
+- The renderer is a single function, e.g. `led_render(LedStatusSlot active_slot)`, plus a small `led_update()` ticked from the main loop that (a) resolves the current slot via the priority rules, (b) advances the alarm blink phase, and (c) expires the wake-cause flash. No status logic lives in the BLE or enforcement modules — they call `led_note_wake(cause)` / `led_note_state_change()` and let the renderer decide.
+- Slot colours, brightness, and blink timings load from NVS on boot (falling back to the defaults above) before the first render, so the very first wake already reflects any app customisation.
+- The ring must be cleared before *every* light-sleep entry path (DORMANT_SLEEP and enforcement light sleep) to avoid leaving an LED lit through sleep; this is the only hard ordering requirement relative to the existing sleep code.
+
+#### 5.7.4 Analog clock display mode
+
+Because the 12-LED ring maps naturally onto a clock face (one LED per hour position), the watch can render the current time directly on the ring via `led_show_time(hour, minute)`. This is an opt-in display, separate from the status-slot resolver above (Section 5.7.2) — it paints the ring explicitly rather than through `led_update()`, and the next status tick repaints over it.
+
+- LED index → clock position: the ring is wired so index `0` is the 12-o'clock LED's neighbour; the renderer maps a clock position `p` (0 = 12 o'clock) to LED index `11 - p`, so positions advance clockwise around the physical ring.
+- **Hour hand:** the LED at `hour % 12` lit **red**.
+- **Minute hand:** the LED at `minute / 5` (nearest 5-minute mark) lit **green**.
+- **Overlap:** when the hour and minute hands fall on the same LED, that single LED is lit **yellow** instead of stacking colours.
+- All other LEDs are off. Brightness uses the configured ring brightness. The hand colours are currently fixed in code (not yet exposed as configurable slots).
 
 ---
 
@@ -1249,6 +1558,7 @@ Write sequential chunks to the data characteristic. Each chunk is at most `BLE_M
 
 **Schedule binary encoding (little-endian):**
 ```
+[1 byte:   format version (currently 0x02; receivers reject unknown versions)]
 [2 bytes:  event count N (uint16)]
 for each Event (N entries):
     [16 bytes: UUID (raw bytes)]
@@ -1262,6 +1572,7 @@ for each Event (N entries):
     [1 byte:   enforcementProfile]
     [1 byte:   anchorProfile (0xFF if null)]
     [1 byte:   negate (0 or 1)]
+    [2 bytes:  donning_grace_s (uint16 seconds; 0 = none. See §5.4.4. Added v0.6, same lockstep batch)]
     [1 byte:   anchorId presence flag (0=absent, 1=present)]
     [16 bytes: anchorId UUID (zero-filled if absent)]
     [1 byte:   wifiSSID length L (0 if absent)]
@@ -1281,8 +1592,15 @@ Write to the control characteristic with:
 
 On receiving END:
 - Compute CRC32 of the received buffer.
-- If matches: deserialize, store to flash, run `recalculate_day(today)`, re-arm callbacks. Respond `0x01`.
 - If mismatch: discard buffer, respond `0x00`. App must retry from BEGIN.
+- If matches: check the leading format version byte (unknown version → discard, respond `0x00`), then:
+  - **Anchor:** deserialize, persist per §4.7, respond `0x01`.
+  - **Watch:** run the §9.3 commitment-integrity diff gate and respond:
+    - `0x01` — accepted in full.
+    - `0x03` — accepted, but one or more loosening changes were quarantined into the pending queue (app should read the Pending Changes characteristic, §9.5).
+    - `0x04` — rejected in full: the push would loosen the **currently active** event (§9.3 Phase-1 rule; under the full diff gate such changes are quarantined and reported via `0x03` instead).
+
+> **Version-byte note (lockstep):** the leading version byte was added in spec v0.5. A v1 parser would misread it as the low byte of the event count, so the app's `ScheduleEncoder`, the watch, and the anchor must all update together — coordinate the flash.
 
 **ABORT command:**
 ```
@@ -1411,6 +1729,25 @@ MINIMUM_BLE_DELAY_ENFORCEMENT      = 30000     // (tunable) ms to wait before re
 // Schedule
 MAX_EVENTS_PER_DAY                 = 64        // maximum events recalculate_day will return
 
+// LED status ring (Section 5.7) — colours/timings below are NVS defaults, overridable at runtime
+LED_RING_DATA_PIN                  = 10        // (hardware-rev dependent) data line for the SK6805 ring.
+                                               // Current rev: GPIO 10 (vibration motor disabled by PCB switch).
+                                               // Next rev: 7 (ring) with the motor restored on GPIO 10. ONLY
+                                               // this constant changes between revs; never touch motor code.
+LED_RING_COUNT                     = 12        // number of LEDs in the ring
+LED_RING_DEFAULT_BRIGHTNESS        = 40        // (tunable) FastLED master brightness, 0–255
+LED_WAKE_FLASH_MS                  = 600       // (tunable) duration of the momentary wake-cause flash before the
+                                               // ring settles to the steady activity colour
+LED_ALARM_BLINK_ON_MS              = 250       // (tunable) default ENFORCE_ALARM blink on-time
+LED_ALARM_BLINK_OFF_MS             = 250       // (tunable) default ENFORCE_ALARM blink off-time
+// Default slot colours (R, G, B) — see LedStatusSlot enum, Section 5.7
+LED_DEFAULT_DORMANT_RGB            = {0,   0,   255}   // blue       — awake & dormant
+LED_DEFAULT_ENFORCE_IDLE_RGB       = {255, 90,  0}     // orange     — enforcing, condition met
+LED_DEFAULT_ENFORCE_ALARM_RGB      = {255, 0,   0}     // red        — enforcing, condition not met (blinks)
+LED_DEFAULT_WAKE_MOTION_RGB        = {0,   255, 0}     // green      — woke on motion
+LED_DEFAULT_WAKE_TIMER_RGB         = {0,   180, 255}   // light blue — woke on RTC/timer
+LED_DEFAULT_WAKE_BLE_RGB           = {255, 255, 255}   // white      — woke on incoming BLE
+
 // ── Proximity engine (proximity.cpp) ──────────────────────────────────────────
 // Watch-side vector assembly
 PROX_MAX_DEVICES                   = 60        // maximum BLE + WiFi entries in a ProxScanVector;
@@ -1456,6 +1793,14 @@ ANCHOR_PROX_DEVICE_STALE_MS        = 10000     // ms without an RSSI update befo
                                                // and excluded from score computations
 ANCHOR_PROX_MAX_FINGERPRINT_DEVICES = 128      // maximum entries in the anchor device registry / fingerprint;
                                                // new devices beyond this cap are silently ignored
+
+// Mode B — phone-distance (phoneAway) commitments
+PHONE_AWAY_TOLERANCE_S             = 60        // (tunable, watch) grace the user may be near/holding the phone
+                                               // before enforcement; brief "quick checks" don't fire
+DOCK_RSSI_THRESHOLD_DBM            = -60       // (tunable, anchor) anchor↔phone link RSSI at/above which the
+                                               // phone counts as docked; below (or link lost) → undocked
+DOCK_RSSI_POLL_MS                  = 2000      // (tunable, anchor) how often the anchor samples the docking-phone
+                                               // link RSSI and updates Dock Status
 ```
 
 ---
@@ -1506,28 +1851,154 @@ WIFI_SCAN_INTERVAL_S               = 120       // (tunable) DORMANT WiFi reconne
 
 ### 8.4 Motion-wake gating & idle reachability
 
-Wrist-worn motion is the watch's largest *potential* battery drain: at the original sensitivity, casual movement woke the watch every few seconds, and each wake held the CPU awake long enough that an active user could keep it out of sleep most of the day (estimated tens to hundreds of mAh/day). The wakeups bought nothing outside an enforcement window. This is addressed in three parts:
+Wrist-worn motion is the watch's largest *potential* battery drain: at the original sensitivity, casual movement woke the watch every few seconds, and each wake held the CPU awake long enough that an active user could keep it out of sleep most of the day (estimated tens to hundreds of mAh/day). The wakeups bought nothing outside an enforcement window. This is addressed in four parts (the fourth, look-to-wake, deliberately re-introduces a *narrow* orientation-gated wake source):
 
 1. **High-pass-filtered motion interrupt.** The LIS3DH interrupt generator runs through its high-pass filter (`CTRL_REG2` HPIS1), so `MOTION_THRESHOLD_MG` measures *dynamic* acceleration with gravity removed — consistent in every wrist orientation, instead of the original gravity-relative threshold that was hair-trigger in some resting positions and dead in others. Because motion now only matters during enforcement (part 2), the threshold and `MOTION_DURATION_MS` are tuned for *responsiveness* — low enough that normal-pace movement (e.g. walking away from a stayNear anchor) reliably triggers a re-check, with a short duration filter so brief gait peaks still register — rather than for idle battery, which motion no longer affects.
 
-2. **Motion is a wake source only during ENFORCEMENT.** In `DORMANT_SLEEP` the watch wakes on the RTC timer only (`gpio_wakeup_disable` on INT1); motion received while in DORMANT is cleared and ignored without resetting the idle timer. During an enforcement window, motion still wakes the watch and forces an immediate condition re-check (responsiveness preserved exactly).
+2. **Motion is a wake source only during ENFORCEMENT.** In `DORMANT_SLEEP`, general high-pass motion (IA1) is not a wake source; motion received while in DORMANT is cleared and ignored without resetting the idle timer. (When look-to-wake is enabled — part 4 — INT1 stays armed for the *look* generator instead, not general motion.) During an enforcement window, motion still wakes the watch and forces an immediate condition re-check (responsiveness preserved exactly).
 
 3. **Idle reachability without motion.** Because a still watch no longer wakes on motion, two mechanisms keep it reachable by the phone app:
    - **No idle sleep while connected.** Neither `DORMANT_SLEEP` nor enforcement light sleep is entered while `bt_connected` is true, so an in-progress configuration session is never dropped by the radio powering down.
    - **Advertise heartbeat.** While disconnected, `DORMANT_SLEEP` caps its wake timer at `DISCONNECTED_ADV_HEARTBEAT_MS` (default 6 s). The watch surfaces each interval, advertises during its brief awake window, and accepts a connection if a phone is scanning — so a still, idle watch is always reachable within ~one heartbeat, with no button or motion required.
 
+4. **Look-to-wake (wrist-raise), `LOOK_WAKEUP_ENABLED`.** The LIS3DH's second interrupt generator (IA2) detects the "looking at the watch" posture and wakes the watch from `DORMANT_SLEEP` through the shared INT1 line. The watch face / LED ring sit on the **−Z** axis, so holding the face up to the sky points −Z up and the accelerometer reads `az ≈ −1 g` — a **Z-low** event. IA2 is configured `AOI=1 | ZLIE` (`INT2_CFG = 0x90`) reading the *raw* signal (HPF off) so it sees gravity/orientation; it fires when `az < −LOOK_TILT_THRESHOLD_MG` held for `LOOK_DURATION_MS`. The two generators are OR'd onto the single INT1 pin and demuxed in software (`lis3dh_read_clear_sources()` returns a `LIS3DH_SRC_MOTION | LIS3DH_SRC_LOOK` bitmask).
+
+   The wake is a one-shot driven by a `g_look_consumed` flag, and INT1 stays GPIO-armed in both phases (only *which* generator drives it changes, via `lis3dh_set_int1_routing(motion_ia1, look_ia2)`):
+   - **Armed** (`consumed == false`): route IA2 only. A wrist-raise wakes the watch immediately; on a real look it plays the boot/flourish animation and sets `consumed = true`. General motion stays muted for battery.
+   - **Shown** (`consumed == true`): route IA1 (motion) only — *not* the face-up level interrupt, which would re-latch every `LOOK_DURATION_MS` and spin the CPU while the watch is held up. Instead the motion of *lowering* the wrist wakes the watch promptly to re-check orientation; once `lis3dh_is_look_lowered()` reports `az > −LOOK_CLEAR_THRESHOLD_MG`, `consumed` clears and the next glance is armed again. Held perfectly still it makes no motion, so it still sleeps the full heartbeat. The `LOOK_CLEAR` vs `LOOK_TILT` gap is the hysteresis that stops a borderline hold from flip-flopping the one-shot.
+
+   Set `LOOK_WAKEUP_ENABLED = 0` to compile the feature out entirely (reverts to timer-only DORMANT sleep with motion muted).
+
+   > **Tuning note (current build):** the `LOOK_*` and `MOTION_*` thresholds below are deliberately **overpermissive** for the active testing/tuning pass — the intent is many false positives so the gesture fires on the gentlest glance. They should be tightened once the wake plumbing is confirmed end-to-end. Watch the `[DIAG] wake az=…` serial line to see what each wrist motion actually produces.
+
 This is a **latency-vs-battery** tradeoff: a shorter heartbeat connects faster but costs more idle power (the watch is awake during each heartbeat window). A full BLE-controller-wake implementation via `esp_pm` automatic light sleep would make idle reachability essentially free (sub-mA, zero latency) and is the recommended future refactor.
 
 ```
-MOTION_THRESHOLD_MG                = 160       // (tunable, imu.cpp) dynamic accel to trigger; tuned to catch
-                                               // normal-pace movement during enforcement (motion is ignored in
-                                               // DORMANT, so this no longer affects idle battery)
-MOTION_DURATION_MS                 = 40        // (tunable, imu.cpp) motion must persist this long to count;
+MOTION_THRESHOLD_MG                = 48        // (tunable, imu.cpp) OVERPERMISSIVE: dynamic accel to trigger; low
+                                               // so the LOWERING wrist motion reliably wakes to re-arm look-to-wake
+MOTION_DURATION_MS                 = 20        // (tunable, imu.cpp) motion must persist this long to count;
                                                // short so brief gait peaks still register
+LOOK_TILT_THRESHOLD_MG             = 48        // (tunable, imu.cpp) OVERPERMISSIVE RAISE: az below −0.048 g — barely
+                                               // any face-up tilt required; held for LOOK_DURATION_MS
+LOOK_DURATION_MS                   = 40        // (tunable, imu.cpp) IA2 hold time (2 ODR samples); nonzero only so
+                                               // the level interrupt doesn't re-latch instantly when parked face-up
+LOOK_CLEAR_THRESHOLD_MG            = 600       // (tunable, imu.cpp) OVERPERMISSIVE LOWERED: az risen above −0.6 g
+                                               // counts as "lowered" and re-arms the one-shot (hysteresis vs RAISE)
 DISCONNECTED_ADV_HEARTBEAT_MS      = 6000      // (tunable) max DORMANT_SLEEP interval while disconnected, so the
                                                // watch periodically advertises and is reachable by the app
 ```
 
 ---
 
-*End of specification v0.1*
+## 9. Commitment Integrity — The Watch as Root of Trust
+
+**Principle:** the watch, not the app, authoritatively enforces the product's self-binding asymmetry — *instant to tighten, slow to loosen*. The app is an authoring terminal: it is deletable, reinstallable, and replaceable by a generic BLE tool, so any loosening guarantee implemented only app-side can be bypassed in minutes. The watch therefore validates every proposed change itself: **the app proposes, the watch disposes.** The app mirrors these rules for previews (MOBILE_APP_SPEC §8.9), but only the watch's verdict is binding.
+
+This is anti-*impulse* hardening, not anti-adversary security. A determined user with a flashing cable always wins; the goal is that no escape is available in the moment, from the phone, in a few taps (`impulse_overview.md`: "hard to beat on impulse," never "impossible to cheat").
+
+### 9.1 Canonical tighten/loosen classification
+
+Every proposed change to an event is classified **tightening**, **loosening**, or **non-comparable**. Non-comparable ⇒ treated as **loosening** (conservative: if the watch can't prove a change binds at least as hard, it is not instant). This table is the single canonical definition; the app implements identical rules so its previews match the watch's verdicts.
+
+| Field changed | Tightening | Loosening | Non-comparable |
+|---|---|---|---|
+| Event added | always | — | — |
+| Event deleted | — | always | — |
+| Window (`startTime`/`endTime`) | new window ⊇ old (starts earlier and/or ends later) | new window ⊆ old | partial shift (e.g. both start and end move later) |
+| Recurrence | new occurrence set ⊇ old (e.g. weekly→daily, same window) | new set ⊆ old (daily→weekly) | different days (weekly Tue→Thu) |
+| `profile` | ≥ in both dimensions of the partial order below | ≤ in both | otherwise |
+| `criteria` | — | — | any change |
+| `anchorId` / `wifiSSID` target | — | — | any change |
+| `beepAnchors` | superset | subset | overlapping-but-different sets |
+| `anchorProfile` | hard > medium > light | reverse | — |
+| `donningGraceS` | decrease | increase | — |
+| One-time `negate` added against a recurring event | — | always (cancels a day) | — |
+
+**EnforcementProfile partial order** — two independent dimensions:
+- Strictness: `strict > normal > loose`.
+- Output: `both > buzz` and `both > silent`; `buzz` vs `silent` are non-comparable.
+
+A profile change is tightening only if ≥ in both dimensions (and > in at least one); loosening only if ≤ in both; anything else is non-comparable.
+
+**Multi-field edits:** an edit is tightening only if **every** changed field classifies as tightening; a single loosening or non-comparable field makes the whole change a loosening.
+
+### 9.2 On-watch settle state
+
+Alongside the schedule blob, the watch persists per event (NVS):
+- `last_edit_elapsed` — elapsed-time stamp of the last accepted change to this event.
+- `settled_baseline` — snapshot of the event as of its most recent settle (absent for events that have never settled).
+
+An event **settles** when `SETTLE_WINDOW_MIN` (default 120) minutes of elapsed time pass with no accepted change; at that instant its current state is copied into `settled_baseline`.
+
+**Elapsed-time basis:** all integrity timers — settle windows, pending `apply_after`, pass-window aging — count **monotonic elapsed time** using a persisted elapsed-time accumulator spanning reboots (the same pattern as the usage instrumentation's persisted elapsed base), **never wall-clock time**. A clock write therefore cannot accelerate any integrity timer.
+
+### 9.3 Schedule-diff gate
+
+Replaces blind replacement in §5.1.4. On receiving a CRC-valid, version-valid schedule blob over BLE:
+
+1. Deserialize as the **proposed** schedule.
+2. Diff against the **current** schedule per event UUID; classify each change per §9.1.
+3. Partition the changes:
+   - **Apply immediately:** tightenings; new events; any change to an **unsettled** event whose resulting state is still ≥ its `settled_baseline` (or that has no baseline yet — the free first-setup window).
+   - **Apply immediately (no-escape exception):** loosenings of an event that is **not currently active** and whose next occurrence starts more than `LOOSEN_FREE_HORIZON_H` (24) hours away — loosening a far-future commitment grants no in-the-moment escape.
+   - **Quarantine:** all other loosenings (including below-baseline edits of unsettled events), as pending-queue entries with `apply_after = now_elapsed + LOOSEN_DELAY_H` (24) hours.
+4. New current schedule = old schedule + immediately-applied changes. Store to flash, `recalculate_day(today)`, re-arm callbacks.
+5. Append quarantined changes to the **pending queue** (NVS, capacity `PENDING_QUEUE_MAX`). If the queue is full, further loosenings are dropped (not applied); the app sees the truth via §9.5.
+6. Respond per §6.2: `0x01` full accept / `0x03` partial quarantine.
+
+**Pending-entry semantics:** a quarantined entry stores the **full proposed post-change state** (the complete new Event, a deletion marker, a negate date, or a setting value) — not just a classification — so promotion needs no app involvement. A subsequently **accepted** change to the same event (or setting) **cancels** any pending entries for it: the newer intent wins, and re-requesting the loosening restarts its 24 h. (Canceling a pending loosening only ever binds harder, so this rule opens no escape.) Cancellations are reported via §9.5, and the app must surface them.
+
+**Phase-1 minimum (ship first):** before the full diff engine exists, the watch must at minimum reject any push that would delete, shorten, weaken, or negate the **currently active** event — compare the active event only; if it changed loosening-wise, discard the entire push and respond `0x04`. This single check closes the "push an empty schedule at 6am" bypass.
+
+### 9.4 Autonomous promotion
+
+The watch promotes its own pending queue with no app involvement: on every wake (RTC boundary, midnight, boot), it applies any pending entries whose `apply_after` has been reached, then re-runs `recalculate_day` and re-arms callbacks, and notifies §9.5. Promotion therefore happens *no earlier than* its nominal time — a sleeping watch may promote slightly late, never early. Entries whose effect has already expired at promotion time (e.g. a negate-day whose date has passed) are dropped, not applied.
+
+### 9.5 Pending Changes characteristic
+
+See §5.6 (`WATCH_PENDING_CHAR_UUID`, `…001A`) for the wire format. The queue exposed there is the authoritative pending state; the app renders it and can rebuild its own view from it after a reinstall.
+
+### 9.6 Emergency pass ledger
+
+The rolling pass budget (MOBILE_APP_SPEC §8.10) lives on the watch, so clearing app data cannot replenish passes. Ledger: allowance (`pass_allowance`, default `PASS_BUDGET_DEFAULT` = 2), plus elapsed-time stamps of spends within the last `PASS_WINDOW_DAYS` (7) days.
+
+On a SPEND write (§5.6, `…001B`): if spends-in-window < allowance, apply a one-day negate for the given event/date **immediately — deliberately bypassing §9.3** (the pass is the sanctioned escape valve, spendable even on the currently active event), record the spend, respond success + remaining. Otherwise respond exhausted. Raising `pass_allowance` is a loosening ⇒ routed through the pending queue (change type 3); lowering it applies immediately.
+
+### 9.7 Time hardening
+
+- A Time write (§5.6, `…0019`) whose effect would end or skip the **currently active** enforcement window (new local time falls outside the active event's window while the previous time was inside) is rejected with `0x02`. All other time writes are accepted normally.
+- The same guard applies to **timezone changes** arriving via the Settings characteristic (§5.6): a `tz_offset_minutes` change that would place the current local time outside the active event's window is rejected with `0x02`.
+- NTP, when available, takes precedence over app-supplied time.
+- Integrity timers are immune to clock changes regardless (elapsed-time basis, §9.2).
+
+### 9.8 Settings gating
+
+Settings writes route through the same classifier. For the dormancy flags (§5.1.1, where `true` = keep enforcing in that connectivity state): `true→false` is a loosening ⇒ quarantined (pending type 3); `false→true` is a tightening ⇒ immediate. Growing `SETTLE_WINDOW_MIN` (a longer free-edit window) is a loosening ⇒ quarantined; shrinking it is immediate. The settle-window value is clamped to `[SETTLE_WINDOW_FLOOR_MIN, SETTLE_WINDOW_CEIL_MIN]` = **[30, 240] minutes** on write. A Settings write containing any quarantined field responds `0x03` (non-gated fields apply immediately); an all-immediate write responds `0x01`.
+
+### 9.9 Phasing
+
+| Phase | Scope |
+|---|---|
+| **1** | Active-event protection only: reject pushes that loosen the currently active event (`0x04`). Smallest possible change; closes the worst bypass. |
+| **2** | Full diff gate (§9.1–9.3), on-watch settle state (§9.2), pending queue + autonomous promotion (§9.4), Pending Changes characteristic (§9.5). |
+| **3** | On-watch pass ledger (§9.6), time hardening (§9.7), settings gating (§9.8). |
+
+Until a phase ships, the app's mirrored policy (MOBILE_APP_SPEC §8.9/§8.10) is the only enforcement of that slice — acceptable during development, not for release hardware.
+
+### 9.10 Constants
+
+```
+SETTLE_WINDOW_MIN            = 120    // (gated-configurable, §9.8) minutes without edits before an event settles
+SETTLE_WINDOW_FLOOR_MIN      = 30     // lowest allowed settle-window setting (minutes; clamp on write)
+SETTLE_WINDOW_CEIL_MIN       = 240    // highest allowed settle-window setting (minutes; clamp on write)
+LOOSEN_DELAY_H               = 24     // hours a quarantined loosening waits before promotion
+LOOSEN_FREE_HORIZON_H        = 24     // loosenings of events starting further out than this apply immediately
+PASS_BUDGET_DEFAULT          = 2      // emergency passes per rolling window (raising = gated, §9.6)
+PASS_WINDOW_DAYS             = 7      // rolling pass-window length, elapsed-time basis
+PENDING_QUEUE_MAX            = 16     // max quarantined entries; further loosenings are dropped when full
+SCHEDULE_FORMAT_VERSION      = 0x02   // leading version byte of the schedule blob (§6.2)
+```
+
+---
+
+*End of specification v0.6*
