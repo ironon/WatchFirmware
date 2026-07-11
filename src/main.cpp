@@ -1432,7 +1432,11 @@ static void push_watch_status() {
         }
     }
     
-    memcpy(buf + pos, &batt_mv, 2); pos += 2;  // battery millivolts, little-endian
+    // battery_pct (§5.6): 1 byte, 0–100 (0xFF if not available). The battery
+    // sense is reserved/non-functional on this hardware rev, but we emit the
+    // curve-derived percentage so the wire layout matches the spec (and the app).
+    uint32_t batt_pct = voltage_to_percentage(batt_mv);
+    buf[pos++] = (batt_pct > 100) ? 100 : (uint8_t)batt_pct;
 
     // active event UUID (zeros if none)
     if (g_active_event && !uuid_is_zero(g_active_event->id)) {
