@@ -14,19 +14,19 @@ This spec changes rapidly. Rules for maintaining this section:
 
 ### 0.1 Spec ↔ firmware parity
 
-Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proximity `proximity_engine`. **Last audited: 2026-07-10.**
+Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proximity `proximity_engine`. **Last audited: 2026-07-11.**
 
 | Spec area | Watch | Anchor | Notes |
 |---|---|---|---|
-| Schedule system + recurrence (§5.3) | ✅ | ⚠️ | Watch verified: `recalculate_day()` with daily/weekly/monthly, NVS blob persistence, midnight re-arm. Anchor **diverges**: events held in RAM only (lost on reboot) and the active-event check ignores recurrence day — a weekly event matches *every* day. Must implement §4.7 (NVS persist + local `recalculate_day`). |
-| GATT surface (§4.4, §5.6) | ✅ `…0011`–`…0019` present | ✅ `…0002`–`…000D` present | Verified by UUID grep; payload-level parity not re-audited this pass. |
-| Schedule transfer (§6.2) | ✅ v1 blob | ✅ v1 blob | **Format version byte (spec v0.5) not implemented anywhere** — lockstep change with the app's `ScheduleEncoder`. Same lockstep batch: extended Settings payloads (watch §5.6 +`settle_window_min`; anchor §4.4 +`tz_offset`) and Emergency Pass opcodes. |
+| Schedule system + recurrence (§5.3) | ✅ | ✅ | Watch verified: `recalculate_day()` with daily/weekly/monthly, NVS blob persistence, midnight re-arm. **Anchor now implements §4.7** (2026-07-11): full blob persisted to NVS, local `anchor_recalculate_day()` (daily/weekly/monthly + once-by-date + negate + sort) on receipt/boot/midnight; the recurrence-day bug is fixed (matching runs against today's computed list). |
+| GATT surface (§4.4, §5.6) | ✅ `…0011`–`…0019` present | ✅ `…0002`–`…000D` present | Verified by UUID grep; payload-level parity not re-audited this pass. Pending Changes `…001A` / Emergency Pass `…001B` (§9 Phase 2/3) not yet created. |
+| Schedule transfer (§6.2) | ✅ v2 blob | ✅ v2 blob | **Format version byte (0x02) now implemented on watch + anchor** (2026-07-11); unknown version → 0x00 / HTTP 400. `donning_grace_s` field parsed on both. Extended Settings payloads landed (watch +`settle_window_min`, anchor +`tz_offset`). Lockstep with the app's `ScheduleEncoder` — flash together. |
 | Proximity engine (§4.10, §5.4.1) | ✅ | ✅ | Shared module, working per commit history. |
 | Enforcement / worn / LED / look-to-wake (§5.2–§5.7) | 🟡 | — | Believed implemented; not re-audited line-by-line this pass. |
 | Phone docking (§4.11, `phoneAway` §5.4.1) | 🟡 | 🟡 | Dock characteristics present in code; behavior unaudited. |
-| **Commitment integrity (§9)** | ❌ | ❌ | New in v0.5. Nothing implemented. Phase 1 (§9.9) is the priority slice. |
-| Donning grace + window-start unworn beep (§5.4.4) | ❌ | ❌ (blob parse) | New in v0.6. Event/blob field `donning_grace_s` + Watch Status `condition_met` byte — same lockstep batch. |
-| Anchor schedule persistence + midnight recalc (§4.7 as of v0.5) | — | ❌ | New in v0.5 (replaces the midnight app-push design). |
+| **Commitment integrity (§9)** | 🟡 Phase 1 | — | **Phase 1 done** (2026-07-11): watch rejects any push that deletes/shortens/weakens/negates the currently-active event (§9.1 classification, `0x04`). Phase 2 (full diff gate, settle state, pending queue, `…001A`) and Phase 3 (pass ledger, time hardening, settings gating) not started. `settle_window_min` is stored but not yet gating. |
+| Donning grace + window-start unworn beep (§5.4.4) | ✅ | ✅ (blob parse) | **Done** (2026-07-11). Watch: window-start WATCH_REMOVED when unworn, `donningGraceS` grace with deadline/short-circuit/sleep-cap/expiry-recheck/removal-cancel. Watch Status `condition_met` byte added. Anchor parses `donning_grace_s` for wire parity. |
+| Anchor schedule persistence + midnight recalc (§4.7 as of v0.5) | — | ✅ | **Done** (2026-07-11): NVS blob persist + SNTP/tz-based local recalc on receipt/boot/midnight; fail-open when no valid time or no stored schedule. |
 
 Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠️ diverges from spec · ❌ not started
 

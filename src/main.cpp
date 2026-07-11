@@ -154,6 +154,12 @@
 
 // Schedule
 #define MAX_EVENTS_PER_DAY                64
+#define SCHEDULE_FORMAT_VERSION         0x02   // leading schedule-blob version byte (§6.2)
+// Commitment-integrity settle window (§9.2/§9.8). Stored now; the §9.8 gating
+// behavior is Phase 3 — this milestone only clamps & persists the value.
+#define SETTLE_WINDOW_MIN_DEFAULT        120
+#define SETTLE_WINDOW_FLOOR_MIN           30
+#define SETTLE_WINDOW_CEIL_MIN           240
 #define MAX_ANCHOR_RECORDS                16
 #define MAX_SEEN_ANCHORS                  32
 #define MAX_WIFI_CREDS                     4
@@ -229,6 +235,7 @@ struct Event {
     AnchorEnforcementProfile anchorProfile;
     bool     hasAnchorProfile;
     bool     negate;
+    uint16_t donningGraceS;   // §5.4.4: watch-side enforcement grace after donning (0 = none)
     bool     hasAnchorId;
     uint8_t  anchorId[16];
     char     wifiSSID[65];
@@ -345,13 +352,19 @@ static bool g_bt_connected   = false;
 static bool g_wifi_connected = false;
 
 // Settings
-static bool    g_disconnected_is_dormant = true;
-static bool    g_away_is_dormant         = true;
-static int16_t g_tz_offset_min           = 0;   // minutes east of UTC
+static bool     g_disconnected_is_dormant = true;
+static bool     g_away_is_dormant         = true;
+static int16_t  g_tz_offset_min           = 0;   // minutes east of UTC
+static uint16_t g_settle_window_min       = SETTLE_WINDOW_MIN_DEFAULT;  // §9.2/§9.8 (stored; gating is Phase 3)
 
 // Today's event list
 static Event g_today_events[MAX_EVENTS_PER_DAY];
 static int   g_today_event_count = 0;
+
+// Shared scratch for parsing the full schedule blob (all recurrence types)
+// before filtering to a single day. Used by recalculate_day() and the §9 diff
+// gate; both run synchronously on the main task, never concurrently.
+static Event g_all_events_scratch[MAX_EVENTS_PER_DAY * 2];
 
 // Active event (pointer into g_today_events)
 static Event *g_active_event = nullptr;
@@ -401,6 +414,14 @@ static uint32_t g_last_wifi_retry_ms    = 0;
 // phoneAway tolerance: wall-clock time() the watch first went NEAR the docked
 // phone in the active event (0 = currently away/compliant). See PHONE_AWAY_TOLERANCE_S.
 static uint32_t g_phone_near_since_ts   = 0;
+// Donning grace (§5.4.4): wall-clock time() at which the active event's donning
+// grace expires (0 = no grace active). Uses time() so it survives light sleep,
+// like the phoneAway tolerance. While now < deadline the condition short-circuits
+// to met. Cleared when the watch is removed or the event ends.
+static time_t   g_grace_deadline        = 0;
+// True while grace was active on the previous enforcement iteration, so the loop
+// can force an immediate re-check the instant grace expires (§5.4.4).
+static bool     g_grace_was_active      = false;
 static uint32_t g_last_activity_ms      = 0;  // for DORMANT→SLEEP idle timer
 #if LOOK_WAKEUP_ENABLED
 static uint32_t g_look_dwell_until      = 0;  // keep awake showing status until this millis after a look wake
@@ -599,8 +620,10 @@ static void on_worn_state_changed(bool is_worn);
 
 static bool deserialize_events(const uint8_t *data, uint32_t len,
                                 Event *out, int *count, int max_count) {
-    if (len < 2) return false;
+    if (len < 3) return false;   // 1 version + 2 count
     uint32_t pos = 0;
+    uint8_t ver = data[pos++];
+    if (ver != SCHEDULE_FORMAT_VERSION) return false;   // unknown version → reject (§6.2)
     uint16_t n;
     memcpy(&n, data + pos, 2); pos += 2;
     if (n > (uint16_t)max_count) n = (uint16_t)max_count;
@@ -643,6 +666,9 @@ static bool deserialize_events(const uint8_t *data, uint32_t len,
 
         if (pos + 1 > len) return false;
         e.negate = data[pos++] != 0;
+
+        if (pos + 2 > len) return false;
+        memcpy(&e.donningGraceS, data + pos, 2); pos += 2;   // §5.4.4
 
         if (pos + 1 > len) return false;
         e.hasAnchorId = data[pos++] != 0;
@@ -737,10 +763,10 @@ static int32_t date_int_of_utc(int64_t utc_ts) {
 // for today and stores the result in g_today_events.
 static void recalculate_day() {
     g_today_event_count = 0;
-    if (!g_sched_blob || g_sched_blob_len < 2) return;
+    if (!g_sched_blob || g_sched_blob_len < 3) return;
 
     // Parse all events
-    static Event all_events[MAX_EVENTS_PER_DAY * 2];
+    Event *all_events = g_all_events_scratch;
     int all_count = 0;
     if (!deserialize_events(g_sched_blob, g_sched_blob_len,
                              all_events, &all_count, MAX_EVENTS_PER_DAY * 2))
@@ -1416,6 +1442,11 @@ static void push_watch_status() {
     }
     pos += 16;
 
+    // condition_met (§5.6, added v0.6): 1 while the enforcement condition is met,
+    // grace is active, or not enforcing; 0 only while actively alarming.
+    uint8_t condition_met = (g_activity_state == STATE_ENFORCEMENT && !g_enf.condition_met) ? 0 : 1;
+    buf[pos++] = condition_met;
+
     buf[pos++] = (uint8_t)g_unreachable_count;
     for (int i = 0; i < g_unreachable_count; i++) {
         const UnreachableNotification &n = g_unreachable_queue[i];
@@ -1524,8 +1555,16 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     return prox_interpret_score(result.score);
 }
 
+// Donning grace (§5.4.4): true while the active event's grace window is running.
+static bool grace_active() {
+    return g_grace_deadline != 0 && time(nullptr) < g_grace_deadline;
+}
+
 static bool is_enforcement_condition_met(const Event *e) {
     if (!e) return false;
+    // Donning grace (§5.4.4): during the grace window the condition short-circuits
+    // to met — no motor/buzzer output — regardless of the physical criteria.
+    if (grace_active()) return true;
     switch (e->criteria) {
         case STAY_NEAR:
         case GET_AWAY: {
@@ -1686,6 +1725,25 @@ static void enter_enforcement(Event *e) {
     g_active_event   = e;
     g_phone_near_since_ts = 0;   // reset phoneAway tolerance grace for the new event
 
+    // §5.4.4 window-start worn check: if this event beeps anchors and the watch
+    // is already unworn at window start, notify beepAnchors immediately — do not
+    // wait for a worn transition (a watch on the charger never transitions).
+    if (e->beepAnchorCount > 0 && !g_worn) {
+        Serial.println("[GRACE] Unworn at window start — sending WATCH_REMOVED");
+        send_watch_removed_to_anchors(e);
+    }
+
+    // §5.4.4 donning grace: if the watch is already worn when the window opens,
+    // start the grace from the window start (donning just before the window must
+    // not be punished). If unworn, grace begins when the watch is next donned.
+    g_grace_deadline   = 0;
+    g_grace_was_active = false;
+    if (e->donningGraceS > 0 && g_worn) {
+        g_grace_deadline   = time(nullptr) + e->donningGraceS;
+        g_grace_was_active = true;
+        Serial.printf("[GRACE] Worn at window start — grace %us\n", e->donningGraceS);
+    }
+
     // Reconfigure BLE scanner to low duty cycle to reduce radio-on time.
     // Stop any running scan first — NimBLE requires the scanner to be idle
     // before setInterval/setWindow take effect.
@@ -1710,6 +1768,8 @@ static void exit_enforcement() {
     g_activity_state = STATE_DORMANT;
     batt_log("enforcement_exit");
     g_active_event   = nullptr;
+    g_grace_deadline   = 0;   // clear donning grace (§5.4.4)
+    g_grace_was_active = false;
     enforcement_stop();
 
     // Restore DORMANT BLE scan duty cycle (90%).
@@ -1753,6 +1813,134 @@ static void recalculate_and_rearm() {
     }
     // Not in any event window
     if (g_activity_state == STATE_ENFORCEMENT) exit_enforcement();
+}
+
+// ============================================================
+//  Commitment Integrity — §9 Phase 1 (active-event protection)
+//
+//  Phase-1 minimum (§9.3/§9.9): reject any push that would delete, shorten,
+//  weaken, or negate the CURRENTLY ACTIVE event. We compare only the active
+//  event: resolve it for today under the proposed blob and check the change
+//  binds at least as hard (§9.1). Anything that does not — a loosening or a
+//  non-comparable change, or the event vanishing — discards the whole push
+//  (respond 0x04). The full diff gate (§9.1–9.5) is Phase 2.
+// ============================================================
+
+// EnforcementProfile strictness rank: strict(2) > normal(1) > loose(0).
+static int profile_strictness(EnforcementProfile p) { return 2 - ((int)p % 3); }
+// EnforcementProfile output category: 0=silent, 1=both, 2=buzz (id/3).
+static int profile_output(EnforcementProfile p) { return (int)p / 3; }
+
+// Does output category `a` bind at least as hard as `b` in the §9.1 partial
+// order? both dominates silent and buzz; silent vs buzz are non-comparable.
+static bool output_ge(int a, int b) {
+    if (a == b) return true;
+    if (a == 1) return true;    // both >= anything
+    return false;               // a != both and a != b → below or non-comparable
+}
+
+// Resolves the event with `id` for today under the given blob, mirroring
+// recalculate_day's merge/recurrence/negate rules. Returns false if the event
+// does not apply today or is negated (i.e. absent from today's list).
+static bool resolve_event_for_today(const uint8_t *blob, uint32_t len,
+                                    const uint8_t *id, Event *out) {
+    Event *all_events = g_all_events_scratch;
+    int all_count = 0;
+    if (!deserialize_events(blob, len, all_events, &all_count, MAX_EVENTS_PER_DAY * 2))
+        return false;
+
+    int32_t today = local_date_int();
+    uint8_t dow   = local_day_of_week();
+    uint8_t dom   = local_day_of_month();
+
+    bool  found = false;
+    Event best  = {};
+
+    // Recurring match for today.
+    for (int i = 0; i < all_count; i++) {
+        const Event &e = all_events[i];
+        if (!uuid_eq(e.id, id)) continue;
+        bool applies = false;
+        switch (e.recurrenceType) {
+            case DAILY:   applies = true;                  break;
+            case WEEKLY:  applies = (e.dayOfWeek  == dow); break;
+            case MONTHLY: applies = (e.dayOfMonth == dom); break;
+            case ONCE:    applies = false;                 break;
+        }
+        if (applies) { best = e; found = true; }
+    }
+    // Specific (once) event for today overrides (including a negate).
+    for (int i = 0; i < all_count; i++) {
+        const Event &e = all_events[i];
+        if (!uuid_eq(e.id, id)) continue;
+        if (e.recurrenceType == ONCE && date_int_of_utc(e.referenceDate) == today) {
+            best = e; found = true;
+        }
+    }
+
+    if (!found || best.negate) return false;
+    *out = best;
+    return true;
+}
+
+// True iff `neu` binds at least as hard as `old` across every §9.1 dimension
+// (i.e. the change is a tightening or leaves the event unchanged). Any loosening
+// or non-comparable field makes the whole change unacceptable (returns false).
+static bool event_binds_at_least_as_hard(const Event &old_e, const Event &neu) {
+    // Window: new must contain old (start no later, end no earlier).
+    if (neu.startTime > old_e.startTime) return false;
+    if (neu.endTime   < old_e.endTime)   return false;
+
+    // Criteria: any change is non-comparable.
+    if (neu.criteria != old_e.criteria) return false;
+
+    // Target (anchorId / wifiSSID): any change is non-comparable.
+    if (neu.hasAnchorId != old_e.hasAnchorId) return false;
+    if (neu.hasAnchorId && memcmp(neu.anchorId, old_e.anchorId, 16) != 0) return false;
+    if (!neu.hasAnchorId && strncmp(neu.wifiSSID, old_e.wifiSSID, 64) != 0) return false;
+
+    // Profile: must be >= in both strictness and output (partial order §9.1).
+    if (profile_strictness(neu.profile) < profile_strictness(old_e.profile)) return false;
+    if (!output_ge(profile_output(neu.profile), profile_output(old_e.profile))) return false;
+
+    // beepAnchors: new must be a superset of old (every old anchor still present).
+    for (int i = 0; i < old_e.beepAnchorCount; i++) {
+        bool present = false;
+        for (int j = 0; j < neu.beepAnchorCount; j++)
+            if (uuid_eq(old_e.beepAnchors[i], neu.beepAnchors[j])) { present = true; break; }
+        if (!present) return false;
+    }
+
+    // anchorProfile: hard(2) > medium(1) > light(0); new must be >= old.
+    if (old_e.hasAnchorProfile) {
+        if (!neu.hasAnchorProfile) return false;
+        if ((int)neu.anchorProfile < (int)old_e.anchorProfile) return false;
+    }
+
+    // donningGraceS: decrease is tightening, increase is loosening (§9.1).
+    if (neu.donningGraceS > old_e.donningGraceS) return false;
+
+    // Recurrence: new occurrence set must cover old. Conservative — accept only
+    // an unchanged recurrence, or a widening to daily (daily ⊇ any set).
+    bool recurrence_same = (neu.recurrenceType == old_e.recurrenceType &&
+                            neu.dayOfWeek  == old_e.dayOfWeek &&
+                            neu.dayOfMonth == old_e.dayOfMonth);
+    if (!recurrence_same && neu.recurrenceType != DAILY) return false;
+
+    return true;
+}
+
+// Phase-1 gate: does the proposed blob loosen the currently active event?
+static bool proposed_loosens_active_event(const uint8_t *blob, uint32_t len) {
+    // Nothing to protect unless an event is actively being enforced.
+    if (g_activity_state != STATE_ENFORCEMENT || !g_active_event) return false;
+
+    Event old_e = *g_active_event;
+    Event new_e;
+    if (!resolve_event_for_today(blob, len, old_e.id, &new_e))
+        return true;   // active event deleted / negated for today → loosening
+
+    return !event_binds_at_least_as_hard(old_e, new_e);
 }
 
 // ============================================================
@@ -2207,6 +2395,12 @@ static void enter_enforcement_sleep() {
             if (us_to_end < sleep_us) sleep_us = us_to_end;
         }
     }
+    // Donning grace (§5.4.4): never sleep past the grace deadline, so the forced
+    // re-check on expiry is not slept through.
+    if (grace_active()) {
+        uint64_t us_to_grace = (uint64_t)(g_grace_deadline - time(nullptr)) * 1000000ULL;
+        if (us_to_grace < sleep_us) sleep_us = us_to_grace;
+    }
     if (sleep_us < 1000000ULL) sleep_us = 1000000ULL; // minimum 1 s
 
     esp_sleep_enable_timer_wakeup(sleep_us);
@@ -2286,6 +2480,25 @@ static void on_worn_state_changed(bool is_worn) {
         && g_active_event->beepAnchorCount > 0) {
         if (is_worn)  send_watch_worn_to_anchors(g_active_event);
         else          send_watch_removed_to_anchors(g_active_event);
+    }
+
+    // Donning grace (§5.4.4): donning starts a fresh grace period; removing the
+    // watch during grace cancels it. Either way, force an immediate condition
+    // re-check rather than waiting for the next poll boundary.
+    if (g_activity_state == STATE_ENFORCEMENT && g_active_event) {
+        if (is_worn) {
+            if (g_active_event->donningGraceS > 0) {
+                g_grace_deadline   = time(nullptr) + g_active_event->donningGraceS;
+                g_grace_was_active = true;
+                g_last_enf_poll_ms = 0;   // re-check on next loop iteration
+                Serial.printf("[GRACE] Donned — grace %us\n", g_active_event->donningGraceS);
+            }
+        } else if (g_grace_deadline != 0) {
+            g_grace_deadline   = 0;
+            g_grace_was_active = false;
+            g_last_enf_poll_ms = 0;       // re-check immediately
+            Serial.println("[GRACE] Removed during grace — cancelled");
+        }
     }
     push_watch_status();
 }
@@ -2446,15 +2659,27 @@ class WatchSchedCtrlCallback : public NimBLECharacteristicCallbacks {
             if (g_sched_xfer_act && g_sched_xfer_buf
                 && g_sched_xfer_rcvd == g_sched_xfer_exp) {
                 uint32_t crc_calc = esp_crc32_le(0, g_sched_xfer_buf, g_sched_xfer_rcvd);
-                if (crc_calc == crc_recv) {
-                    if (g_sched_blob) free(g_sched_blob);
-                    g_sched_blob     = g_sched_xfer_buf;
-                    g_sched_blob_len = g_sched_xfer_rcvd;
-                    g_sched_xfer_buf = nullptr;
-                    save_schedule_blob(g_sched_blob, g_sched_blob_len);
-                    recalculate_and_rearm();
-                    resp = 0x01;
+                // Reject unknown format versions (§6.2, lockstep): a v1 parser
+                // would misread the version byte as the low byte of the count.
+                bool version_ok = (g_sched_xfer_rcvd >= 1 &&
+                                   g_sched_xfer_buf[0] == SCHEDULE_FORMAT_VERSION);
+                if (crc_calc == crc_recv && version_ok) {
+                    // §9.3 Phase-1 gate: reject a push that would loosen the
+                    // CURRENTLY ACTIVE event; discard the whole push, respond 0x04.
+                    if (proposed_loosens_active_event(g_sched_xfer_buf, g_sched_xfer_rcvd)) {
+                        resp = 0x04;
+                        Serial.println("[SCHED] Rejected: push loosens active event (§9.3 Phase 1)");
+                    } else {
+                        if (g_sched_blob) free(g_sched_blob);
+                        g_sched_blob     = g_sched_xfer_buf;
+                        g_sched_blob_len = g_sched_xfer_rcvd;
+                        g_sched_xfer_buf = nullptr;
+                        save_schedule_blob(g_sched_blob, g_sched_blob_len);
+                        recalculate_and_rearm();
+                        resp = 0x01;
+                    }
                 }
+                // else: CRC or version failure → resp stays 0x00 (§6.2)
             }
             if (g_sched_xfer_buf) { free(g_sched_xfer_buf); g_sched_xfer_buf = nullptr; }
             g_sched_xfer_act = false;
@@ -2497,10 +2722,22 @@ class WatchSettingsCallback : public NimBLECharacteristicCallbacks {
         g_away_is_dormant         = new_away;
         g_tz_offset_min           = new_tz;
 
+        // settle_window_min (uint16) added in v0.5 (payload grew 4->6 bytes).
+        // Clamp to [30,240] (§9.8) and persist. The §9.8 loosening-gate behavior
+        // for this field is Phase 3 — for now we only store the clamped value.
+        if (val.size() >= 6) {
+            uint16_t sw;
+            memcpy(&sw, val.data() + 4, 2);
+            if (sw < SETTLE_WINDOW_FLOOR_MIN) sw = SETTLE_WINDOW_FLOOR_MIN;
+            if (sw > SETTLE_WINDOW_CEIL_MIN)  sw = SETTLE_WINDOW_CEIL_MIN;
+            g_settle_window_min = sw;
+        }
+
         prefs.begin("watch", false);
         prefs.putBool("disc_dorm", g_disconnected_is_dormant);
         prefs.putBool("away_dorm", g_away_is_dormant);
         prefs.putShort("tz_off",   g_tz_offset_min);
+        prefs.putUShort("settle_min", g_settle_window_min);
         prefs.end();
 
         if (tz_changed) {
@@ -2755,6 +2992,7 @@ void setup() {
     g_disconnected_is_dormant = prefs.getBool("disc_dorm", true);
     g_away_is_dormant         = prefs.getBool("away_dorm", true);
     g_tz_offset_min           = prefs.getShort("tz_off", 0);
+    g_settle_window_min       = prefs.getUShort("settle_min", SETTLE_WINDOW_MIN_DEFAULT);
     bool has_uuid     = prefs.isKey("uuid");
     if (has_uuid) prefs.getBytes("uuid", g_watch_uuid, 16);
     prefs.end();
@@ -3111,6 +3349,14 @@ void loop() {
 
     // ---- Enforcement state ----
     if (g_activity_state == STATE_ENFORCEMENT) {
+        // Donning grace expiry (§5.4.4): the instant grace ends, force an
+        // immediate condition re-check rather than waiting for the poll boundary.
+        if (g_grace_was_active && !grace_active()) {
+            g_grace_was_active = false;
+            g_grace_deadline   = 0;
+            g_last_enf_poll_ms = 0;
+            Serial.println("[GRACE] Expired — forcing condition re-check");
+        }
         // Check event end time
         if (g_active_event && now_min >= g_active_event->endTime) {
             exit_enforcement();
