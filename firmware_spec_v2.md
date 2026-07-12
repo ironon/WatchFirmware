@@ -14,17 +14,17 @@ This spec changes rapidly. Rules for maintaining this section:
 
 ### 0.1 Spec ↔ firmware parity
 
-Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proximity `proximity_engine`. **Last audited: 2026-07-11.**
+Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proximity `proximity_engine`. **Last audited: 2026-07-12.**
 
 | Spec area | Watch | Anchor | Notes |
 |---|---|---|---|
 | Schedule system + recurrence (§5.3) | ✅ | ✅ | Watch verified: `recalculate_day()` with daily/weekly/monthly, NVS blob persistence, midnight re-arm. **Anchor now implements §4.7** (2026-07-11): full blob persisted to NVS, local `anchor_recalculate_day()` (daily/weekly/monthly + once-by-date + negate + sort) on receipt/boot/midnight; the recurrence-day bug is fixed (matching runs against today's computed list). |
-| GATT surface (§4.4, §5.6) | ✅ `…0011`–`…0019` present | ✅ `…0002`–`…000D` present | Verified by UUID grep; payload-level parity not re-audited this pass. Pending Changes `…001A` / Emergency Pass `…001B` (§9 Phase 2/3) not yet created. |
+| GATT surface (§4.4, §5.6) | ✅ `…0011`–`…001B` present | ✅ `…0002`–`…000D` present | Verified by UUID grep. Pending Changes `…001A` (Read+Notify) and Emergency Pass `…001B` (Read+Write+Notify) created 2026-07-12. |
 | Schedule transfer (§6.2) | ✅ v2 blob | ✅ v2 blob | **Format version byte (0x02) now implemented on watch + anchor** (2026-07-11); unknown version → 0x00 / HTTP 400. `donning_grace_s` field parsed on both. Extended Settings payloads landed (watch +`settle_window_min`, anchor +`tz_offset`). Lockstep with the app's `ScheduleEncoder` — flash together. |
 | Proximity engine (§4.10, §5.4.1) | ✅ | ✅ | Shared module, working per commit history. |
 | Enforcement / worn / LED / look-to-wake (§5.2–§5.7) | 🟡 | — | Believed implemented; not re-audited line-by-line this pass. |
 | Phone docking (§4.11, `phoneAway` §5.4.1) | 🟡 | 🟡 | Dock characteristics present in code; behavior unaudited. |
-| **Commitment integrity (§9)** | 🟡 Phase 2 | — | **Phase 2 done** (2026-07-11): full §9.1/§9.3 diff gate (per-key event diff, tighten-immediate / loosen-quarantine, unsettled-above-baseline + far-future exceptions), §9.2 settle state in NVS on the monotonic elapsed basis, NVS pending queue (full proposed state, supersede + expiry rules), §9.4 autonomous promotion, Pending Changes `…001A` (Read+Notify, §9.5 format), END responds `0x01`/`0x03` (`0x04` fast-path retired per §6.2). Phase 3 (pass ledger `…001B`, §9.7 time hardening, §9.8 settings gating) not started. |
+| **Commitment integrity (§9)** | ✅ Phases 1–3 | — | **Phase 2 done** (2026-07-11): full §9.1/§9.3 diff gate (per-key event diff, tighten-immediate / loosen-quarantine, unsettled-above-baseline + far-future exceptions), §9.2 settle state in NVS on the monotonic elapsed basis, NVS pending queue (full proposed state, supersede + expiry rules), §9.4 autonomous promotion, Pending Changes `…001A` (Read+Notify, §9.5 format), END responds `0x01`/`0x03` (`0x04` fast-path retired per §6.2). **Phase 3 done** (2026-07-12): Emergency Pass `…001B` (SPEND applies a one-day negate bypassing the gate; SET_ALLOWANCE raise quarantined `0x03` / lower immediate; Read returns allowance/remaining/regen countdowns, all elapsed-basis), §9.7 time + Settings-tz hardening (`0x02` reject when a clock/tz write would escape the active window), §9.8 settings gating (dormancy `true→false` and settle-window increases quarantined, reverse immediate). On-hardware validation pending. |
 | Donning grace + window-start unworn beep (§5.4.4) | ✅ | ✅ (blob parse) | **Done** (2026-07-11). Watch: window-start WATCH_REMOVED when unworn, `donningGraceS` grace with deadline/short-circuit/sleep-cap/expiry-recheck/removal-cancel. Watch Status `condition_met` byte added. Anchor parses `donning_grace_s` for wire parity. |
 | Anchor schedule persistence + midnight recalc (§4.7 as of v0.5) | — | ✅ | **Done** (2026-07-11): NVS blob persist + SNTP/tz-based local recalc on receipt/boot/midnight; fail-open when no valid time or no stored schedule. |
 

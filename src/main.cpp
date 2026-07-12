@@ -3415,21 +3415,67 @@ class WatchSettingsCallback : public NimBLECharacteristicCallbacks {
         int16_t new_tz;
         memcpy(&new_tz, val.data() + 2, 2);
 
+        // §9.7 timezone guard: a tz change that would place the current local
+        // time outside the CURRENTLY ACTIVE event's window is rejected with
+        // 0x02 (the whole write is discarded — the app should retry without
+        // the escaping tz).
         bool tz_changed = (new_tz != g_tz_offset_min);
-        g_disconnected_is_dormant = new_disconn;
-        g_away_is_dormant         = new_away;
-        g_tz_offset_min           = new_tz;
+        if (tz_changed &&
+            time_write_would_escape_active_window((int64_t)time(nullptr), new_tz)) {
+            Serial.println("[INTEG] Settings tz change escapes active window — rejected (0x02)");
+            uint8_t resp = 0x02;
+            pChar->setValue(&resp, 1);
+            pChar->notify();
+            g_last_activity_ms = millis();
+            return;
+        }
 
-        // settle_window_min (uint16) added in v0.5 (payload grew 4->6 bytes).
-        // Clamp to [30,240] (§9.8) and persist. The §9.8 loosening-gate behavior
-        // for this field is Phase 3 — for now we only store the clamped value.
+        // §9.8 settings gating: dormancy flags true→false and settle-window
+        // increases are loosenings → quarantined (pending type 3); the reverse
+        // directions bind harder and apply immediately. Non-gated fields in the
+        // same write still apply; any quarantined field makes the response 0x03.
+        bool quarantined = false;
+        bool pending_changed = false;
+
+        if (new_disconn != g_disconnected_is_dormant) {
+            if (!new_disconn) {   // true→false = enforce less often = loosening
+                queue_pending_setting(1, 0);
+                quarantined = pending_changed = true;
+                Serial.println("[INTEG] DISCONNECTED_IS_DORMANT false quarantined");
+            } else {
+                g_disconnected_is_dormant = true;
+                pending_changed |= cancel_pending_for_setting(1);
+            }
+        }
+        if (new_away != g_away_is_dormant) {
+            if (!new_away) {
+                queue_pending_setting(2, 0);
+                quarantined = pending_changed = true;
+                Serial.println("[INTEG] AWAY_IS_DORMANT false quarantined");
+            } else {
+                g_away_is_dormant = true;
+                pending_changed |= cancel_pending_for_setting(2);
+            }
+        }
+
+        // settle_window_min (uint16, v0.5, payload 4→6 bytes): clamp to
+        // [30,240]; growing the free-edit window is a loosening → quarantined.
         if (val.size() >= 6) {
             uint16_t sw;
             memcpy(&sw, val.data() + 4, 2);
             if (sw < SETTLE_WINDOW_FLOOR_MIN) sw = SETTLE_WINDOW_FLOOR_MIN;
             if (sw > SETTLE_WINDOW_CEIL_MIN)  sw = SETTLE_WINDOW_CEIL_MIN;
-            g_settle_window_min = sw;
+            if (sw > g_settle_window_min) {
+                queue_pending_setting(3, sw);
+                quarantined = pending_changed = true;
+                Serial.printf("[INTEG] settle_window_min %u quarantined\n", sw);
+            } else if (sw != g_settle_window_min) {
+                g_settle_window_min = sw;
+                pending_changed |= cancel_pending_for_setting(3);
+            }
         }
+
+        g_tz_offset_min = new_tz;
 
         prefs.begin("watch", false);
         prefs.putBool("disc_dorm", g_disconnected_is_dormant);
@@ -3438,12 +3484,17 @@ class WatchSettingsCallback : public NimBLECharacteristicCallbacks {
         prefs.putUShort("settle_min", g_settle_window_min);
         prefs.end();
 
+        if (pending_changed) {
+            save_pending_queue();
+            pending_publish();
+        }
+
         if (tz_changed) {
             configTime((long)g_tz_offset_min * 60, 0, "pool.ntp.org");
             recalculate_and_rearm();
         }
 
-        uint8_t resp = 0x01;
+        uint8_t resp = quarantined ? 0x03 : 0x01;
         pChar->setValue(&resp, 1);
         pChar->notify();
         g_last_activity_ms = millis();
@@ -3460,6 +3511,19 @@ class WatchTimeCallback : public NimBLECharacteristicCallbacks {
         memcpy(&utc_epoch, val.data(), 8);
         int16_t new_tz;
         memcpy(&new_tz, val.data() + 8, 2);
+
+        // §9.7 time hardening: a clock write whose effect would end or skip the
+        // CURRENTLY ACTIVE enforcement window (new local time outside the
+        // active event's window) is rejected with 0x02. Integrity timers are
+        // immune to clock changes regardless (elapsed basis, §9.2).
+        if (time_write_would_escape_active_window(utc_epoch, new_tz)) {
+            Serial.println("[INTEG] Time write escapes active window — rejected (0x02)");
+            uint8_t resp = 0x02;
+            pChar->setValue(&resp, 1);
+            pChar->notify();
+            g_last_activity_ms = millis();
+            return;
+        }
 
         g_tz_offset_min = new_tz;
         prefs.begin("watch", false);
@@ -3498,6 +3562,117 @@ class WatchPendingCallback : public NimBLECharacteristicCallbacks {
         uint8_t buf[1 + PENDING_QUEUE_MAX * 21];
         int len = pending_build_payload(buf);
         pChar->setValue(buf, len);
+    }
+};
+
+// Emergency Pass characteristic (§9.6, …001B). The rolling pass ledger lives
+// on the watch so clearing app data cannot replenish passes.
+//   SPEND (0x01 + uuid16 + date u32 YYYYMMDD): if spends-in-window < allowance,
+//   apply a one-day negate for that event/date IMMEDIATELY — deliberately
+//   bypassing the §9.3 gate (the pass is the sanctioned escape valve) — and
+//   respond 0x01 + remaining; else 0x02 + 0x00. 0x00 on malformed payload.
+//   SET_ALLOWANCE (0x02 + u8): lowering applies immediately (0x01); raising is
+//   a loosening → pending queue, type 3 (0x03).
+// Read returns [allowance][remaining] + a regen countdown per spent pass.
+// Response codes are conveyed by value + notify, matching the codebase's
+// established with-response pattern.
+class WatchPassCallback : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
+        std::string val = pChar->getValue();
+        uint8_t resp[2] = { 0x00, 0x00 };
+        int     resp_len = 1;
+
+        if (!val.empty() && (uint8_t)val[0] == 0x01 && val.size() >= 21) {
+            // ---- SPEND ----
+            const uint8_t *uuid = (const uint8_t*)val.data() + 1;
+            uint32_t date;
+            memcpy(&date, val.data() + 17, 4);
+
+            int spent     = pass_prune_and_count();
+            int remaining = (int)g_pass_allowance - spent;
+            if (remaining <= 0) {
+                resp[0] = 0x02; resp[1] = 0x00; resp_len = 2;
+                Serial.println("[PASS] Spend rejected — budget exhausted");
+            } else {
+                // Build the one-day negate: a once event carrying the target
+                // event's UUID with negate=true, dated so date_int_of_utc()
+                // lands on the given local day (noon avoids boundary drift).
+                Event neg;
+                memset(&neg, 0, sizeof(neg));
+                memcpy(neg.id, uuid, 16);
+                neg.recurrenceType = ONCE;
+                neg.negate         = true;
+                neg.referenceDate  = local_ymd_to_utc_epoch((int32_t)date, 720);
+
+                Event *cur = g_all_events_scratch;
+                int    nc  = 0;
+                if (g_sched_blob && g_sched_blob_len >= 3)
+                    deserialize_events(g_sched_blob, g_sched_blob_len, cur, &nc,
+                                       MAX_EVENTS_PER_DAY * 2);
+                int idx = find_event_index(cur, nc, neg.id, true, (int32_t)date);
+                if (idx >= 0) cur[idx] = neg;
+                else if (nc < MAX_EVENTS_PER_DAY * 2) cur[nc++] = neg;
+
+                if (store_current_schedule(cur, nc)) {
+                    recalculate_and_rearm();
+                    // Record the spend (elapsed basis — clock writes can't age it).
+                    for (int i = 0; i < PASS_MAX_STAMPS; i++) {
+                        if (g_pass_spends[i] == 0) {
+                            g_pass_spends[i] = integ_elapsed_now();
+                            break;
+                        }
+                    }
+                    save_pass_ledger();
+                    resp[0] = 0x01; resp[1] = (uint8_t)(remaining - 1); resp_len = 2;
+                    Serial.printf("[PASS] Spent on %02x… for %lu — %d remaining\n",
+                                  uuid[0], (unsigned long)date, remaining - 1);
+                }
+                // store failure → resp stays 0x00
+            }
+        } else if (!val.empty() && (uint8_t)val[0] == 0x02 && val.size() >= 2) {
+            // ---- SET_ALLOWANCE ----
+            uint8_t na = (uint8_t)val[1];
+            if (na <= g_pass_allowance) {
+                g_pass_allowance = na;   // lowering (or unchanged) binds harder → immediate
+                save_pass_ledger();
+                if (cancel_pending_for_setting(4)) {
+                    save_pending_queue();
+                    pending_publish();
+                }
+                resp[0] = 0x01;
+                Serial.printf("[PASS] Allowance set to %d\n", na);
+            } else {
+                queue_pending_setting(4, na);   // raising = loosening → quarantine (§9.6)
+                save_pending_queue();
+                pending_publish();
+                resp[0] = 0x03;
+                Serial.printf("[PASS] Allowance raise to %d quarantined\n", na);
+            }
+        }
+        // else: malformed → 0x00
+
+        pChar->setValue(resp, resp_len);
+        pChar->notify();
+        g_last_activity_ms = millis();
+    }
+
+    void onRead(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
+        uint8_t buf[2 + PASS_MAX_STAMPS * 4];
+        int spent     = pass_prune_and_count();
+        int remaining = (int)g_pass_allowance - spent;
+        if (remaining < 0) remaining = 0;
+        buf[0] = g_pass_allowance;
+        buf[1] = (uint8_t)remaining;
+        int pos = 2;
+        uint32_t now_el = integ_elapsed_now();
+        uint32_t win_s  = (uint32_t)PASS_WINDOW_DAYS * 86400UL;
+        for (int i = 0; i < PASS_MAX_STAMPS; i++) {
+            if (g_pass_spends[i] == 0) continue;
+            uint32_t regen = g_pass_spends[i] + win_s;
+            uint32_t secs  = (regen > now_el) ? (regen - now_el) : 0;
+            memcpy(buf + pos, &secs, 4); pos += 4;
+        }
+        pChar->setValue(buf, pos);
     }
 };
 
@@ -3829,6 +4004,13 @@ void setup() {
         int plen = pending_build_payload(pbuf);
         g_pending_char->setValue(pbuf, plen);
     }
+
+    // Emergency Pass (§9.6, …001B): on-watch rolling pass ledger.
+    g_pass_char = svc->createCharacteristic(WATCH_PASS_CHAR_UUID,
+                                            NIMBLE_PROPERTY::READ |
+                                            NIMBLE_PROPERTY::WRITE |
+                                            NIMBLE_PROPERTY::NOTIFY);
+    g_pass_char->setCallbacks(new WatchPassCallback());
 
     bp;
     // CHK 8: start service + advertising
