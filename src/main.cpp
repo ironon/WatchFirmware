@@ -155,11 +155,17 @@
 // Schedule
 #define MAX_EVENTS_PER_DAY                64
 #define SCHEDULE_FORMAT_VERSION         0x02   // leading schedule-blob version byte (§6.2)
-// Commitment-integrity settle window (§9.2/§9.8). Stored now; the §9.8 gating
-// behavior is Phase 3 — this milestone only clamps & persists the value.
-#define SETTLE_WINDOW_MIN_DEFAULT        120
-#define SETTLE_WINDOW_FLOOR_MIN           30
+// Commitment integrity (§9.10)
+#define SETTLE_WINDOW_MIN_DEFAULT        120   // minutes without edits before an event settles (§9.2)
+#define SETTLE_WINDOW_FLOOR_MIN           30   // settle-window clamp (§9.8)
 #define SETTLE_WINDOW_CEIL_MIN           240
+#define LOOSEN_DELAY_H                    24   // hours a quarantined loosening waits (§9.3)
+#define LOOSEN_FREE_HORIZON_H             24   // far-future loosenings apply immediately (§9.3)
+#define PENDING_QUEUE_MAX                 16   // max quarantined entries (§9.3)
+#define MAX_SETTLE_RECORDS                16   // per-event settle-state slots tracked in NVS (§9.2)
+#define PASS_BUDGET_DEFAULT                2   // emergency passes per rolling window (§9.6)
+#define PASS_WINDOW_DAYS                   7   // rolling pass-window length, elapsed basis (§9.6)
+#define PASS_MAX_STAMPS                   16   // spend-stamp storage cap (>= any sane allowance)
 #define MAX_ANCHOR_RECORDS                16
 #define MAX_SEEN_ANCHORS                  32
 #define MAX_WIFI_CREDS                     4
@@ -202,6 +208,8 @@
 #define WATCH_ANCHOR_IP_CHAR_UUID    "4A0F0017-F8CE-11EE-8001-020304050607"
 #define WATCH_LED_CONFIG_CHAR_UUID   "4A0F0018-F8CE-11EE-8001-020304050607"
 #define WATCH_TIME_CHAR_UUID         "4A0F0019-F8CE-11EE-8001-020304050607"
+#define WATCH_PENDING_CHAR_UUID      "4A0F001A-F8CE-11EE-8001-020304050607"  // §9.5
+#define WATCH_PASS_CHAR_UUID         "4A0F001B-F8CE-11EE-8001-020304050607"  // §9.6
 
 // ============================================================
 //  Enumerations
@@ -1820,14 +1828,20 @@ static void recalculate_and_rearm() {
 }
 
 // ============================================================
-//  Commitment Integrity — §9 Phase 1 (active-event protection)
+//  Commitment Integrity — §9 (Phases 2 + 3)
 //
-//  Phase-1 minimum (§9.3/§9.9): reject any push that would delete, shorten,
-//  weaken, or negate the CURRENTLY ACTIVE event. We compare only the active
-//  event: resolve it for today under the proposed blob and check the change
-//  binds at least as hard (§9.1). Anything that does not — a loosening or a
-//  non-comparable change, or the event vanishing — discards the whole push
-//  (respond 0x04). The full diff gate (§9.1–9.5) is Phase 2.
+//  The watch is the root of trust: the app proposes, the watch disposes.
+//  Every schedule push runs through the diff gate (§9.3): tightenings and new
+//  events apply immediately; loosenings are quarantined into a pending queue
+//  for LOOSEN_DELAY_H hours unless a §9.3 exception applies (unsettled event
+//  still above its settled baseline, or a far-future event). The queue is
+//  promoted autonomously (§9.4) and exposed via the Pending Changes
+//  characteristic …001A (§9.5). The emergency-pass ledger (§9.6), time
+//  hardening (§9.7), and settings gating (§9.8) are Phase 3.
+//
+//  All integrity timers count MONOTONIC ELAPSED TIME via a persisted
+//  accumulator (the same pattern as the MEASURE_USAGE instrumentation), never
+//  wall clock — a Time write cannot accelerate them (§9.2).
 // ============================================================
 
 // EnforcementProfile strictness rank: strict(2) > normal(1) > loose(0).
@@ -1843,54 +1857,14 @@ static bool output_ge(int a, int b) {
     return false;               // a != both and a != b → below or non-comparable
 }
 
-// Resolves the event with `id` for today under the given blob, mirroring
-// recalculate_day's merge/recurrence/negate rules. Returns false if the event
-// does not apply today or is negated (i.e. absent from today's list).
-static bool resolve_event_for_today(const uint8_t *blob, uint32_t len,
-                                    const uint8_t *id, Event *out) {
-    Event *all_events = g_all_events_scratch;
-    int all_count = 0;
-    if (!deserialize_events(blob, len, all_events, &all_count, MAX_EVENTS_PER_DAY * 2))
-        return false;
-
-    int32_t today = local_date_int();
-    uint8_t dow   = local_day_of_week();
-    uint8_t dom   = local_day_of_month();
-
-    bool  found = false;
-    Event best  = {};
-
-    // Recurring match for today.
-    for (int i = 0; i < all_count; i++) {
-        const Event &e = all_events[i];
-        if (!uuid_eq(e.id, id)) continue;
-        bool applies = false;
-        switch (e.recurrenceType) {
-            case DAILY:   applies = true;                  break;
-            case WEEKLY:  applies = (e.dayOfWeek  == dow); break;
-            case MONTHLY: applies = (e.dayOfMonth == dom); break;
-            case ONCE:    applies = false;                 break;
-        }
-        if (applies) { best = e; found = true; }
-    }
-    // Specific (once) event for today overrides (including a negate).
-    for (int i = 0; i < all_count; i++) {
-        const Event &e = all_events[i];
-        if (!uuid_eq(e.id, id)) continue;
-        if (e.recurrenceType == ONCE && date_int_of_utc(e.referenceDate) == today) {
-            best = e; found = true;
-        }
-    }
-
-    if (!found || best.negate) return false;
-    *out = best;
-    return true;
-}
-
 // True iff `neu` binds at least as hard as `old` across every §9.1 dimension
 // (i.e. the change is a tightening or leaves the event unchanged). Any loosening
 // or non-comparable field makes the whole change unacceptable (returns false).
 static bool event_binds_at_least_as_hard(const Event &old_e, const Event &neu) {
+    // Negate added is always a loosening (§9.1); negate removed re-arms the
+    // day, which binds harder, so it falls through.
+    if (neu.negate && !old_e.negate) return false;
+
     // Window: new must contain old (start no later, end no earlier).
     if (neu.startTime > old_e.startTime) return false;
     if (neu.endTime   < old_e.endTime)   return false;
@@ -1934,17 +1908,743 @@ static bool event_binds_at_least_as_hard(const Event &old_e, const Event &neu) {
     return true;
 }
 
-// Phase-1 gate: does the proposed blob loosen the currently active event?
-static bool proposed_loosens_active_event(const uint8_t *blob, uint32_t len) {
-    // Nothing to protect unless an event is actively being enforced.
+// ---- Elapsed-time accumulator (§9.2) --------------------------------------
+// Monotonic elapsed seconds spanning reboots: persisted base + esp_timer time
+// this boot (esp_timer advances across light sleep). Saved on the 5-min battery
+// heartbeat and on every integrity mutation, so a crash loses at most a few
+// minutes — timers then mature slightly LATE, never early.
+
+static uint64_t g_integ_boot_us        = 0;   // esp_timer at integrity init
+static uint32_t g_integ_elapsed_base_s = 0;   // seconds carried over from prior boots (NVS)
+
+static uint32_t integ_elapsed_now() {
+    return g_integ_elapsed_base_s +
+           (uint32_t)((esp_timer_get_time() - g_integ_boot_us) / 1000000ULL);
+}
+
+static void integ_save_elapsed() {
+    prefs.begin("integ", false);
+    prefs.putUInt("elap", integ_elapsed_now());
+    prefs.end();
+}
+
+// ---- Persistent state (§9.2/§9.3/§9.6) ------------------------------------
+
+// Per-event settle state. An event is identified by (uuid, once?, once-date):
+// a recurring event and a once-event (e.g. its negate) legitimately share a
+// UUID, so the UUID alone is not a unique key within the schedule blob.
+struct SettleRecord {
+    bool     valid;
+    bool     settled;             // baseline reflects the current event state
+    bool     has_baseline;
+    bool     once;                // key: recurrenceType == once
+    uint8_t  uuid[16];            // key
+    int32_t  once_date;           // key: local YYYYMMDD for once events, 0 otherwise
+    uint32_t last_edit_elapsed;   // elapsed stamp of the last accepted change
+    Event    baseline;            // snapshot as of the most recent settle
+};
+
+// One quarantined loosening (§9.3). Stores the FULL proposed post-change state
+// so promotion needs no app involvement.
+struct PendingEntry {
+    bool     valid;
+    uint8_t  change_type;    // wire values (§9.5): 0=delete, 1=loosen-modify, 2=negate-day, 3=setting
+    uint8_t  uuid[16];       // event UUID (zero-filled for setting entries)
+    bool     once;           // key of the target schedule entry (types 0/1)
+    int32_t  once_date;
+    uint32_t apply_after;    // elapsed-seconds stamp at which this promotes
+    Event    proposed;       // types 1/2: complete proposed event (incl. the negate event)
+    int32_t  negate_date;    // type 2: local YYYYMMDD being negated
+    uint8_t  setting_id;     // type 3: 1=disc_dorm, 2=away_dorm, 3=settle_window, 4=pass_allowance
+    uint16_t setting_value;  // type 3
+};
+
+static SettleRecord g_settle[MAX_SETTLE_RECORDS]   = {};
+static PendingEntry g_pending[PENDING_QUEUE_MAX]   = {};
+
+// Emergency-pass ledger (§9.6): allowance + elapsed stamps of spends. 0 = free slot.
+static uint8_t  g_pass_allowance               = PASS_BUDGET_DEFAULT;
+static uint32_t g_pass_spends[PASS_MAX_STAMPS] = {};
+
+static NimBLECharacteristic *g_pending_char = nullptr;
+static NimBLECharacteristic *g_pass_char    = nullptr;
+
+// Second full-schedule scratch: the diff gate needs current and proposed
+// parsed simultaneously. Same synchronous-main-task discipline as
+// g_all_events_scratch.
+static Event g_proposed_scratch[MAX_EVENTS_PER_DAY * 2];
+
+static void save_settle_records() {
+    prefs.begin("integ", false);
+    prefs.putBytes("settle", g_settle, sizeof(g_settle));
+    prefs.putUInt("elap", integ_elapsed_now());
+    prefs.end();
+}
+
+static void save_pending_queue() {
+    prefs.begin("integ", false);
+    prefs.putBytes("pending", g_pending, sizeof(g_pending));
+    prefs.putUInt("elap", integ_elapsed_now());
+    prefs.end();
+}
+
+static void save_pass_ledger() {
+    prefs.begin("integ", false);
+    prefs.putUChar("allow", g_pass_allowance);
+    prefs.putBytes("spends", g_pass_spends, sizeof(g_pass_spends));
+    prefs.putUInt("elap", integ_elapsed_now());
+    prefs.end();
+}
+
+// ---- Event-key helpers ------------------------------------------------------
+
+static bool event_is_once(const Event &e) { return e.recurrenceType == ONCE; }
+
+static int32_t event_once_date(const Event &e) {
+    return event_is_once(e) ? date_int_of_utc(e.referenceDate) : 0;
+}
+
+static int find_event_index(const Event *arr, int n,
+                            const uint8_t *uuid, bool once, int32_t date) {
+    for (int i = 0; i < n; i++) {
+        if (uuid_eq(arr[i].id, uuid) &&
+            event_is_once(arr[i]) == once &&
+            event_once_date(arr[i]) == date) return i;
+    }
+    return -1;
+}
+
+// ---- Settle-record helpers (§9.2) ------------------------------------------
+
+static SettleRecord* find_settle_record(const uint8_t *uuid, bool once, int32_t date) {
+    for (int i = 0; i < MAX_SETTLE_RECORDS; i++) {
+        SettleRecord &r = g_settle[i];
+        if (r.valid && uuid_eq(r.uuid, uuid) && r.once == once && r.once_date == date)
+            return &r;
+    }
+    return nullptr;
+}
+
+// Records an accepted change to the event: stamps last_edit and marks it
+// unsettled (existing baseline is retained until the next settle). Creates the
+// record if missing — a brand-new event starts with no baseline, which is the
+// §9.3 free first-setup window.
+static void mark_event_edited(const Event &e) {
+    bool    once = event_is_once(e);
+    int32_t date = event_once_date(e);
+    SettleRecord *r = find_settle_record(e.id, once, date);
+    if (!r) {
+        for (int i = 0; i < MAX_SETTLE_RECORDS; i++) {
+            if (!g_settle[i].valid) { r = &g_settle[i]; break; }
+        }
+        if (!r) return;   // table full: event stays untracked (treated as settled — conservative)
+        memset(r, 0, sizeof(*r));
+        r->valid = true;
+        memcpy(r->uuid, e.id, 16);
+        r->once      = once;
+        r->once_date = date;
+    }
+    r->last_edit_elapsed = integ_elapsed_now();
+    r->settled           = false;
+}
+
+static void remove_settle_record(const Event &e) {
+    SettleRecord *r = find_settle_record(e.id, event_is_once(e), event_once_date(e));
+    if (r) r->valid = false;
+}
+
+// ---- Pending-queue helpers (§9.3/§9.5) --------------------------------------
+
+// Builds the §9.5 wire payload into buf; returns its length.
+static int pending_build_payload(uint8_t *buf) {
+    uint32_t now_el = integ_elapsed_now();
+    int pos = 1, n = 0;
+    for (int i = 0; i < PENDING_QUEUE_MAX; i++) {
+        const PendingEntry &p = g_pending[i];
+        if (!p.valid) continue;
+        memcpy(buf + pos, p.uuid, 16); pos += 16;
+        buf[pos++] = p.change_type;
+        uint32_t secs = (p.apply_after > now_el) ? (p.apply_after - now_el) : 0;
+        memcpy(buf + pos, &secs, 4); pos += 4;
+        n++;
+    }
+    buf[0] = (uint8_t)n;
+    return pos;
+}
+
+// Re-publishes the queue on the Pending Changes characteristic (§9.5) and
+// notifies. Called whenever an entry is added, promoted, or canceled.
+static void pending_publish() {
+    if (!g_pending_char) return;
+    uint8_t buf[1 + PENDING_QUEUE_MAX * 21];
+    int len = pending_build_payload(buf);
+    g_pending_char->setValue(buf, len);
+    g_pending_char->notify();
+}
+
+// Cancels all event-type pending entries for a UUID (§9.3: a newly accepted
+// change to an event supersedes its pending entries). Returns true if any
+// entry was removed.
+static bool cancel_pending_for_uuid(const uint8_t *uuid) {
+    bool changed = false;
+    for (int i = 0; i < PENDING_QUEUE_MAX; i++) {
+        PendingEntry &p = g_pending[i];
+        if (p.valid && p.change_type <= 2 && uuid_eq(p.uuid, uuid)) {
+            p.valid = false;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static bool cancel_pending_for_setting(uint8_t setting_id) {
+    bool changed = false;
+    for (int i = 0; i < PENDING_QUEUE_MAX; i++) {
+        PendingEntry &p = g_pending[i];
+        if (p.valid && p.change_type == 3 && p.setting_id == setting_id) {
+            p.valid = false;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// Finds the slot for a new pending entry. An existing entry for the same
+// logical target is REPLACED (the newer request wins and its 24 h restarts):
+// delete/modify share a bucket per event key; negate-day is keyed by date;
+// settings by setting id. Returns nullptr when the queue is full (§9.3: the
+// loosening is dropped, not applied).
+static PendingEntry* pending_slot_for(uint8_t type, const uint8_t *uuid,
+                                      bool once, int32_t date, uint8_t setting_id) {
+    for (int i = 0; i < PENDING_QUEUE_MAX; i++) {
+        PendingEntry &p = g_pending[i];
+        if (!p.valid) continue;
+        if (type <= 1 && p.change_type <= 1 &&
+            uuid_eq(p.uuid, uuid) && p.once == once && p.once_date == date) return &p;
+        if (type == 2 && p.change_type == 2 &&
+            uuid_eq(p.uuid, uuid) && p.negate_date == date) return &p;
+        if (type == 3 && p.change_type == 3 && p.setting_id == setting_id) return &p;
+    }
+    for (int i = 0; i < PENDING_QUEUE_MAX; i++)
+        if (!g_pending[i].valid) return &g_pending[i];
+    return nullptr;
+}
+
+// Queues a quarantined event change (types 0/1/2). `proposed` is null for a
+// delete. Returns true if the entry was stored (false = queue full → dropped).
+static bool queue_pending_event(uint8_t type, const Event &target,
+                                const Event *proposed, int32_t negate_date) {
+    int32_t key_date = (type == 2) ? negate_date : event_once_date(target);
+    PendingEntry *p = pending_slot_for(type, target.id,
+                                       (type == 2) ? true : event_is_once(target),
+                                       key_date, 0);
+    if (!p) {
+        Serial.println("[INTEG] Pending queue full — loosening dropped");
+        return false;
+    }
+    memset(p, 0, sizeof(*p));
+    p->valid       = true;
+    p->change_type = type;
+    memcpy(p->uuid, target.id, 16);
+    p->once        = (type == 2) ? true : event_is_once(target);
+    p->once_date   = key_date;
+    p->apply_after = integ_elapsed_now() + (uint32_t)LOOSEN_DELAY_H * 3600UL;
+    if (proposed) p->proposed = *proposed;
+    p->negate_date = negate_date;
+    return true;
+}
+
+static bool queue_pending_setting(uint8_t setting_id, uint16_t value) {
+    PendingEntry *p = pending_slot_for(3, nullptr, false, 0, setting_id);
+    if (!p) {
+        Serial.println("[INTEG] Pending queue full — setting loosening dropped");
+        return false;
+    }
+    memset(p, 0, sizeof(*p));
+    p->valid         = true;
+    p->change_type   = 3;
+    p->apply_after   = integ_elapsed_now() + (uint32_t)LOOSEN_DELAY_H * 3600UL;
+    p->setting_id    = setting_id;
+    p->setting_value = value;
+    return true;
+}
+
+// ---- Schedule re-serialization (§6.2 v2 blob) --------------------------------
+// The stored schedule is no longer the raw received blob: the gate composes
+// old + accepted changes, so the watch must write its own blobs.
+
+static uint8_t* serialize_schedule(const Event *evts, int count, uint32_t *out_len) {
+    uint32_t sz = 3;   // version byte + count u16
+    for (int i = 0; i < count; i++) {
+        uint32_t ssid_len = strnlen(evts[i].wifiSSID, 64);
+        sz += 56 + ssid_len + 16u * evts[i].beepAnchorCount;
+    }
+    uint8_t *buf = (uint8_t*)malloc(sz);
+    if (!buf) return nullptr;
+
+    uint32_t pos = 0;
+    buf[pos++] = SCHEDULE_FORMAT_VERSION;
+    uint16_t n = (uint16_t)count;
+    memcpy(buf + pos, &n, 2); pos += 2;
+    for (int i = 0; i < count; i++) {
+        const Event &e = evts[i];
+        memcpy(buf + pos, e.id, 16); pos += 16;
+        memcpy(buf + pos, &e.referenceDate, 8); pos += 8;
+        memcpy(buf + pos, &e.startTime, 2); pos += 2;
+        memcpy(buf + pos, &e.endTime, 2); pos += 2;
+        buf[pos++] = (uint8_t)e.recurrenceType;
+        buf[pos++] = e.dayOfWeek;
+        buf[pos++] = e.dayOfMonth;
+        buf[pos++] = (uint8_t)e.criteria;
+        buf[pos++] = (uint8_t)e.profile;
+        buf[pos++] = e.hasAnchorProfile ? (uint8_t)e.anchorProfile : 0xFF;
+        buf[pos++] = e.negate ? 1 : 0;
+        memcpy(buf + pos, &e.donningGraceS, 2); pos += 2;
+        buf[pos++] = e.hasAnchorId ? 1 : 0;
+        memcpy(buf + pos, e.anchorId, 16); pos += 16;
+        uint8_t ssid_len = (uint8_t)strnlen(e.wifiSSID, 64);
+        buf[pos++] = ssid_len;
+        if (ssid_len) { memcpy(buf + pos, e.wifiSSID, ssid_len); pos += ssid_len; }
+        buf[pos++] = e.beepAnchorCount;
+        for (int j = 0; j < e.beepAnchorCount; j++) {
+            memcpy(buf + pos, e.beepAnchors[j], 16); pos += 16;
+        }
+    }
+    *out_len = pos;
+    return buf;
+}
+
+// Serializes and stores the given event set as the current schedule (RAM + NVS).
+static bool store_current_schedule(const Event *evts, int count) {
+    uint32_t len = 0;
+    uint8_t *blob = serialize_schedule(evts, count, &len);
+    if (!blob) return false;
+    if (g_sched_blob) free(g_sched_blob);
+    g_sched_blob     = blob;
+    g_sched_blob_len = len;
+    save_schedule_blob(blob, len);
+    return true;
+}
+
+// ---- Calendar helpers -------------------------------------------------------
+
+// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+static int64_t days_from_civil(int y, int m, int d) {
+    y -= m <= 2;
+    int      era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153u * (unsigned)(m + (m > 2 ? -3 : 9)) + 2u) / 5u + (unsigned)d - 1u;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+// UTC epoch for a local date (YYYYMMDD) at a given minutes-since-midnight.
+static int64_t local_ymd_to_utc_epoch(int32_t ymd, uint32_t minute_of_day) {
+    int y = ymd / 10000, m = (ymd / 100) % 100, d = ymd % 100;
+    return days_from_civil(y, m, d) * 86400LL +
+           (int64_t)minute_of_day * 60 - (int64_t)g_tz_offset_min * 60;
+}
+
+// Seconds (wall clock) until the event's next window start; UINT32_MAX if it
+// never occurs again (a once event whose date has passed). Used only for the
+// §9.3 far-future exception — this is schedule-domain time, not an integrity
+// timer, so the wall clock is the correct basis here.
+static uint32_t next_occurrence_start_s(const Event &e) {
+    time_t now_utc = time(nullptr);
+    for (int off = 0; off <= 400; off++) {
+        time_t lt = now_utc + (time_t)g_tz_offset_min * 60 + (time_t)off * 86400;
+        struct tm ti; gmtime_r(&lt, &ti);
+        int32_t dint = (ti.tm_year + 1900) * 10000 + (ti.tm_mon + 1) * 100 + ti.tm_mday;
+        uint8_t dow  = (ti.tm_wday == 0) ? 7 : (uint8_t)ti.tm_wday;
+        bool applies = false;
+        switch (e.recurrenceType) {
+            case DAILY:   applies = true;                              break;
+            case WEEKLY:  applies = (e.dayOfWeek  == dow);             break;
+            case MONTHLY: applies = (e.dayOfMonth == ti.tm_mday);      break;
+            case ONCE:    applies = (event_once_date(e) == dint);      break;
+        }
+        if (!applies) continue;
+        int64_t diff = local_ymd_to_utc_epoch(dint, e.startTime) - (int64_t)now_utc;
+        if (diff > 0)
+            return (diff > 0xFFFFFFFELL) ? 0xFFFFFFFEu : (uint32_t)diff;
+    }
+    return 0xFFFFFFFFu;
+}
+
+static bool event_is_currently_active(const uint8_t *uuid) {
+    return g_activity_state == STATE_ENFORCEMENT && g_active_event &&
+           uuid_eq(g_active_event->id, uuid);
+}
+
+// ---- §9.3 loosening exceptions ------------------------------------------------
+
+// True if a loosening of `cur` (to `proposed`, or a delete when null) applies
+// immediately instead of being quarantined.
+static bool loosening_applies_immediately(const Event &cur, const Event *proposed) {
+    // Unsettled-event exception: within the settle window, edits that stay at
+    // or above the settled baseline are free; an event with no baseline yet is
+    // in its first-setup window and fully free. A missing record is treated as
+    // settled (conservative).
+    SettleRecord *rec = find_settle_record(cur.id, event_is_once(cur), event_once_date(cur));
+    if (rec && !rec->settled) {
+        if (!rec->has_baseline) return true;
+        if (proposed && event_binds_at_least_as_hard(rec->baseline, *proposed)) return true;
+    }
+    // No-escape exception: loosening an event that is not active now and whose
+    // next occurrence is beyond the horizon grants no in-the-moment escape.
+    if (!event_is_currently_active(cur.id) &&
+        next_occurrence_start_s(cur) > (uint32_t)LOOSEN_FREE_HORIZON_H * 3600UL)
+        return true;
+    return false;
+}
+
+// ---- §9.3 schedule-diff gate ---------------------------------------------------
+
+// Runs the full commitment-integrity diff gate on a CRC- and version-valid
+// proposed blob. Returns the §6.2 ctrl response: 0x01 full accept, 0x03 one or
+// more loosenings quarantined, 0x00 malformed.
+static uint8_t apply_schedule_diff_gate(const uint8_t *blob, uint32_t len) {
+    Event *cur = g_all_events_scratch;
+    int    nc  = 0;
+    if (g_sched_blob && g_sched_blob_len >= 3)
+        deserialize_events(g_sched_blob, g_sched_blob_len, cur, &nc, MAX_EVENTS_PER_DAY * 2);
+
+    Event *prop = g_proposed_scratch;
+    int    np   = 0;
+    if (!deserialize_events(blob, len, prop, &np, MAX_EVENTS_PER_DAY * 2))
+        return 0x00;
+    int np_prop = np;   // proposed entries; kept-alive current events append after
+
+    static bool drop[MAX_EVENTS_PER_DAY * 2];
+    memset(drop, 0, sizeof(drop));
+
+    bool any_quarantine = false;
+    bool pending_changed = false;
+
+    // Pass 1 — proposed entries: adds and modifications.
+    for (int i = 0; i < np_prop; i++) {
+        Event &b = prop[i];
+        int ai = find_event_index(cur, nc, b.id, event_is_once(b), event_once_date(b));
+
+        if (ai < 0 && b.negate && event_is_once(b)) {
+            // One-time negate added. If it targets a live event with the same
+            // UUID it cancels a day — a loosening (§9.1).
+            int ti = -1;
+            for (int j = 0; j < nc; j++)
+                if (uuid_eq(cur[j].id, b.id) && !cur[j].negate) { ti = j; break; }
+            if (ti >= 0) {
+                const Event &target = cur[ti];
+                int32_t nd = event_once_date(b);
+                bool immediate = false;
+                SettleRecord *rec = find_settle_record(target.id, event_is_once(target),
+                                                       event_once_date(target));
+                if (rec && !rec->settled && !rec->has_baseline)
+                    immediate = true;   // free first-setup window
+                if (!immediate && !event_is_currently_active(target.id)) {
+                    int64_t su = local_ymd_to_utc_epoch(nd, target.startTime) - (int64_t)time(nullptr);
+                    // Far-future negate grants no escape; a past-date negate is inert.
+                    if (su > (int64_t)LOOSEN_FREE_HORIZON_H * 3600 || su <= 0) immediate = true;
+                }
+                if (immediate) {
+                    mark_event_edited(b);
+                    pending_changed |= cancel_pending_for_uuid(b.id);
+                } else {
+                    queue_pending_event(2, target, &b, nd);
+                    drop[i] = true;
+                    any_quarantine = true;
+                    pending_changed = true;
+                }
+            } else {
+                mark_event_edited(b);   // negate with no live target: inert, accept
+            }
+            continue;
+        }
+
+        if (ai < 0) {
+            // New event: always a tightening (§9.1) → apply, open its settle window.
+            mark_event_edited(b);
+            continue;
+        }
+
+        Event &a = cur[ai];
+        if (memcmp(&a, &b, sizeof(Event)) == 0) continue;   // unchanged
+
+        bool accept = event_binds_at_least_as_hard(a, b) ||   // tightening
+                      loosening_applies_immediately(a, &b);   // §9.3 exceptions
+        if (accept) {
+            mark_event_edited(b);
+            pending_changed |= cancel_pending_for_uuid(b.id);
+        } else {
+            queue_pending_event(1, a, &b, 0);
+            b = a;                    // keep the current state in the result
+            any_quarantine = true;
+            pending_changed = true;
+        }
+    }
+
+    // Pass 2 — deletions: current entries absent from the proposal.
+    for (int j = 0; j < nc; j++) {
+        Event &a = cur[j];
+        if (find_event_index(prop, np_prop, a.id, event_is_once(a), event_once_date(a)) >= 0)
+            continue;   // still present (possibly restored to current state above)
+
+        if (a.negate && event_is_once(a)) {
+            // Removing a negate re-arms the canceled day → tightening → accept.
+            remove_settle_record(a);
+            pending_changed |= cancel_pending_for_uuid(a.id);
+            continue;
+        }
+        if (loosening_applies_immediately(a, nullptr)) {
+            remove_settle_record(a);
+            pending_changed |= cancel_pending_for_uuid(a.id);
+        } else {
+            queue_pending_event(0, a, nullptr, 0);
+            if (np < MAX_EVENTS_PER_DAY * 2) { prop[np] = a; drop[np] = false; np++; }
+            any_quarantine = true;
+            pending_changed = true;
+        }
+    }
+
+    // Compact the result and make it the current schedule.
+    int nr = 0;
+    for (int i = 0; i < np; i++)
+        if (!drop[i]) prop[nr++] = prop[i];
+
+    if (!store_current_schedule(prop, nr)) return 0x00;
+    recalculate_and_rearm();
+    save_settle_records();
+    if (pending_changed) {
+        save_pending_queue();
+        pending_publish();
+    }
+
+    Serial.printf("[INTEG] Diff gate: %d event(s) stored%s\n", nr,
+                  any_quarantine ? ", loosenings quarantined" : "");
+    return any_quarantine ? 0x03 : 0x01;
+}
+
+// ---- §9.2 settle promotion + §9.4 autonomous pending promotion -----------------
+
+// Settles events whose window has elapsed with no accepted change: snapshots
+// their current state into settled_baseline.
+static void settle_tick() {
+    uint32_t now_el   = integ_elapsed_now();
+    uint32_t window_s = (uint32_t)g_settle_window_min * 60UL;
+    bool any_due = false;
+    for (int i = 0; i < MAX_SETTLE_RECORDS; i++) {
+        SettleRecord &r = g_settle[i];
+        if (r.valid && !r.settled && now_el - r.last_edit_elapsed >= window_s) {
+            any_due = true; break;
+        }
+    }
+    if (!any_due) return;
+
+    Event *cur = g_all_events_scratch;
+    int    nc  = 0;
+    if (g_sched_blob && g_sched_blob_len >= 3)
+        deserialize_events(g_sched_blob, g_sched_blob_len, cur, &nc, MAX_EVENTS_PER_DAY * 2);
+
+    for (int i = 0; i < MAX_SETTLE_RECORDS; i++) {
+        SettleRecord &r = g_settle[i];
+        if (!r.valid || r.settled || now_el - r.last_edit_elapsed < window_s) continue;
+        int idx = find_event_index(cur, nc, r.uuid, r.once, r.once_date);
+        if (idx < 0) { r.valid = false; continue; }   // event gone — drop the record
+        r.baseline     = cur[idx];
+        r.has_baseline = true;
+        r.settled      = true;
+        Serial.printf("[INTEG] Event %02x… settled — baseline updated\n", r.uuid[0]);
+    }
+    save_settle_records();
+}
+
+// Applies matured pending entries (§9.4). Runs with no app involvement on every
+// wake; a sleeping watch promotes late, never early. Entries whose effect has
+// expired are dropped.
+static void promote_pending() {
+    uint32_t now_el = integ_elapsed_now();
+    bool any_mature = false;
+    for (int i = 0; i < PENDING_QUEUE_MAX; i++) {
+        if (g_pending[i].valid && g_pending[i].apply_after <= now_el) { any_mature = true; break; }
+    }
+    if (!any_mature) return;
+
+    Event *cur = g_all_events_scratch;
+    int    nc  = 0;
+    if (g_sched_blob && g_sched_blob_len >= 3)
+        deserialize_events(g_sched_blob, g_sched_blob_len, cur, &nc, MAX_EVENTS_PER_DAY * 2);
+
+    int32_t today = local_date_int();
+    bool sched_changed = false;
+
+    for (int i = 0; i < PENDING_QUEUE_MAX; i++) {
+        PendingEntry &p = g_pending[i];
+        if (!p.valid || p.apply_after > now_el) continue;
+
+        switch (p.change_type) {
+            case 0: {   // delete
+                int idx = find_event_index(cur, nc, p.uuid, p.once, p.once_date);
+                if (idx >= 0) {
+                    remove_settle_record(cur[idx]);
+                    for (int k = idx; k < nc - 1; k++) cur[k] = cur[k + 1];
+                    nc--;
+                    sched_changed = true;
+                    Serial.printf("[INTEG] Promoted delete of %02x…\n", p.uuid[0]);
+                }
+                break;   // target already gone → drop silently
+            }
+            case 1: {   // loosen-modify
+                if (p.once && p.once_date < today) break;   // expired once event → drop
+                int idx = find_event_index(cur, nc, p.uuid, p.once, p.once_date);
+                if (idx >= 0) {
+                    cur[idx] = p.proposed;
+                    mark_event_edited(p.proposed);
+                    sched_changed = true;
+                    Serial.printf("[INTEG] Promoted loosening of %02x…\n", p.uuid[0]);
+                }
+                break;
+            }
+            case 2: {   // negate-day
+                if (p.negate_date < today) break;           // day already passed → drop
+                int idx = find_event_index(cur, nc, p.uuid, true, p.negate_date);
+                if (idx >= 0) cur[idx] = p.proposed;
+                else if (nc < MAX_EVENTS_PER_DAY * 2) cur[nc++] = p.proposed;
+                mark_event_edited(p.proposed);
+                sched_changed = true;
+                Serial.printf("[INTEG] Promoted negate-day %ld for %02x…\n",
+                              (long)p.negate_date, p.uuid[0]);
+                break;
+            }
+            case 3: {   // setting change
+                switch (p.setting_id) {
+                    case 1: g_disconnected_is_dormant = (p.setting_value != 0); break;
+                    case 2: g_away_is_dormant         = (p.setting_value != 0); break;
+                    case 3: {
+                        uint16_t sw = p.setting_value;
+                        if (sw < SETTLE_WINDOW_FLOOR_MIN) sw = SETTLE_WINDOW_FLOOR_MIN;
+                        if (sw > SETTLE_WINDOW_CEIL_MIN)  sw = SETTLE_WINDOW_CEIL_MIN;
+                        g_settle_window_min = sw;
+                        break;
+                    }
+                    case 4:
+                        g_pass_allowance = (uint8_t)p.setting_value;
+                        save_pass_ledger();
+                        break;
+                }
+                prefs.begin("watch", false);
+                prefs.putBool("disc_dorm", g_disconnected_is_dormant);
+                prefs.putBool("away_dorm", g_away_is_dormant);
+                prefs.putUShort("settle_min", g_settle_window_min);
+                prefs.end();
+                Serial.printf("[INTEG] Promoted setting %d = %u\n",
+                              p.setting_id, p.setting_value);
+                break;
+            }
+        }
+        p.valid = false;
+    }
+
+    if (sched_changed) {
+        store_current_schedule(cur, nc);
+        recalculate_and_rearm();
+        save_settle_records();
+    }
+    save_pending_queue();
+    pending_publish();
+}
+
+// ---- §9.7 time hardening --------------------------------------------------------
+
+// True if setting the clock/timezone to (new_utc, new_tz) would place the
+// current local time outside the CURRENTLY ACTIVE event's window (the previous
+// time is inside by definition of "active"). Such writes are rejected (0x02).
+static bool time_write_would_escape_active_window(int64_t new_utc, int16_t new_tz) {
     if (g_activity_state != STATE_ENFORCEMENT || !g_active_event) return false;
+    time_t cur_lt = time(nullptr) + (time_t)g_tz_offset_min * 60;
+    time_t new_lt = (time_t)new_utc + (time_t)new_tz * 60;
+    struct tm ct, nt;
+    gmtime_r(&cur_lt, &ct);
+    gmtime_r(&new_lt, &nt);
+    bool same_day = (ct.tm_year == nt.tm_year && ct.tm_mon == nt.tm_mon &&
+                     ct.tm_mday == nt.tm_mday);
+    uint32_t new_min = (uint32_t)(nt.tm_hour * 60 + nt.tm_min);
+    bool inside = same_day &&
+                  new_min >= g_active_event->startTime &&
+                  new_min <  g_active_event->endTime;
+    return !inside;
+}
 
-    Event old_e = *g_active_event;
-    Event new_e;
-    if (!resolve_event_for_today(blob, len, old_e.id, &new_e))
-        return true;   // active event deleted / negated for today → loosening
+// ---- §9.6 emergency-pass ledger ---------------------------------------------------
 
-    return !event_binds_at_least_as_hard(old_e, new_e);
+// Drops spend stamps older than the rolling window; returns spends in window.
+static int pass_prune_and_count() {
+    uint32_t now_el = integ_elapsed_now();
+    uint32_t win_s  = (uint32_t)PASS_WINDOW_DAYS * 86400UL;
+    int cnt = 0;
+    for (int i = 0; i < PASS_MAX_STAMPS; i++) {
+        if (g_pass_spends[i] == 0) continue;
+        if (now_el - g_pass_spends[i] >= win_s) g_pass_spends[i] = 0;
+        else cnt++;
+    }
+    return cnt;
+}
+
+// ---- Init + per-wake tick ---------------------------------------------------------
+
+static void integrity_init() {
+    g_integ_boot_us = esp_timer_get_time();
+    prefs.begin("integ", true);
+    g_integ_elapsed_base_s = prefs.getUInt("elap", 0);
+    if (prefs.getBytesLength("settle") == sizeof(g_settle))
+        prefs.getBytes("settle", g_settle, sizeof(g_settle));
+    if (prefs.getBytesLength("pending") == sizeof(g_pending))
+        prefs.getBytes("pending", g_pending, sizeof(g_pending));
+    g_pass_allowance = prefs.getUChar("allow", PASS_BUDGET_DEFAULT);
+    if (prefs.getBytesLength("spends") == sizeof(g_pass_spends))
+        prefs.getBytes("spends", g_pass_spends, sizeof(g_pass_spends));
+    prefs.end();
+
+    // Bootstrap: schedule events that predate settle tracking (first boot of
+    // this firmware) are treated as SETTLED at their current state, so a
+    // loosening right after the update is quarantined rather than free. New
+    // events created through the gate get the normal first-setup window.
+    if (g_sched_blob && g_sched_blob_len >= 3) {
+        Event *cur = g_all_events_scratch;
+        int    nc  = 0;
+        bool changed = false;
+        if (deserialize_events(g_sched_blob, g_sched_blob_len, cur, &nc,
+                               MAX_EVENTS_PER_DAY * 2)) {
+            for (int i = 0; i < nc; i++) {
+                const Event &e = cur[i];
+                if (find_settle_record(e.id, event_is_once(e), event_once_date(e)))
+                    continue;
+                for (int s = 0; s < MAX_SETTLE_RECORDS; s++) {
+                    if (g_settle[s].valid) continue;
+                    SettleRecord &r = g_settle[s];
+                    memset(&r, 0, sizeof(r));
+                    r.valid = true;
+                    memcpy(r.uuid, e.id, 16);
+                    r.once              = event_is_once(e);
+                    r.once_date         = event_once_date(e);
+                    r.last_edit_elapsed = integ_elapsed_now();
+                    r.baseline          = e;
+                    r.has_baseline      = true;
+                    r.settled           = true;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (changed) save_settle_records();
+    }
+    Serial.printf("[INTEG] Init: elapsed=%lus allowance=%d\n",
+                  (unsigned long)integ_elapsed_now(), g_pass_allowance);
+}
+
+// Runs the integrity timers. Called from the main loop (which executes after
+// every wake: boot, RTC boundary, midnight, motion, BLE) on a 1 s cadence.
+static void integrity_tick() {
+    settle_tick();
+    promote_pending();
 }
 
 // ============================================================
@@ -2668,20 +3368,14 @@ class WatchSchedCtrlCallback : public NimBLECharacteristicCallbacks {
                 bool version_ok = (g_sched_xfer_rcvd >= 1 &&
                                    g_sched_xfer_buf[0] == SCHEDULE_FORMAT_VERSION);
                 if (crc_calc == crc_recv && version_ok) {
-                    // §9.3 Phase-1 gate: reject a push that would loosen the
-                    // CURRENTLY ACTIVE event; discard the whole push, respond 0x04.
-                    if (proposed_loosens_active_event(g_sched_xfer_buf, g_sched_xfer_rcvd)) {
-                        resp = 0x04;
-                        Serial.println("[SCHED] Rejected: push loosens active event (§9.3 Phase 1)");
-                    } else {
-                        if (g_sched_blob) free(g_sched_blob);
-                        g_sched_blob     = g_sched_xfer_buf;
-                        g_sched_blob_len = g_sched_xfer_rcvd;
-                        g_sched_xfer_buf = nullptr;
-                        save_schedule_blob(g_sched_blob, g_sched_blob_len);
-                        recalculate_and_rearm();
-                        resp = 0x01;
-                    }
+                    // Full §9.3 commitment-integrity diff gate: tightenings and
+                    // new events apply immediately; loosenings are quarantined
+                    // into the pending queue (24 h) unless a §9.3 exception
+                    // applies. 0x01 = accepted in full, 0x03 = one or more
+                    // changes quarantined (read …001A), 0x00 = malformed.
+                    // (The Phase-1 0x04 full rejection is superseded: under the
+                    // full gate active-event loosenings are quarantined, §6.2.)
+                    resp = apply_schedule_diff_gate(g_sched_xfer_buf, g_sched_xfer_rcvd);
                 }
                 // else: CRC or version failure → resp stays 0x00 (§6.2)
             }
@@ -2792,6 +3486,18 @@ class WatchTimeCallback : public NimBLECharacteristicCallbacks {
         pChar->setValue(&resp, 1);
         pChar->notify();
         g_last_activity_ms = millis();
+    }
+};
+
+// Pending Changes characteristic (§9.5, …001A): read returns the current
+// quarantine queue with live countdowns; notifications fire on add/promote/
+// cancel via pending_publish(). Rebuild on every read so the "seconds until
+// apply" fields are current.
+class WatchPendingCallback : public NimBLECharacteristicCallbacks {
+    void onRead(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
+        uint8_t buf[1 + PENDING_QUEUE_MAX * 21];
+        int len = pending_build_payload(buf);
+        pChar->setValue(buf, len);
     }
 };
 
@@ -3023,6 +3729,12 @@ void setup() {
     load_schedule_blob();
     bp;
 
+    // Commitment integrity (§9): start the elapsed-time accumulator, load the
+    // settle records / pending queue / pass ledger, and bootstrap settle state
+    // for any events that predate tracking. Must follow load_schedule_blob().
+    integrity_init();
+    bp;
+
     // Restore the known-anchor table (UUID→MAC/IP) so proximity can connect on
     // boot without re-discovering each anchor's MAC. Must precede the schedule
     // recalc, whose ensure_anchor_record() dedups against these by UUID.
@@ -3105,8 +3817,18 @@ void setup() {
     led_cfg_publish_value();  // seed the readable value with the current config
 
     auto *timeChar = svc->createCharacteristic(WATCH_TIME_CHAR_UUID,
-                                               NIMBLE_PROPERTY::WRITE);
+                                               NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
     timeChar->setCallbacks(new WatchTimeCallback());
+
+    // Pending Changes (§9.5, …001A): authoritative quarantine queue.
+    g_pending_char = svc->createCharacteristic(WATCH_PENDING_CHAR_UUID,
+                                               NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    g_pending_char->setCallbacks(new WatchPendingCallback());
+    {   // Seed the readable value with the current (loaded) queue.
+        uint8_t pbuf[1 + PENDING_QUEUE_MAX * 21];
+        int plen = pending_build_payload(pbuf);
+        g_pending_char->setValue(pbuf, plen);
+    }
 
     bp;
     // CHK 8: start service + advertising
@@ -3430,10 +4152,23 @@ void loop() {
 #endif
     }
 
+    // ---- Commitment-integrity tick (§9.2/§9.4) ----
+    // Settle promotion + autonomous pending promotion. The loop runs after
+    // every wake (boot, RTC boundary, midnight, motion, BLE), so this covers
+    // all §9.4 promotion points; a sleeping watch promotes late, never early.
+    {
+        static uint32_t s_last_integ_tick_ms = 0;
+        if (now_ms - s_last_integ_tick_ms >= 1000) {
+            s_last_integ_tick_ms = now_ms;
+            integrity_tick();
+        }
+    }
+
     // ---- Battery heartbeat (periodic voltage sample) ----
     if (now_ms - g_last_batt_heartbeat_ms >= BATT_HEARTBEAT_INTERVAL_MS) {
         g_last_batt_heartbeat_ms = now_ms;
         batt_log("heartbeat");
+        integ_save_elapsed();   // §9.2 elapsed accumulator: same cadence as usage_save
 #if MEASURE_USAGE
         usage_report();
         usage_save();   // persist snapshot (single fixed NVS key, overwritten in place)
