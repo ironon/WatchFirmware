@@ -32,6 +32,12 @@ Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠
 
 ### 0.2 Change log
 
+**Anchor audit — 2026-07-12** (code fixes in `AnchorFirmware/src/main.cpp`; no wire-format change)
+- **Field bug — spontaneous restarts:** several contributing causes fixed in the anchor. (1) Schedule store + `anchor_recalculate_day` ran inside the BLE SchedCtrl-END callback, i.e. on the NimBLE **host task**, racing the loop task's readers of `g_sched_blob`/`g_events` (use-after-free / corruption); now deferred to the loop task. (2) BLE BEGIN transfers `malloc`'d an untrusted 4-byte length with no cap; now bounded to 64 KB. Also added `esp_reset_reason()` + persisted reboot-counter / last-abnormal-reason logging at boot so field reboots are diagnosable. **Note:** the anchor disables the brownout detector (`RTC_CNTL_BROWN_OUT_REG=0`), so genuine rail dips will surface as `PANIC`/garbage resets, *not* `ESP_RST_BROWNOUT`, when reading that log.
+- **Field bug — intermittent Identify beep:** the Identify callback beeped inline with a blocking `delay()` on the BLE host task and drove the buzzer pin in parallel with the loop's alarm state machine (single-core race). Reworked to a non-blocking request serviced by the loop with priority over the alarm; loop is now the single owner of the buzzer pin.
+- **Conformance — HTTP `/schedule`:** the WiFi-credential BLE write started only mDNS + UDP on first connect, so the HTTP endpoint (§7) never listened until a later reconnect; now routed through `setup_network_services()`.
+- **Pin divergence (flagged, unverified — needs hardware):** anchor firmware uses **GPIO 21** for the buzzer and **GPIO 9** (BOOT) for factory reset; §1's anchor table lists the buzzer on GPIO 12 and does not mention a reset pin. Field beeping works, so the code pins appear correct and §1 is stale — left unchanged pending hardware confirmation. `SERVO_MOVE_DURATION_MS` is 1000 ms in code vs. 500 ms in §7 (tunable).
+
 **v0.6 — 2026-07-10**
 - **New §5.4.4 "Donning Grace & Window-Start Worn Handling"** (unblocks the Sunrise Lock template): the watch sends WATCH_REMOVED at window start if already unworn (transition-independent), and a new per-event **`donningGraceS`** field (uint16 seconds, 0 = none) suppresses watch-side enforcement for N seconds after the watch is put on.
 - §3.2 / §6.2: Event struct and schedule blob gain `donning_grace_s` (inserted after `negate`). The v2 blob layout has never been implemented, so `SCHEDULE_FORMAT_VERSION` stays `0x02` — the field ships in the same lockstep batch.
