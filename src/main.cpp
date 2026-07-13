@@ -3235,9 +3235,11 @@ static bool ir_reflection_indicates_worn(int reflection) {
 
 static void update_worn_state() {
     if (millis() - g_last_worn_sample_ms < IR_WORN_SAMPLE_INTERVAL_MS) return;
+    Serial.println("[WORN] Sampling IR reflection");
     g_last_worn_sample_ms = millis();
 
     int     reflection = ir_sample_reflection();
+    Serial.println("[WORN] reflection=" + String(reflection));
     uint8_t reading    = ir_reflection_indicates_worn(reflection) ? 1 : 0;
     g_worn_buffer[g_worn_buf_idx] = reading;
     g_worn_buf_idx = (g_worn_buf_idx + 1) % IR_WORN_DEBOUNCE_SAMPLES;
@@ -3256,6 +3258,7 @@ static void update_worn_state() {
     bool new_worn = (val == 1);
     if (new_worn != g_worn) {
         g_worn = new_worn;
+        Serial.printf("[WORN] State changed to %s\n", g_worn ? "worn" : "removed");
         on_worn_state_changed(new_worn);
     }
 }
@@ -3948,6 +3951,7 @@ void setup() {
     // the default (~0 dBm) leaves the proximity query failing while ads are
     // still heard. (Boost the anchor's TX power the same way for full benefit.)
     NimBLEDevice::setPower(9);  // +9 dBm (max on ESP32-C3)
+    NimBLEDevice::setDeviceName("Impulse Watch");
 
     bp;
 
@@ -4016,6 +4020,7 @@ void setup() {
     // CHK 8: start service + advertising
     svc->start();
     NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+    pAdv->setName("Impulse Watch");
     pAdv->addServiceUUID(WATCH_SERVICE_UUID);
     pAdv->start();
     Serial.println("[BLE] Watch advertising started");
