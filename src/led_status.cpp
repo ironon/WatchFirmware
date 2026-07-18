@@ -42,6 +42,12 @@ static bool      s_inited = false;
 static LedWakeCause s_flash_cause    = LED_WAKE_NONE;
 static uint32_t     s_flash_start_ms = 0;
 
+// DORMANT analog-clock bookkeeping. The clock is repainted only when the shown
+// minute changes (once per minute), or when another state (alarm, flash, off)
+// clobbered the ring and it must be redrawn on return.
+static int  s_last_clock_min = -1;
+static bool s_clock_dirty    = true;
+
 // Last rendered frame, to avoid redundant FastLED.show() calls each tick.
 static CRGB    s_last_color  = CRGB::Black;
 static uint8_t s_last_bright = 0;
@@ -126,70 +132,28 @@ void led_actual_off() {
     s_have_last   = true;
 }
 
-void led_show_time(int hour, int minute, int second) {
- // makes an analog clock out of the 12 leds, with the hour hand in red and the minute hand in green
-    
+void led_show_time(int hour, int minute) {
+    // Analog clock on the 12-LED ring: hour hand red, minute hand green, yellow
+    // when they overlap. No second hand — the ring holds this frame through sleep
+    // and is repainted only when the minute changes (§5.7.4).
     if (!s_inited) return;
-    CRGB c[LED_RING_COUNT];
-    fill_solid(c, LED_RING_COUNT, CRGB::Black);
-    if (11 - (hour % 12) == 11 - (minute / 5)) {
-        // hour and minute hands overlap, make it yellow
-        c[11 - (hour % 12)] = CRGB::Yellow;
+
+    fill_solid(s_leds, LED_RING_COUNT, CRGB::Black);
+    int hour_pos = 11 - (hour % 12);
+    int min_pos  = 11 - (minute / 5);
+    if (hour_pos == min_pos) {
+        s_leds[hour_pos] = CRGB::Yellow;
     } else {
-        c[11 - (hour % 12)] = CRGB::Red;
-        c[11 - (minute / 5)] = CRGB::Green;
+        s_leds[hour_pos] = CRGB::Red;
+        s_leds[min_pos]  = CRGB::Green;
     }
     FastLED.setBrightness(s_cfg.brightness);
-    memcpy(s_leds, c, sizeof(c));
     FastLED.show();
-    s_last_color  = CRGB::Black;  // force a repaint on the next tick
-    s_last_bright = s_cfg.brightness;
-    s_have_last   = true;
-    // show the second hand in blue, updating it each second for 5 seconds
-    for (int i = 0; i < 25; i++) {
-       fill_solid(s_leds, LED_RING_COUNT, CRGB::Black);
-        float percentage_through_minute = (float)second / 60.0f;
-        // in the case which the second hand is between two leds, we will light up both at different brightness levels to simulate the second hand being in between two leds
-        double led_float_index = percentage_through_minute * LED_RING_COUNT;
-        double percent_high = ceil(led_float_index) - led_float_index;
-        double percent_low = 1.0 - percent_high;
-        int led_index_high = (int)ceil(led_float_index) % LED_RING_COUNT;
-        int led_index_low = (int)floor(led_float_index) % LED_RING_COUNT
-;       
-        led_index_high = 11 - led_index_high;  // invert the index to match the physical layout of the leds
-        led_index_low = 11 - led_index_low;    // invert the index to match
 
-        // make the ceil of the index percent_high brightness blue, make the floor of the index percent_low brightness blue
-        s_leds[led_index_high] = CRGB::Blue;
-        s_leds[led_index_low] = CRGB::Blue;
-        
-        if (led_index_high == led_index_low) {
-            s_leds[led_index_high] = CRGB::Blue;
-       
-        } else {
-            s_leds[led_index_high].fadeLightBy((uint8_t)(255 * percent_high));
-            s_leds[led_index_low].fadeLightBy((uint8_t)(255 * percent_low));
-        }
- 
-         if (11 - (hour % 12) == 11 - (minute / 5)) {
-            // hour and minute hands overlap, make it yellow
-            s_leds[11 - (hour % 12)] = CRGB::Yellow;
-        } else {
-            s_leds[11 - (hour % 12)] = CRGB::Red;
-            s_leds[11 - (minute / 5)] = CRGB::Green;
-        }
-
-        FastLED.setBrightness(s_cfg.brightness);
-
-        FastLED.show();
-   
-        delay(1000);
-        second++;
-            
-    }
-    
-    led_actual_off();
- 
+    // The ring now holds an explicit multi-colour frame rather than a single solid
+    // colour, so invalidate the solid-colour de-dup cache: the next led_show_color
+    // (a flash, an alarm, or the enforcement off-before-sleep) must repaint.
+    s_have_last = false;
 }
 // Blocking boot animation (§5.7 is silent on the visuals — this is a flourish).
 // Three acts: a rainbow comet that laps the ring and accelerates, a short
@@ -253,11 +217,12 @@ void led_update(const LedStatusInput &in) {
         s_flash_cause = LED_WAKE_NONE;
 
     // Priority 1: unpaired → ring off (no status to show until paired).
-    if (in.unpaired) { led_show_color(CRGB::Black); return; }
+    if (in.unpaired) { s_clock_dirty = true; led_show_color(CRGB::Black); return; }
 
     // Priority 2: active enforcement alarm (condition not met) → blink the alarm
     // colour. Overrides the wake flash so the visual alarm tracks the buzzer.
     if (in.enforcing && !in.condition_met) {
+        s_clock_dirty = true;
         const LedSlotCfg &a = s_cfg.slots[LED_SLOT_ENFORCE_ALARM];
         CRGB col(a.r, a.g, a.b);
         if (a.on_ms > 0 && a.off_ms > 0) {
@@ -268,14 +233,25 @@ void led_update(const LedStatusInput &in) {
         return;
     }
 
-    // Priority 3: momentary wake-cause flash.
+    // Priority 3: momentary wake-cause flash (enforcement wakes only — DORMANT no
+    // longer flashes on wake; it just shows the clock).
     if (s_flash_cause != LED_WAKE_NONE) {
+        s_clock_dirty = true;
         led_show_color(slot_color(slot_for_wake(s_flash_cause)));
         return;
     }
 
-    // Priority 4: steady activity colour.
-    // led_show_color(slot_color(in.enforcing ? LED_SLOT_ENFORCE_IDLE : LED_SLOT_DORMANT));
+    // Enforcement, condition met: no dedicated output (retain prior behaviour).
+    if (in.enforcing) { s_clock_dirty = true; return; }
+
+    // Priority 4: DORMANT (paired) → keep the analog clock lit, always on. Repaint
+    // only when the shown minute changes, or after another state clobbered the
+    // ring, so the display refreshes once per minute rather than every loop.
+    if (s_clock_dirty || in.minute != s_last_clock_min) {
+        led_show_time(in.hour, in.minute);
+        s_last_clock_min = in.minute;
+        s_clock_dirty    = false;
+    }
 }
 
 // ── App configuration (de)serialisation (§5.6) ──────────────

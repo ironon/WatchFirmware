@@ -117,10 +117,6 @@
 // in DORMANT, so this heartbeat is the only way to reach a still, idle watch.
 // Lower = snappier app connect, higher = less battery. Tunable.
 #define DISCONNECTED_ADV_HEARTBEAT_MS   6000
-// After a wrist-raise wakes the watch (LOOK_WAKEUP_ENABLED, imu.h), the LED ring
-// shows live status for this long before the watch is allowed back to sleep, so
-// the user has time to read it. Tunable.
-#define LOOK_DWELL_MS                   4000
 #define ANCHOR_WIFI_RETRY_INTERVAL_S      30
 #define ANCHOR_SEEN_TIMEOUT_S             20
 // Max time setup() waits for the IMU's first motion interrupt before continuing
@@ -143,8 +139,8 @@
 #define IR_WORN_DEBOUNCE_SAMPLES           5     // consecutive equal samples to flip state
 #define IR_WORN_SAMPLE_INTERVAL_MS      1000     // ms between reflection samples
 #define IR_EMIT_SETTLE_US                500     // emitter rise/settle before ADC read
-#define IR_WORN_THRESHOLD                300     // min ambient-subtracted ADC delta to count as worn
-#define IR_WORN_HIGHER_MEANS_WORN       true     // false if the readout is inverted (skin lowers the delta)
+#define IR_WORN_THRESHOLD                500     // min ambient-subtracted ADC delta to count as worn
+#define IR_WORN_HIGHER_MEANS_WORN       false     // false if the readout is inverted (skin lowers the delta)
 
 // Enforcement escalation
 #define INTERVAL_DECREMENT_MS           2000
@@ -431,10 +427,6 @@ static time_t   g_grace_deadline        = 0;
 // can force an immediate re-check the instant grace expires (§5.4.4).
 static bool     g_grace_was_active      = false;
 static uint32_t g_last_activity_ms      = 0;  // for DORMANT→SLEEP idle timer
-#if LOOK_WAKEUP_ENABLED
-static uint32_t g_look_dwell_until      = 0;  // keep awake showing status until this millis after a look wake
-static bool     g_look_consumed         = false;  // already showed the flourish for the current sustained raise
-#endif
 #if DIAG_AWAKE
 static uint32_t g_dbg_burst_start_ms = 0;   // millis the current awake burst began
 static uint32_t g_dbg_last_loop_ms   = 0;   // millis at the top of the previous loop iteration
@@ -572,13 +564,21 @@ static uint16_t read_battery_mv() {
 }
 
 // ---- LED status helpers (§5.7) ----
+static time_t local_now();  // fwd decl (defined below) — for the DORMANT clock
+
 // Snapshot current watch state for the LED renderer. Decouples led_status.cpp
-// from the state machine — it just gets the three bits it needs.
+// from the state machine — it just gets the bits it needs, plus the current
+// local time for the DORMANT analog clock (§5.7.4).
 static LedStatusInput led_status_input() {
     LedStatusInput in;
     in.unpaired      = (g_activity_state == STATE_UNPAIRED);
     in.enforcing     = (g_activity_state == STATE_ENFORCEMENT);
     in.condition_met = g_enf.condition_met;
+    time_t lt = local_now();
+    struct tm ti;
+    gmtime_r(&lt, &ti);
+    in.hour   = ti.tm_hour;
+    in.minute = ti.tm_min;
     return in;
 }
 
@@ -2935,35 +2935,17 @@ static void enter_dormant_sleep() {
 
     esp_sleep_enable_timer_wakeup(sleep_us);
 
-    // General motion is NOT a wake source in DORMANT (§8.4): outside an
-    // enforcement window there is nothing for it to trigger, and waking on every
-    // wrist movement was the single largest battery drain. Detach the edge ISR;
-    // the actual wake source is configured below per the look-to-wake feature.
+    // Motion is NOT a wake source in DORMANT (§8.4): outside an enforcement
+    // window there is nothing for it to trigger, and waking on every wrist
+    // movement was the single largest battery drain. Detach the edge ISR and mute
+    // the INT1 GPIO wake entirely — DORMANT_SLEEP wakes on the timer (and BLE)
+    // only. (The former look-to-wake wrist-raise wake source has been removed; the
+    // clock stays lit on the ring instead of relying on a glance to light it.)
     detachInterrupt(digitalPinToInterrupt(LIS3DH_INT1));
     data_ready        = false;
     g_last_motion_ms  = 0;
-#if LOOK_WAKEUP_ENABLED
-    // Look-to-wake: the INT1 GPIO wake stays armed, but WHICH generator drives it
-    // depends on whether we've already shown a raise:
-    //   consumed == false (armed for a raise): route IA2 (Z-low / face-up) only.
-    //       A wrist-raise wakes the watch immediately; general motion stays muted
-    //       for battery (§8.4).
-    //   consumed == true (raise already shown): route IA1 (motion) only — NOT the
-    //       face-up level interrupt, which would re-latch every LOOK_DURATION_MS
-    //       and spin the CPU while the watch is held up. Instead the motion of
-    //       LOWERING the wrist wakes us promptly to re-check orientation and
-    //       re-arm — so the next glance is responsive instead of waiting for a
-    //       heartbeat. Held perfectly still it makes no motion, so it still
-    //       sleeps the full heartbeat.
-    lis3dh_set_int1_routing(/*motion_ia1=*/g_look_consumed, /*look_ia2=*/!g_look_consumed);
-    lis3dh_read_clear_sources();   // clear latches so INT1 starts LOW (level wake)
-    esp_sleep_enable_gpio_wakeup();
-    gpio_wakeup_enable((gpio_num_t)LIS3DH_INT1, GPIO_INTR_HIGH_LEVEL);
-#else
-    // Feature off: mute the INT1 GPIO wake entirely; wake on the timer only.
     lis3dh_clear_int1();
     gpio_wakeup_disable((gpio_num_t)LIS3DH_INT1);
-#endif
 
 #if ADVERTISE_DURING_SLEEP
     // Keep BLE radio alive (modem sleep) so the phone can connect and wake
@@ -2980,8 +2962,11 @@ static void enter_dormant_sleep() {
 
     batt_log("pre_sleep");
 
-    // Ring off through sleep so no LED is left lit (§5.7 priority 1).
-    led_off();
+    // Analog clock stays lit through DORMANT_SLEEP (§5.7.4): the SK6805 ring
+    // latches whatever frame it was last sent, so paint the current time now and
+    // it remains visible for the whole sleep. led_update() renders the clock
+    // (minute-gated), so this refreshes it to the current minute before we sleep.
+    led_update(led_status_input());
 
 #if MEASURE_USAGE
     usage_before_sleep();
@@ -2992,14 +2977,9 @@ static void enter_dormant_sleep() {
     usage_after_sleep(esp_timer_get_time() - _use_t0, /*is_enforcement=*/false);
 #endif
 
-    // After wakeup: read which generator woke us (this clears the latches), then
-    // re-arm the ISR and restore general-motion routing for the awake/enforce path.
-#if LOOK_WAKEUP_ENABLED
-    uint8_t wake_src = lis3dh_read_clear_sources();  // clears both latches (kept for diagnostics)
-    lis3dh_set_int1_routing(/*motion_ia1=*/true, /*look_ia2=*/true);  // both live while awake; pre-sleep re-selects
-#else
+    // After wakeup: clear the INT1 latch and re-arm the edge ISR for the
+    // awake/enforce path (motion is actionable again once we may enter enforcement).
     lis3dh_clear_int1();
-#endif
     data_ready       = false;
     g_last_motion_ms = 0;
     attachInterrupt(digitalPinToInterrupt(LIS3DH_INT1), lis3dh_isr, RISING);
@@ -3014,55 +2994,9 @@ static void enter_dormant_sleep() {
 #endif
 
     Serial.println("[STATE] Woke from light sleep");
-#if LOOK_WAKEUP_ENABLED
-    // Trust the HARDWARE for the raise. IA2 only latches its Z-low (face-up) bit
-    // after the condition has held for LOOK_DURATION_MS, so a set LOOK bit means a
-    // genuine sustained face-up — not the transient of the swing. A single
-    // post-wake accelerometer read can't be trusted for this: the orientation has
-    // usually moved on by the time we read it (that mismatch was what kept
-    // flashing green instead of the rainbow). The accel read is used only to
-    // detect the steadier "wrist lowered" state, to re-arm the one-shot.
-    bool look_fired = (wake_src & LIS3DH_SRC_LOOK) != 0;
-    bool lowered    = lis3dh_is_look_lowered();
-    if (lowered) {
-        Serial.printf("[LOOK] Wrist-lowered (src=0x%02x) — re-arm one-shot\n", wake_src);
-    }
-#if DIAG_AWAKE
-    {
-        Accel _a = read_accel();
-        Serial.printf("[DIAG] wake az=%.2fg look_fired=%d lowered=%d consumed=%d src=0x%02x cause=%d\n",
-                      _a.z, (int)look_fired, (int)lowered, (int)g_look_consumed, wake_src,
-                      (int)esp_sleep_get_wakeup_cause());
-    }
-#endif
-    if (look_fired && !g_look_consumed) {
-        // Genuine wrist-raise → play the full startup animation, then dwell on
-        // live status. consumed stops it replaying while the wrist stays up.
-        g_look_consumed = true;
-      
-        Serial.printf("[LOOK] Wrist-raise (src=0x%02x) — animation + status\n", wake_src);
-        time_t lt = local_now();
-        struct tm ti;
-        gmtime_r(&lt, &ti);
-        int hour = ti.tm_hour;
-        int min  = ti.tm_min;
-        Serial.printf("[LOOK] Time %02d:%02d\n", hour, min);
-        led_show_time(hour, min, ti.tm_sec);
-        g_look_dwell_until = millis() + LOOK_DWELL_MS;
-    } else {
-        // Re-arm the one-shot only once the wrist is clearly lowered again
-        // (hysteresis), so holding the watch up doesn't replay it.
-      
-        Serial.printf("[LOOK] Rejected because %s (src=0x%02x)\n",
-                      g_look_consumed ? "already consumed" : (look_fired ? "transient" : "not face-up"),
-                      wake_src);
-        if (lowered) g_look_consumed = false;
-      
-        // led_note_wake(led_wake_cause_from_esp());  // momentary wake-cause flash (§5.7)
-    }
-#else
-    led_note_wake(led_wake_cause_from_esp());  // momentary wake-cause flash (§5.7)
-#endif
+    // The analog clock is repainted by led_update() on the next loop pass (and
+    // was refreshed just before sleep); no wake-cause flash in DORMANT — the clock
+    // owns the ring so a still, disconnected watch always shows the time.
     batt_log("wake_from_sleep");
     g_activity_state   = STATE_DORMANT;
     g_last_activity_ms = millis();
@@ -4305,11 +4239,7 @@ void loop() {
     if (g_activity_state == STATE_DORMANT &&
         !g_bt_connected &&
         !(g_ble_scan && g_ble_scan->isScanning()) &&
-        (now_ms - g_last_activity_ms) > DORMANT_TO_SLEEP_IDLE_MS &&
-#if LOOK_WAKEUP_ENABLED
-        (int32_t)(g_look_dwell_until - now_ms) <= 0 &&  // stay awake during a look dwell
-#endif
-        true) {
+        (now_ms - g_last_activity_ms) > DORMANT_TO_SLEEP_IDLE_MS) {
         // Motion no longer blocks DORMANT sleep — it is not a wake source here
         // and is ignored above (§8.4), so the idle timer alone governs sleep.
         // An in-flight discovery scan does block sleep so it can finish (§ above).

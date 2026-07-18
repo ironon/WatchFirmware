@@ -1,6 +1,6 @@
 # ADHD Habit Enforcement Watch & Anchor — Firmware Specification
 
-**Version:** 0.6 (Draft — see Section 0 for spec status, firmware parity, and the change log)
+**Version:** 0.7 (Draft — see Section 0 for spec status, firmware parity, and the change log)
 **Scope:** Firmware for the ESP32-C3-WROOM Watch and ESP32-C3-WROOM Anchor devices, intended as a complete reference for a coding agent.
 
 ---
@@ -22,7 +22,7 @@ Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proxi
 | GATT surface (§4.4, §5.6) | ✅ `…0011`–`…001B` present | ✅ `…0002`–`…000D` present | Verified by UUID grep. Pending Changes `…001A` (Read+Notify) and Emergency Pass `…001B` (Read+Write+Notify) created 2026-07-12. |
 | Schedule transfer (§6.2) | ✅ v2 blob | ✅ v2 blob | **Format version byte (0x02) now implemented on watch + anchor** (2026-07-11); unknown version → 0x00 / HTTP 400. `donning_grace_s` field parsed on both. Extended Settings payloads landed (watch +`settle_window_min`, anchor +`tz_offset`). Lockstep with the app's `ScheduleEncoder` — flash together. |
 | Proximity engine (§4.10, §5.4.1) | ✅ | ✅ | Shared module, working per commit history. |
-| Enforcement / worn / LED / look-to-wake (§5.2–§5.7) | 🟡 | — | Believed implemented; not re-audited line-by-line this pass. |
+| Enforcement / worn / LED (§5.2–§5.7) | 🟡 | — | Believed implemented; not re-audited line-by-line this pass. Look-to-wake removed in v0.7 — DORMANT now shows the always-on analog clock (§5.7.4) with no motion interrupt. |
 | Phone docking (§4.11, `phoneAway` §5.4.1) | 🟡 | 🟡 | Dock characteristics present in code; behavior unaudited. |
 | **Commitment integrity (§9)** | ✅ Phases 1–3 | — | **Phase 2 done** (2026-07-11): full §9.1/§9.3 diff gate (per-key event diff, tighten-immediate / loosen-quarantine, unsettled-above-baseline + far-future exceptions), §9.2 settle state in NVS on the monotonic elapsed basis, NVS pending queue (full proposed state, supersede + expiry rules), §9.4 autonomous promotion, Pending Changes `…001A` (Read+Notify, §9.5 format), END responds `0x01`/`0x03` (`0x04` fast-path retired per §6.2). **Phase 3 done** (2026-07-12): Emergency Pass `…001B` (SPEND applies a one-day negate bypassing the gate; SET_ALLOWANCE raise quarantined `0x03` / lower immediate; Read returns allowance/remaining/regen countdowns, all elapsed-basis), §9.7 time + Settings-tz hardening (`0x02` reject when a clock/tz write would escape the active window), §9.8 settings gating (dormancy `true→false` and settle-window increases quarantined, reverse immediate). On-hardware validation pending. |
 | Donning grace + window-start unworn beep (§5.4.4) | ✅ | ✅ (blob parse) | **Done** (2026-07-11). Watch: window-start WATCH_REMOVED when unworn, `donningGraceS` grace with deadline/short-circuit/sleep-cap/expiry-recheck/removal-cancel. Watch Status `condition_met` byte added. Anchor parses `donning_grace_s` for wire parity. |
@@ -31,6 +31,10 @@ Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proxi
 Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠️ diverges from spec · ❌ not started
 
 ### 0.2 Change log
+
+**v0.7 — 2026-07-14** (watch only; no wire-format change)
+- **Look-to-wake removed; DORMANT is now a zero-motion-interrupt state.** The wrist-raise wake source (IA2, `LOOK_WAKEUP_ENABLED`, and the `LOOK_*` tunables) is deleted from `imu.cpp`/`imu.h`. `DORMANT_SLEEP` arms **no** IMU interrupt at all — it wakes on the timer/advertise-heartbeat and BLE only. Motion (IA1) remains a wake source **only during ENFORCEMENT** (§8.4 part 2), unchanged.
+- **Always-on analog clock (§5.7.4).** Instead of lighting the ring on a glance, the watch keeps the 12-LED analog clock lit continuously and redraws it once per minute. The SK6805 ring latches its last frame, so the clock stays visible through `DORMANT_SLEEP`; it is repainted (minute-gated) by `led_update()` and refreshed just before each sleep. **The second hand is removed** — `led_show_time()` now takes `(hour, minute)` only and no longer blocks on a per-second animation. §5.7.2 priority 1 amended: DORMANT_SLEEP leaves the clock lit rather than clearing the ring (enforcement light sleep still clears it). This is a battery optimization: it eliminates the motion/look wakeups that were the dominant idle drain.
 
 **Anchor audit — 2026-07-12** (code fixes in `AnchorFirmware/src/main.cpp`; no wire-format change)
 - **Field bug — spontaneous restarts:** several contributing causes fixed in the anchor. (1) Schedule store + `anchor_recalculate_day` ran inside the BLE SchedCtrl-END callback, i.e. on the NimBLE **host task**, racing the loop task's readers of `g_sched_blob`/`g_events` (use-after-free / corruption); now deferred to the loop task. (2) BLE BEGIN transfers `malloc`'d an untrusted 4-byte length with no cap; now bounded to 64 KB. Also added `esp_reset_reason()` + persisted reboot-counter / last-abnormal-reason logging at boot so field reboots are diagnosable. **Note:** the anchor disables the brownout detector (`RTC_CNTL_BROWN_OUT_REG=0`), so genuine rail dips will surface as `PANIC`/garbage resets, *not* `ESP_RST_BROWNOUT`, when reading that log.
@@ -53,7 +57,7 @@ Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠
 - §9.6/§5.6: Emergency Pass characteristic gains a SET_ALLOWANCE opcode (`0x02`). §9.3: pending entries store the full proposed state; a newer accepted edit to the same event cancels its pending entries. §9.4: expired pending entries are dropped. §9.7: guard extended to timezone changes via Settings.
 - Audit: watch recurrence support **verified present** (no watch work needed); anchor recurrence/persistence divergence logged in §0.1.
 
-**v0.4 and earlier** — pre-changelog; see git history. (v0.4 added the proximity engine, LED status ring, look-to-wake, analog-clock ring mode.)
+**v0.4 and earlier** — pre-changelog; see git history. (v0.4 added the proximity engine, LED status ring, look-to-wake, analog-clock ring mode. Look-to-wake was later removed in v0.7.)
 
 ---
 
@@ -1492,7 +1496,7 @@ enum LedStatusSlot {
 
 The ring shows exactly one slot at any instant. The watch re-evaluates which slot to display on every relevant event (sleep entry, wake, activity-state change, enforcement condition transition) using this fixed priority — highest first:
 
-1. **Asleep → ring OFF.** Whenever the watch is in `DORMANT_SLEEP` or enforcement light sleep (Section 5.4.2), all LEDs are cleared (`FastLED.clear()` + `show()`) *immediately before* the `esp_light_sleep_start()` call. "Off" means every pixel black; there is no separate power-enable line (GPIO 21 is the buzzer and is owned by existing firmware — the LED feature must not touch it). The ring draws only its quiescent leakage while asleep.
+1. **Asleep → ring OFF, except the DORMANT clock.** In **enforcement** light sleep (Section 5.4.2), all LEDs are cleared (`FastLED.clear()` + `show()`) *immediately before* the `esp_light_sleep_start()` call. "Off" means every pixel black; there is no separate power-enable line (GPIO 21 is the buzzer and is owned by existing firmware — the LED feature must not touch it). **`DORMANT_SLEEP` is the exception:** it leaves the analog clock (§5.7.4) lit through sleep rather than clearing the ring — the SK6805 pixels latch their last frame, so the clock stays visible while the CPU sleeps and is refreshed to the current minute right before each sleep. The ring draws only its quiescent leakage (enforcement sleep) or the few lit clock pixels (dormant sleep) while asleep.
 
 2. **Active enforcement alarm.** While `activity_state == ENFORCEMENT` **and** the enforcement condition is **not met** (i.e. a profile pattern from Section 5.4.3 is running), the ring shows `LED_SLOT_ENFORCE_ALARM`, blinking per its `on_ms`/`off_ms`. This overrides the steady state colour so the visual alarm tracks the buzzer/motor alarm. The instant the condition transitions back to met, the ring drops to priority 4.
 
@@ -1503,29 +1507,32 @@ The ring shows exactly one slot at any instant. The watch re-evaluates which slo
 
    The flash is non-blocking: it does not delay scanning, the proximity query, or condition evaluation — it is a colour the renderer holds until `LED_WAKE_FLASH_MS` has elapsed, after which the ring falls through to priority 4 (or to priority 2 if by then the watch is in an active alarm). If the watch goes back to sleep before the flash elapses, priority 1 wins and the ring goes off.
 
-   Note on wake sources by state: per Section 8.4, motion is a wake source **only during ENFORCEMENT**; in `DORMANT_SLEEP` the watch wakes on the RTC timer (and BLE, when reachable) only. The renderer simply colours whichever source actually woke it, so a dormant wake is normally light blue (timer) or white (BLE), and a green motion flash appears only inside enforcement.
+   Note on wake sources by state: per Section 8.4, motion is a wake source **only during ENFORCEMENT**; in `DORMANT_SLEEP` the watch wakes on the RTC timer (and BLE, when reachable) only. The wake-cause flash applies **only in ENFORCEMENT** — in DORMANT the ring is owned by the always-on analog clock (§5.7.4, priority 4), so a dormant wake shows the refreshed clock rather than a flash.
 
 4. **Steady activity colour.** When awake with none of the above active, the ring shows the colour for the current activity state:
    - `DORMANT` → `LED_SLOT_DORMANT` (blue).
    - `ENFORCEMENT`, condition met → `LED_SLOT_ENFORCE_IDLE` (orange).
    - `UNPAIRED` → ring off (no status to show until paired). This is a rendering choice, not a separate slot.
 
-So a typical enforcement wake looks like: green flash (motion) → settles to orange (in-window, compliant) → turns red-blinking the moment the condition is found not met → back to orange when the user complies → off when the watch light-sleeps again. A typical dormant wake looks like: light-blue flash (timer) → blue (dormant) → off on return to sleep.
+So a typical enforcement wake looks like: green flash (motion) → settles to orange (in-window, compliant) → turns red-blinking the moment the condition is found not met → back to orange when the user complies → off when the watch light-sleeps again. In DORMANT the ring simply shows the analog clock the whole time (§5.7.4) — it stays lit through sleep and ticks once per minute; there is no wake flash and no off-on-sleep.
 
 #### 5.7.3 Implementation Notes
 
 - The renderer is a single function, e.g. `led_render(LedStatusSlot active_slot)`, plus a small `led_update()` ticked from the main loop that (a) resolves the current slot via the priority rules, (b) advances the alarm blink phase, and (c) expires the wake-cause flash. No status logic lives in the BLE or enforcement modules — they call `led_note_wake(cause)` / `led_note_state_change()` and let the renderer decide.
 - Slot colours, brightness, and blink timings load from NVS on boot (falling back to the defaults above) before the first render, so the very first wake already reflects any app customisation.
-- The ring must be cleared before *every* light-sleep entry path (DORMANT_SLEEP and enforcement light sleep) to avoid leaving an LED lit through sleep; this is the only hard ordering requirement relative to the existing sleep code.
+- The ring must be cleared before **enforcement** light-sleep entry to avoid leaving an LED lit through that sleep; this is the only hard ordering requirement relative to the existing sleep code. `DORMANT_SLEEP` is deliberately *not* cleared — it leaves the analog clock (§5.7.4) lit through sleep.
 
-#### 5.7.4 Analog clock display mode
+#### 5.7.4 Analog clock display mode (always-on DORMANT face)
 
-Because the 12-LED ring maps naturally onto a clock face (one LED per hour position), the watch can render the current time directly on the ring via `led_show_time(hour, minute)`. This is an opt-in display, separate from the status-slot resolver above (Section 5.7.2) — it paints the ring explicitly rather than through `led_update()`, and the next status tick repaints over it.
+Because the 12-LED ring maps naturally onto a clock face (one LED per hour position), the watch renders the current time directly on the ring via `led_show_time(hour, minute)`. This is the watch's default DORMANT display: **the clock is always on.** It is driven from the DORMANT branch of `led_update()` (priority 4, Section 5.7.2), which repaints it **once per minute** — only when the displayed minute changes, or when a higher-priority state (alarm, unpaired-off) has clobbered the ring and it must be redrawn. The clock is not shown during ENFORCEMENT (the enforce/alarm slots own the ring there) or while UNPAIRED (ring off).
+
+Because the SK6805 pixels latch their last frame, the clock stays lit with no CPU involvement through `DORMANT_SLEEP` (Section 5.7.2 priority 1); the firmware refreshes it to the current minute right before each sleep and again on wake. Keeping the clock lit — rather than lighting the ring only on a wrist-raise — is what let look-to-wake (and its motion wake source) be removed entirely (§8.4).
 
 - LED index → clock position: the ring is wired so index `0` is the 12-o'clock LED's neighbour; the renderer maps a clock position `p` (0 = 12 o'clock) to LED index `11 - p`, so positions advance clockwise around the physical ring.
 - **Hour hand:** the LED at `hour % 12` lit **red**.
 - **Minute hand:** the LED at `minute / 5` (nearest 5-minute mark) lit **green**.
 - **Overlap:** when the hour and minute hands fall on the same LED, that single LED is lit **yellow** instead of stacking colours.
+- **No second hand.** The ring updates only on the minute; there is no per-second animation (an earlier build swept a blue second hand — removed for battery, since it forced the CPU awake every second).
 - All other LEDs are off. Brightness uses the configured ring brightness. The hand colours are currently fixed in code (not yet exposed as configurable slots).
 
 ---
@@ -1857,41 +1864,28 @@ WIFI_SCAN_INTERVAL_S               = 120       // (tunable) DORMANT WiFi reconne
 
 ### 8.4 Motion-wake gating & idle reachability
 
-Wrist-worn motion is the watch's largest *potential* battery drain: at the original sensitivity, casual movement woke the watch every few seconds, and each wake held the CPU awake long enough that an active user could keep it out of sleep most of the day (estimated tens to hundreds of mAh/day). The wakeups bought nothing outside an enforcement window. This is addressed in four parts (the fourth, look-to-wake, deliberately re-introduces a *narrow* orientation-gated wake source):
+Wrist-worn motion is the watch's largest *potential* battery drain: at the original sensitivity, casual movement woke the watch every few seconds, and each wake held the CPU awake long enough that an active user could keep it out of sleep most of the day (estimated tens to hundreds of mAh/day). The wakeups bought nothing outside an enforcement window. This is addressed in three parts. (An earlier revision added a fourth, look-to-wake — a narrow orientation-gated wrist-raise wake source — but it was **removed in v0.7**: keeping the analog clock always lit on the ring (§5.7.4) means the watch never needs a glance to light it, so `DORMANT_SLEEP` carries **no IMU interrupt at all**.)
 
 1. **High-pass-filtered motion interrupt.** The LIS3DH interrupt generator runs through its high-pass filter (`CTRL_REG2` HPIS1), so `MOTION_THRESHOLD_MG` measures *dynamic* acceleration with gravity removed — consistent in every wrist orientation, instead of the original gravity-relative threshold that was hair-trigger in some resting positions and dead in others. Because motion now only matters during enforcement (part 2), the threshold and `MOTION_DURATION_MS` are tuned for *responsiveness* — low enough that normal-pace movement (e.g. walking away from a stayNear anchor) reliably triggers a re-check, with a short duration filter so brief gait peaks still register — rather than for idle battery, which motion no longer affects.
 
-2. **Motion is a wake source only during ENFORCEMENT.** In `DORMANT_SLEEP`, general high-pass motion (IA1) is not a wake source; motion received while in DORMANT is cleared and ignored without resetting the idle timer. (When look-to-wake is enabled — part 4 — INT1 stays armed for the *look* generator instead, not general motion.) During an enforcement window, motion still wakes the watch and forces an immediate condition re-check (responsiveness preserved exactly).
+2. **Motion is a wake source only during ENFORCEMENT.** In `DORMANT_SLEEP`, general high-pass motion (IA1) is not a wake source: the edge ISR is detached and the INT1 GPIO wake is disabled entirely, so the watch wakes on the timer/advertise-heartbeat and BLE only. Motion received while awake in DORMANT is cleared and ignored without resetting the idle timer. During an enforcement window, motion still wakes the watch and forces an immediate condition re-check (responsiveness preserved exactly).
 
 3. **Idle reachability without motion.** Because a still watch no longer wakes on motion, two mechanisms keep it reachable by the phone app:
    - **No idle sleep while connected.** Neither `DORMANT_SLEEP` nor enforcement light sleep is entered while `bt_connected` is true, so an in-progress configuration session is never dropped by the radio powering down.
-   - **Advertise heartbeat.** While disconnected, `DORMANT_SLEEP` caps its wake timer at `DISCONNECTED_ADV_HEARTBEAT_MS` (default 6 s). The watch surfaces each interval, advertises during its brief awake window, and accepts a connection if a phone is scanning — so a still, idle watch is always reachable within ~one heartbeat, with no button or motion required.
+   - **Advertise heartbeat.** While disconnected, `DORMANT_SLEEP` caps its wake timer at `DISCONNECTED_ADV_HEARTBEAT_MS` (default 6 s). The watch surfaces each interval, advertises during its brief awake window, and accepts a connection if a phone is scanning — so a still, idle watch is always reachable within ~one heartbeat, with no button or motion required. The same heartbeat wake refreshes the always-on analog clock (§5.7.4); the visible face changes only once per minute.
 
-4. **Look-to-wake (wrist-raise), `LOOK_WAKEUP_ENABLED`.** The LIS3DH's second interrupt generator (IA2) detects the "looking at the watch" posture and wakes the watch from `DORMANT_SLEEP` through the shared INT1 line. The watch face / LED ring sit on the **−Z** axis, so holding the face up to the sky points −Z up and the accelerometer reads `az ≈ −1 g` — a **Z-low** event. IA2 is configured `AOI=1 | ZLIE` (`INT2_CFG = 0x90`) reading the *raw* signal (HPF off) so it sees gravity/orientation; it fires when `az < −LOOK_TILT_THRESHOLD_MG` held for `LOOK_DURATION_MS`. The two generators are OR'd onto the single INT1 pin and demuxed in software (`lis3dh_read_clear_sources()` returns a `LIS3DH_SRC_MOTION | LIS3DH_SRC_LOOK` bitmask).
-
-   The wake is a one-shot driven by a `g_look_consumed` flag, and INT1 stays GPIO-armed in both phases (only *which* generator drives it changes, via `lis3dh_set_int1_routing(motion_ia1, look_ia2)`):
-   - **Armed** (`consumed == false`): route IA2 only. A wrist-raise wakes the watch immediately; on a real look it plays the boot/flourish animation and sets `consumed = true`. General motion stays muted for battery.
-   - **Shown** (`consumed == true`): route IA1 (motion) only — *not* the face-up level interrupt, which would re-latch every `LOOK_DURATION_MS` and spin the CPU while the watch is held up. Instead the motion of *lowering* the wrist wakes the watch promptly to re-check orientation; once `lis3dh_is_look_lowered()` reports `az > −LOOK_CLEAR_THRESHOLD_MG`, `consumed` clears and the next glance is armed again. Held perfectly still it makes no motion, so it still sleeps the full heartbeat. The `LOOK_CLEAR` vs `LOOK_TILT` gap is the hysteresis that stops a borderline hold from flip-flopping the one-shot.
-
-   Set `LOOK_WAKEUP_ENABLED = 0` to compile the feature out entirely (reverts to timer-only DORMANT sleep with motion muted).
-
-   > **Tuning note (current build):** the `LOOK_*` and `MOTION_*` thresholds below are deliberately **overpermissive** for the active testing/tuning pass — the intent is many false positives so the gesture fires on the gentlest glance. They should be tightened once the wake plumbing is confirmed end-to-end. Watch the `[DIAG] wake az=…` serial line to see what each wrist motion actually produces.
+**Removed: look-to-wake (wrist-raise).** An earlier revision re-introduced a fourth part — a narrow orientation-gated wrist-raise wake source (LIS3DH generator IA2) that lit the ring only when the watch was held face-up. It was removed in v0.7 along with its `LOOK_*` tunables, `LOOK_WAKEUP_ENABLED`, and the IA2 register setup. Its purpose was to light the LED ring on a glance; keeping the analog clock **always lit** (§5.7.4) subsumes that purpose while removing the wrist-raise wake source entirely, so `DORMANT_SLEEP` now arms no IMU interrupt at all. Motion (IA1) survives only as the ENFORCEMENT re-check wake source (part 2).
 
 This is a **latency-vs-battery** tradeoff: a shorter heartbeat connects faster but costs more idle power (the watch is awake during each heartbeat window). A full BLE-controller-wake implementation via `esp_pm` automatic light sleep would make idle reachability essentially free (sub-mA, zero latency) and is the recommended future refactor.
 
 ```
-MOTION_THRESHOLD_MG                = 48        // (tunable, imu.cpp) OVERPERMISSIVE: dynamic accel to trigger; low
-                                               // so the LOWERING wrist motion reliably wakes to re-arm look-to-wake
+MOTION_THRESHOLD_MG                = 48        // (tunable, imu.cpp) dynamic accel to trigger the ENFORCEMENT
+                                               // re-check; low so normal-pace movement reliably registers
 MOTION_DURATION_MS                 = 20        // (tunable, imu.cpp) motion must persist this long to count;
                                                // short so brief gait peaks still register
-LOOK_TILT_THRESHOLD_MG             = 48        // (tunable, imu.cpp) OVERPERMISSIVE RAISE: az below −0.048 g — barely
-                                               // any face-up tilt required; held for LOOK_DURATION_MS
-LOOK_DURATION_MS                   = 40        // (tunable, imu.cpp) IA2 hold time (2 ODR samples); nonzero only so
-                                               // the level interrupt doesn't re-latch instantly when parked face-up
-LOOK_CLEAR_THRESHOLD_MG            = 600       // (tunable, imu.cpp) OVERPERMISSIVE LOWERED: az risen above −0.6 g
-                                               // counts as "lowered" and re-arms the one-shot (hysteresis vs RAISE)
 DISCONNECTED_ADV_HEARTBEAT_MS      = 6000      // (tunable) max DORMANT_SLEEP interval while disconnected, so the
-                                               // watch periodically advertises and is reachable by the app
+                                               // watch periodically advertises, is reachable by the app, and
+                                               // refreshes the always-on analog clock (§5.7.4)
 ```
 
 ---

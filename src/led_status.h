@@ -39,6 +39,8 @@ struct LedStatusInput {
     bool unpaired;       // activity_state == UNPAIRED  → ring off
     bool enforcing;      // activity_state == ENFORCEMENT
     bool condition_met;  // enforcement condition currently satisfied
+    int  hour;           // current local hour (0–23), for the DORMANT analog clock
+    int  minute;         // current local minute (0–59), for the DORMANT analog clock
 };
 
 // FastLED init + load persisted config. Call once in setup().
@@ -55,8 +57,11 @@ bool led_apply_config(const uint8_t *data, size_t len);
 // Returns bytes written, or 0 if `cap` is too small. Needs 2 + LED_SLOT_COUNT*8.
 size_t led_serialize_config(uint8_t *out, size_t cap);
 
-// analog clock with leds
-void led_show_time(int hour, int minute, int second);
+// Paint the ring as an analog clock: hour hand red, minute hand green, yellow
+// when they overlap (§5.7.4). Leaves the frame lit — the SK6805 ring latches it,
+// so the clock stays visible through DORMANT_SLEEP. In DORMANT this is driven by
+// led_update() once per minute; there is no second hand.
+void led_show_time(int hour, int minute);
 
 // Blocking "hello" animation played once after a successful boot. Restores the
 // ring to cleared state when done, ready for the first led_update().
@@ -65,7 +70,9 @@ void led_startup_animation();
 // Begin a momentary wake-cause flash; expires after LED_WAKE_FLASH_MS.
 void led_note_wake(LedWakeCause cause);
 
-// Clear the ring immediately. Call right before each esp_light_sleep_start().
+// Clear the ring immediately. Call right before entering enforcement light sleep
+// (§5.7 priority 1). DORMANT_SLEEP no longer clears the ring — it leaves the
+// analog clock lit through sleep.
 void led_off();
 
 void led_actual_off();
