@@ -167,6 +167,12 @@
 #define MAX_WIFI_CREDS                     4
 #define MAX_UNREACHABLE_QUEUE              8
 
+// Watch-side anchor WiFi repair (§5.5.3). Must equal the anchor's slot count.
+#define ANCHOR_WIFI_MAX_CRED_SLOTS         4
+#define ANCHOR_REPAIR_MIN_BATTERY_MV    4000   // only repair on/near the charger
+#define ANCHOR_REPAIR_SCAN_INTERVAL_S   1200   // 20 min between repair checks
+#define ANCHOR_REPAIR_BACKOFF_S        14400   // 4 h per-anchor offer suppression
+
 // Continuous enforcement flag value
 #define DURATION_CONTINUOUS       0xFFFFFFFFUL
 
@@ -190,6 +196,9 @@
 //  Shared UUIDs  (must match anchor firmware and mobile app)
 // ============================================================
 #define ANCHOR_SERVICE_UUID               "4A0F0001-F8CE-11EE-8001-020304050607"
+// Anchor WiFi characteristics (must match anchor firmware) — used by §5.5.3 repair.
+#define ANCHOR_WIFI_CRED_CHAR_UUID        "4A0F0003-F8CE-11EE-8001-020304050607"
+#define ANCHOR_WIFI_STATUS_CHAR_UUID      "4A0F000E-F8CE-11EE-8001-020304050607"
 // Proximity engine characteristics (v2 — must match anchor firmware)
 #define ANCHOR_PROX_VECTOR_CHAR_UUID      "4A0F0008-F8CE-11EE-8001-020304050607"
 #define ANCHOR_PROX_SCORE_CHAR_UUID       "4A0F0009-F8CE-11EE-8001-020304050607"
@@ -1194,6 +1203,157 @@ static int8_t get_anchor_rssi(const uint8_t *uuid) {
 }
 
 // ============================================================
+//  Anchor WiFi repair (watch side, §5.5.3)
+//  A watch on the charger silently heals stranded anchors that its own schedule
+//  depends on — the Sunrise Lock safety net. Distress-only, schedule-referenced-
+//  only (a security boundary: any device can advertise Major 0x4A0F, so we never
+//  hand credentials to an anchor we aren't bound to). No Watch Status change —
+//  the app rediscovers recovery by reading the anchor's own …000E.
+// ============================================================
+
+// Per-anchor offer suppression (§5.5.3 backoff). Not persisted — a reboot simply
+// re-checks, which is harmless.
+struct RepairBackoff {
+    uint8_t  uuid[16];
+    uint32_t lastOfferMs;   // 0 = never offered
+    uint8_t  lastState;     // last observed …000E state byte
+    bool     valid;
+};
+static RepairBackoff g_repair_backoff[MAX_ANCHOR_RECORDS];
+static uint32_t      g_last_repair_check_ms = 0;
+
+static RepairBackoff *repair_backoff_for(const uint8_t *uuid) {
+    int free_slot = -1;
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        if (g_repair_backoff[i].valid && uuid_eq(g_repair_backoff[i].uuid, uuid))
+            return &g_repair_backoff[i];
+        if (!g_repair_backoff[i].valid && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) return nullptr;
+    RepairBackoff &b = g_repair_backoff[free_slot];
+    memcpy(b.uuid, uuid, 16);
+    b.lastOfferMs = 0;
+    b.lastState   = 0xFF;
+    b.valid       = true;
+    return &b;
+}
+
+// True iff the anchor UUID is referenced by the currently loaded schedule — as
+// an event's anchorId or in a beepAnchors list (§5.5.3 security boundary). The
+// seen-anchors list is NOT an acceptable filter (passive scan can see planted
+// anchors).
+static bool anchor_is_schedule_referenced(const uint8_t *uuid) {
+    for (int i = 0; i < g_today_event_count; i++) {
+        const Event &e = g_today_events[i];
+        if (e.hasAnchorId && uuid_eq(e.anchorId, uuid)) return true;
+        int n = e.beepAnchorCount; if (n > 8) n = 8;
+        for (int j = 0; j < n; j++) {
+            if (uuid_eq(e.beepAnchors[j], uuid)) return true;
+        }
+    }
+    return false;
+}
+
+// Connect to one anchor as a BLE central, read WiFi Status …000E, and — if in
+// distress (state 0/3/4) and not suppressed by backoff — offer every stored
+// credential pair (§5.5.3). Returns the observed state byte, or -1 on failure.
+static int repair_service_anchor(const AnchorRecord *rec, uint32_t now_ms) {
+    if (!rec->bleMacValid) return -1;
+
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    if (scan && scan->isScanning()) scan->stop();
+
+    NimBLEAddress addr(rec->bleMac, rec->bleAddrType);
+    NimBLEClient *client = NimBLEDevice::createClient();
+    if (!client) return -1;
+    NimBLEDevice::setMTU(BLE_REQUESTED_MTU);
+    client->setConnectionParams(12, 12, 0, 400);
+    if (!client->connect(addr)) {
+        NimBLEDevice::deleteClient(client);
+        return -1;
+    }
+    NimBLERemoteService *svc = client->getService(ANCHOR_SERVICE_UUID);
+    NimBLERemoteCharacteristic *statusChar =
+        svc ? svc->getCharacteristic(ANCHOR_WIFI_STATUS_CHAR_UUID) : nullptr;
+    if (!statusChar) {
+        // Pre-v0.8 anchor without …000E — degrade: do nothing (§10 item 6).
+        client->disconnect();
+        NimBLEDevice::deleteClient(client);
+        return -1;
+    }
+    std::string v = statusChar->readValue();
+    if (v.empty()) {
+        client->disconnect();
+        NimBLEDevice::deleteClient(client);
+        return -1;
+    }
+    uint8_t state = (uint8_t)v[0];
+
+    // Repair distress only (0 never-provisioned, 3 auth-fail, 4 AP-not-found).
+    // Connected (2) / connecting (1) → disconnect and do nothing (§5.5.3 step 3).
+    bool distress = (state == 0 || state == 3 || state == 4);
+    if (distress) {
+        RepairBackoff *bo = repair_backoff_for(rec->uuid);
+        bool stateChanged = !bo || bo->lastState != state;
+        bool suppressed = bo && bo->lastOfferMs != 0 &&
+                          (now_ms - bo->lastOfferMs) < (uint32_t)ANCHOR_REPAIR_BACKOFF_S * 1000UL &&
+                          !stateChanged;
+        if (!suppressed) {
+            NimBLERemoteCharacteristic *credChar =
+                svc->getCharacteristic(ANCHOR_WIFI_CRED_CHAR_UUID);
+            if (credChar) {
+                int limit = g_wifi_cred_count < ANCHOR_WIFI_MAX_CRED_SLOTS
+                            ? g_wifi_cred_count : ANCHOR_WIFI_MAX_CRED_SLOTS;
+                for (int i = 0; i < limit; i++) {
+                    JsonDocument doc;
+                    doc["ssid"]     = g_wifi_creds[i].ssid;
+                    doc["password"] = g_wifi_creds[i].pass;
+                    char buf[160];
+                    size_t n = serializeJson(doc, buf, sizeof(buf));
+                    // Write-with-response; the anchor responds 0x01 = accepted
+                    // and carries it from here via its own retry loop (§4.5.1).
+                    credChar->writeValue((uint8_t *)buf, n, true);
+                }
+                Serial.printf("[REPAIR] Offered %d cred(s) to %s (state=%u)\n",
+                              limit, rec->name, state);
+            }
+            if (bo) bo->lastOfferMs = now_ms;
+        }
+        if (bo) bo->lastState = state;
+    }
+
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return state;
+}
+
+// Periodic repair check (§5.5.3). Gated on being on the charger, dormant, and
+// not app-connected. Piggybacks on the DORMANT loop; walks only schedule-
+// referenced anchors seen in a recent scan.
+static void anchor_wifi_repair_tick(uint32_t now_ms) {
+    if (g_bt_connected) return;                                  // don't contend with the app
+    if (g_activity_state != STATE_DORMANT) return;              // never during enforcement
+    if (g_wifi_cred_count == 0) return;                         // nothing to offer
+    if (read_battery_mv() <= ANCHOR_REPAIR_MIN_BATTERY_MV) return; // must be on/near charger
+    if (g_last_repair_check_ms != 0 &&
+        (now_ms - g_last_repair_check_ms) < (uint32_t)ANCHOR_REPAIR_SCAN_INTERVAL_S * 1000UL)
+        return;
+    g_last_repair_check_ms = now_ms;
+
+    uint32_t now_ts = (uint32_t)time(nullptr);
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        AnchorRecord &rec = g_anchor_records[i];
+        if (!rec.valid || !rec.bleMacValid) continue;
+        if (!anchor_is_schedule_referenced(rec.uuid)) continue;  // security boundary
+        // Only anchors actually in range (recently advertised) — avoids wasting
+        // a multi-second connect timeout on an absent anchor.
+        if (rec.lastSeen == 0 ||
+            now_ts - rec.lastSeen > (uint32_t)ANCHOR_SEEN_TIMEOUT_S * 3) continue;
+        repair_service_anchor(&rec, now_ms);
+    }
+}
+
+// ============================================================
 //  WiFi helpers
 // ============================================================
 
@@ -1441,8 +1601,9 @@ static void push_watch_status() {
     }
     
     // battery_pct (§5.6): 1 byte, 0–100 (0xFF if not available). The battery
-    // sense is reserved/non-functional on this hardware rev, but we emit the
-    // curve-derived percentage so the wire layout matches the spec (and the app).
+    // ADC is functional (read_battery_mv() is authoritative, §1); the old
+    // "reserved/non-functional" note was stale (v0.8 §0.2). This value is also
+    // load-bearing for the §5.5.3 watch-side anchor-repair battery gate.
     uint32_t batt_pct = voltage_to_percentage(batt_mv);
     buf[pos++] = (batt_pct > 100) ? 100 : (uint8_t)batt_pct;
 
@@ -1458,6 +1619,13 @@ static void push_watch_status() {
     // grace is active, or not enforcing; 0 only while actively alarming.
     uint8_t condition_met = (g_activity_state == STATE_ENFORCEMENT && !g_enf.condition_met) ? 0 : 1;
     buf[pos++] = condition_met;
+
+    // schedule_crc (§5.6, added v0.8 — lockstep): CRC32 of the schedule blob the
+    // watch currently holds (the effective, gate-composed blob), 0 if none. Lets
+    // the app confirm-vs-infer sync (MOBILE_APP_SPEC §8.16).
+    uint32_t sched_crc = (g_sched_blob && g_sched_blob_len >= 3)
+                         ? esp_crc32_le(0, g_sched_blob, g_sched_blob_len) : 0;
+    memcpy(buf + pos, &sched_crc, 4); pos += 4;
 
     buf[pos++] = (uint8_t)g_unreachable_count;
     for (int i = 0; i < g_unreachable_count; i++) {
@@ -3885,7 +4053,7 @@ void setup() {
     // the default (~0 dBm) leaves the proximity query failing while ads are
     // still heard. (Boost the anchor's TX power the same way for full benefit.)
     NimBLEDevice::setPower(9);  // +9 dBm (max on ESP32-C3)
-    NimBLEDevice::setDeviceName("Impulse Watch");
+    
 
     bp;
 
@@ -3954,8 +4122,15 @@ void setup() {
     // CHK 8: start service + advertising
     svc->start();
     NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
-    pAdv->setName("Impulse Watch");
+
     pAdv->addServiceUUID(WATCH_SERVICE_UUID);
+    // Scan response: carries the friendly name. LightBlue and iOS pick this up
+    // on an active scan; it does not compete for the primary packet's 31 bytes.
+    NimBLEAdvertisementData scanResponse;
+    scanResponse.setName("Impulse Watch");
+    pAdv->setScanResponseData(scanResponse);
+
+    
     pAdv->start();
     Serial.println("[BLE] Watch advertising started");
 
@@ -4180,6 +4355,12 @@ void loop() {
     // poll and each motion-triggered check refreshes the cache with an aligned
     // active scan immediately before the query, and the watch light-sleeps
     // between polls when compliant — so a separate background scan was redundant.
+
+    // ---- Anchor WiFi repair (§5.5.3) ----
+    // Battery-gated, dormant-only, ~20 min: heal stranded schedule-referenced
+    // anchors from the watch's own stored credentials. Runs after the scan above
+    // so anchor RSSI/last-seen is fresh. Internally gated + rate-limited.
+    anchor_wifi_repair_tick(now_ms);
 
     // ---- Event boundary check ----
     if (g_activity_state == STATE_DORMANT && g_next_boundary_min <= now_min) {
