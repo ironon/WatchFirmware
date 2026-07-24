@@ -1,6 +1,6 @@
 # ADHD Habit Enforcement Watch & Anchor — Firmware Specification
 
-**Version:** 0.7 (Draft — see Section 0 for spec status, firmware parity, and the change log)
+**Version:** 0.8 (Draft — see Section 0 for spec status, firmware parity, and the change log)
 **Scope:** Firmware for the ESP32-C3-WROOM Watch and ESP32-C3-WROOM Anchor devices, intended as a complete reference for a coding agent.
 
 ---
@@ -28,9 +28,22 @@ Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proxi
 | Donning grace + window-start unworn beep (§5.4.4) | ✅ | ✅ (blob parse) | **Done** (2026-07-11). Watch: window-start WATCH_REMOVED when unworn, `donningGraceS` grace with deadline/short-circuit/sleep-cap/expiry-recheck/removal-cancel. Watch Status `condition_met` byte added. Anchor parses `donning_grace_s` for wire parity. |
 | Anchor schedule persistence + midnight recalc (§4.7 as of v0.5) | — | ✅ | **Done** (2026-07-11): NVS blob persist + SNTP/tz-based local recalc on receipt/boot/midnight; fail-open when no valid time or no stored schedule. |
 
+| Anchor WiFi credential slots + WiFi Status char (§4.4, §4.5.1) | — | ❌ | **New in v0.8.** 4-slot NVS credential table with dedup/LRU eviction, slot-cycling retry loop, `…000E` WiFi Status (Read+Notify), non-blocking credential write response. **Lockstep** with MOBILE_APP_SPEC §8.14. |
+| Watch-side anchor WiFi repair (§5.5.3) | ❌ | — | **New in v0.8.** Battery-gated (>4000 mV), 20-min interval, schedule-referenced anchors only. No wire-format change on the watch side; depends on the anchor `…000E` characteristic above. |
+
 Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠️ diverges from spec · ❌ not started
 
 ### 0.2 Change log
+
+**v0.8 — 2026-07-21** (anchor wire-format change — **lockstep with MOBILE_APP_SPEC v1.3 §8.14**)
+- **Anchor WiFi credentials become a 4-slot table (§4.4, §4.5.1).** `ANCHOR_WIFI_MAX_CRED_SLOTS = 4`, deduplicated by SSID, LRU-evicted preferring never-connected slots. Credential offers are now **non-destructive** — the central failure mode of the old single-pair store (overwriting working credentials with wrong ones and stranding an anchor) is closed by construction. Slots are tried most-recently-successful first, so a healthy anchor never drops a working link for a speculative offer.
+- **New anchor characteristic: WiFi Status `…000E` (Read + Notify) (§4.4).** `[state][ssid_len][ssid][ipv4][rssi][slots_used]`. Previously nothing could ask an anchor about its own network state, so the app could only infer health from HTTP timeouts and the only remedy was a blind overwrite. States `0x03` (auth failed) / `0x04` (AP not found) define **distress**. Exposing `ipv4` also gives the app a BLE fallback for learning anchor addresses when mDNS is blocked or iOS Local Network permission is denied.
+- **Credential write is now non-blocking (§4.4) — behavior change.** Responds `0x01` = *accepted*, immediately; the connection outcome arrives via a WiFi Status notification. The old blocking write stalled 10–15 s against BLE write-response timeouts, making it least reliable in exactly the recovery scenarios it exists for. **`0x01` no longer means "connected."**
+- **New §5.5.3 — watch-side anchor WiFi repair.** A watch on the charger (battery > `ANCHOR_REPAIR_MIN_BATTERY_MV` = 4000 mV, `DORMANT`, not app-connected) checks nearby anchors every 20 min and offers its own stored credentials to any in distress. Motivated by Sunrise Lock: the watch sits on the nightstand all night beside the exact anchors that commitment depends on, and a stranded anchor means the alarm silently never fires (§4.7 fail-open). **Eligibility is restricted to anchors referenced by the watch's own schedule** (`anchorId` / `beepAnchors`) — a security boundary, since any device can advertise Major `0x4A0F` and "any anchor in range" would leak the user's WiFi password to a planted device. The watch repairs distress only; it never offers to a healthy anchor. No Watch Status change — repairs are silent and the app infers them from the anchor's own `…000E`.
+- **§1 correction — battery sense is functional.** The hardware table's "non-functional, reserved for future" note on GPIO 3 was **stale**; `read_battery_mv()` works and is load-bearing for the §5.5.3 gate. A matching stale comment survives in `main.cpp` beside the `battery_pct` packing.
+- New constants (§7): `ANCHOR_WIFI_MAX_CRED_SLOTS`, `ANCHOR_WIFI_SLOT_ATTEMPT_LIMIT`, `ANCHOR_REPAIR_MIN_BATTERY_MV`, `ANCHOR_REPAIR_SCAN_INTERVAL_S`, `ANCHOR_REPAIR_BACKOFF_S`.
+- **Anchor WiFi must become event-driven (§4.5.1).** The `0x03`/`0x04` distress split requires classifying the `WiFi.onEvent()` disconnect reason (`WIFI_REASON_NO_AP_FOUND` vs the auth-family reasons); the existing blocking `WiFi.status()` polls in `try_connect_wifi`/`WifiCredCallback` can't and are replaced.
+- **Schedule CRC readback (lockstep with MOBILE_APP_SPEC §8.16).** Watch Status `…0016` gains a 4-byte `schedule_crc` (after `condition_met`); the anchor answers `GET /schedule` with its stored blob's CRC32 and mirrors the same value in WiFi Status `…000E`. Lets the app **confirm** sync rather than infer it, catching a device that reset to a stale persisted schedule. Watch Status growing is a lockstep wire change.
 
 **v0.7 — 2026-07-14** (watch only; no wire-format change)
 - **Look-to-wake removed; DORMANT is now a zero-motion-interrupt state.** The wrist-raise wake source (IA2, `LOOK_WAKEUP_ENABLED`, and the `LOOK_*` tunables) is deleted from `imu.cpp`/`imu.h`. `DORMANT_SLEEP` arms **no** IMU interrupt at all — it wakes on the timer/advertise-heartbeat and BLE only. Motion (IA1) remains a wake source **only during ENFORCEMENT** (§8.4 part 2), unchanged.
@@ -79,6 +92,7 @@ Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠
 7. Constants & Tunables
 8. Power & Radio Optimization (Watch)
 9. Commitment Integrity — The Watch as Root of Trust
+10. Deferred Items & v0.8 Coding-Agent Handoff
 
 ---
 
@@ -102,7 +116,9 @@ Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠
 | IR worn receiver      | GPIO 0   | ADC; phototransistor reflection level              |
 | Vibration motor       | GPIO 10  | HIGH = on                                          |
 | LED status ring       | GPIO 10  | Addressable LED data line. See note below.         |
-| Battery voltage sense | GPIO 3   | ADC, Vbat/2 (non-functional, reserved for future) |
+| Battery voltage sense | GPIO 3   | ADC, Vbat/2 via a 1/2 divider. **Functional** — see note below. |
+
+**Battery sense note:** GPIO 3 carries Vbat/2 through a resistor divider, read with `ADC_11db` attenuation. `read_battery_mv()` (`main.cpp`) returns battery millivolts by doubling the raw reading before scaling; `voltage_to_percentage()` maps that to the 0–100 value in Watch Status (§5.6). Earlier revisions of this spec described the sense as non-functional/reserved — **that is stale**; the ADC works and is load-bearing for the anchor WiFi repair gate (§5.5.3). A matching stale comment remains in `main.cpp` next to the `battery_pct` packing and should be corrected when that code is next touched.
 
 **IMU:** LIS3DHTR, connected via SPI.
 **Worn sensor:** ITR8307/S17/TR8 (C81632) reflective opto-interrupter — a GaAs IR LED emitter (GPIO 1) paired with an NPN phototransistor receiver read on the ADC (GPIO 0). Skin held against the sensor reflects the emitted IR back into the phototransistor.
@@ -326,11 +342,50 @@ On any write (payload is ignored), the anchor activates its buzzer for `IDENTIFY
 { "ssid": "<network name>", "password": "<password>" }
 ```
 
-On write: the anchor stores the credentials to NVS and attempts to connect to the given WiFi network. It responds with:
-- `0x01` on successful connection.
-- `0x00` on failure (connection timeout or wrong credentials).
+**Credential slots (v0.8).** The anchor stores up to `ANCHOR_WIFI_MAX_CRED_SLOTS` (default **4**) credential pairs in NVS, not one. This makes credential offers (§4.5.1, §5.5.3, MOBILE_APP_SPEC §8.14) **non-destructive**: handing an anchor a new network can never orphan it, because the previously working credentials survive as a fallback.
 
-The anchor stores only one WiFi credential pair. Writing new credentials overwrites the old ones.
+On write, the anchor:
+1. Parses the JSON. Malformed or zero-length payload → respond `0x00`, no state change.
+2. **Deduplicates by SSID.** If the SSID already occupies a slot, that slot's password is updated in place and the slot is promoted to most-recently-offered. Otherwise the pair is inserted into a free slot, or — if all slots are full — evicts the **least-recently-successfully-connected** slot. A slot that has never connected successfully is evicted before any slot that has.
+3. Persists the slot table to NVS.
+4. Responds **`0x01` immediately** — meaning *accepted and will be attempted*, not *connected*.
+5. Asynchronously begins a connection attempt to the offered network (see §4.5), unless the anchor is already connected to that same SSID, in which case it stays put and only refreshes the stored password.
+
+**Response semantics changed in v0.8 (lockstep).** The write no longer blocks on the WiFi connection attempt — a connect can take 10–15 s, which is longer than typical BLE write-response timeouts, and the old blocking behavior made the write unreliable in exactly the recovery scenarios it exists for. The connection **outcome** is delivered via the WiFi Status characteristic (Read + Notify, below), which the writer should subscribe to before writing. `0x01` now means accepted; it does not mean connected.
+
+**Roaming behavior.** Because slots are tried in order (§4.5), an anchor that is currently connected will *not* drop a working connection to try a newly offered network. The new credentials sit in a slot and are used on the next reconnect or boot. This is what makes it safe for the app to offer credentials to healthy anchors (MOBILE_APP_SPEC §8.14).
+
+#### Characteristic: WiFi Status (Read + Notify) **(new in v0.8)**
+
+**UUID:** `ANCHOR_WIFI_STATUS_CHAR_UUID` (`4A0F000E-F8CE-11EE-8001-020304050607`)
+
+Lets a connected client ask the anchor about its own network state over BLE — the channel that always works, since the anchor advertises continuously and remains connectable regardless of WiFi state (§4.3). Without this, neither the app nor the watch can distinguish "anchor is fine" from "anchor is stranded," and the only available action is a blind, potentially destructive credential overwrite.
+
+**Payload (variable length, little-endian):**
+```
+[1 byte:  state      (see table)]
+[1 byte:  ssid_len]
+[N bytes: ssid       (UTF-8, the SSID of the slot currently in use or last attempted;
+                      empty when state = 0)]
+[4 bytes: ipv4       (network byte order; 0 when not connected)]
+[1 byte:  rssi       (AP link RSSI encoded as rssi + 128; 0 when not connected)]
+[1 byte:  slots_used (0..ANCHOR_WIFI_MAX_CRED_SLOTS)]
+[4 bytes: schedule_crc (uint32, CRC32 of the schedule blob currently in NVS; 0 if none.
+          Same value as GET /schedule, §6.2 — lets the app verify sync over BLE when the
+          LAN path is unavailable. MOBILE_APP_SPEC §8.16.)]
+```
+
+| `state` | Meaning |
+|---|---|
+| `0x00` | Never provisioned — no credential slots occupied. |
+| `0x01` | Connecting / retrying (§4.5 retry loop is active). |
+| `0x02` | Connected. `ipv4` and `rssi` are valid. |
+| `0x03` | Auth failure — AP found, credentials rejected. |
+| `0x04` | AP not found — the stored SSID(s) were not seen in a scan. |
+
+The anchor notifies on every `state` transition and whenever `ipv4` changes (e.g. a DHCP lease change). A client that subscribes before writing credentials will therefore observe the outcome of its own offer.
+
+**Why `ipv4` is exposed here:** it gives the app the anchor's address over BLE, providing a fallback path for the HTTP schedule push (§4.7) when mDNS is unavailable — which is common on guest and enterprise networks, and whenever iOS Local Network permission has been denied.
 
 #### Characteristic: Anchor Settings (Write, With Response)
 
@@ -462,6 +517,32 @@ After successfully connecting to WiFi, the anchor:
 3. Opens a UDP socket on port `ANCHOR_UDP_PORT` (defined constant) and listens for commands.
 
 If WiFi disconnects, the anchor continues BLE advertising and attempts reconnection every `ANCHOR_WIFI_RETRY_INTERVAL_S` seconds using stored credentials.
+
+#### 4.5.1 Credential Slot Cycling (v0.8)
+
+With up to `ANCHOR_WIFI_MAX_CRED_SLOTS` credential pairs stored (§4.4), the anchor cycles through them rather than retrying one pair forever.
+
+**Ordering.** Slots are tried **most-recently-successfully-connected first**, then most-recently-offered. A slot that has connected before is always preferred over an untested offer — an anchor that works today keeps working after receiving a speculative offer.
+
+**Attempt loop.** Starting from the preferred slot, the anchor attempts connection. After `ANCHOR_WIFI_SLOT_ATTEMPT_LIMIT` (default 3) consecutive failures on a slot it advances to the next occupied slot. Having cycled through every occupied slot without success, it sleeps `ANCHOR_WIFI_RETRY_INTERVAL_S` and starts the cycle again — indefinitely. The anchor never gives up permanently; a router that comes back after an outage is picked up without user intervention.
+
+**State reporting.** The loop drives the WiFi Status `state` byte (§4.4):
+- No occupied slots → `0x00`.
+- Attempt in flight, or between attempts within a cycle → `0x01`.
+- Association + DHCP succeeded → `0x02`; the slot is stamped as last-successful and `setup_network_services()` runs (mDNS, UDP listener, HTTP `/schedule` endpoint).
+- A full cycle completed with at least one slot rejected on authentication → `0x03`.
+- A full cycle completed with no stored SSID observed in a scan → `0x04`.
+
+`0x03` and `0x04` are the two states that mean "a human or a peer device needs to intervene," and are what the app (MOBILE_APP_SPEC §8.14) and the watch (§5.5.3) treat as **distress**.
+
+**Implementation note — distinguishing `0x03` from `0x04`.** The current code (`try_connect_wifi`, `WifiCredCallback`) polls `WiFi.status()` in a blocking loop, which cannot reliably separate auth failure from AP-not-found. Move to the event-driven path: register a `WiFi.onEvent()` handler and classify on `ARDUINO_EVENT_WIFI_STA_DISCONNECTED` by `wifi_err_reason_t`:
+- `WIFI_REASON_NO_AP_FOUND` → contributes to `0x04`.
+- `WIFI_REASON_AUTH_FAIL`, `WIFI_REASON_AUTH_EXPIRE`, `WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT`, `WIFI_REASON_HANDSHAKE_TIMEOUT`, `WIFI_REASON_MIC_FAILURE` → contribute to `0x03`.
+- other reasons (assoc failures, beacon timeout, etc.) → transient; stay `0x01` and keep retrying.
+
+The event-driven handler also removes the 10 s blocking `while` loops that currently stall the loop task and the BLE callback — required anyway for the non-blocking credential-write response (§4.4).
+
+**Fresh-offer preemption.** Receiving a credential write for an SSID *not* currently connected restarts the attempt cycle immediately rather than waiting out the retry interval — a user standing in front of a stranded anchor should see it recover in seconds. As stated in §4.4, an anchor already in state `0x02` does not drop its working connection to do this.
 
 ### 4.6 UDP Command Handling
 
@@ -1241,6 +1322,34 @@ struct UnreachableNotification {
 
 The next time `bt_connected == true`, the watch sends all queued notifications to the app via the Watch Status GATT characteristic (see Section 5.6).
 
+#### 5.5.3 Anchor WiFi Repair (v0.8)
+
+**Motivation.** A stranded anchor is *silently* inert, not merely degraded: with no WiFi it never reaches SNTP, and with no valid time it behaves as though it has no schedule and will not beep at all (§4.7). For Sunrise Lock this is the worst possible failure — the alarm simply does not happen, and the user finds out by oversleeping. The phone can repair this (MOBILE_APP_SPEC §8.14), but only when the app is open and the user is nearby. The watch is better positioned for the Sunrise Lock case specifically: it spends the entire night on the charger on the nightstand, inches from the very anchors that commitment depends on.
+
+**Gate — all conditions must hold.** The watch performs repair scans only when:
+1. **Battery > `ANCHOR_REPAIR_MIN_BATTERY_MV` (default 4000 mV)**, read via `read_battery_mv()` (§1). Above 4.0 V the watch is on or freshly off the charger, so the extra radio work is not competing with the day's enforcement budget. This gate is what makes the feature affordable — it is not a general-purpose background task.
+2. `bt_connected == false` — the watch does not contend for its radio while the app is talking to it.
+3. Activity state is `DORMANT` or `DORMANT_SLEEP`. Repair never runs during `ENFORCEMENT`; enforcement latency always wins.
+
+**Interval.** `ANCHOR_REPAIR_SCAN_INTERVAL_S` (default **1200 s / 20 min**). Overnight this yields tens of opportunities before the wake window, which is ample — the watch has all night to fix an anchor, so the interval is tuned for negligible power cost rather than speed. The repair check piggybacks on an existing `DORMANT` wake where possible rather than scheduling a dedicated one.
+
+**Eligibility — which anchors the watch will write credentials into.** This is a **security boundary, not an optimization.** The watch will offer credentials **only** to anchors whose UUID appears in its own currently loaded schedule — as an event's `anchorId`, or in an event's `beepAnchors` list. Anchors merely *seen* in a BLE scan are never eligible, no matter how they advertise.
+
+> **Rationale (do not relax without understanding this).** Offering credentials means transmitting the user's home WiFi password into another device. Any device can advertise the Impulse iBeacon Major `0x4A0F` — so "any anchor in range" would let a neighbor's anchor, or one deliberately placed outside a window by an attacker, harvest the user's WiFi password from a watch that simply walked past. Restricting to schedule-referenced UUIDs means the target is an anchor the user themselves bound a commitment to. The seen-anchors list is populated by passive scanning and is therefore **not** an adequate filter.
+
+**Procedure.** For each eligible anchor observed in the periodic scan (§5.1.2, `BLE_SCAN_INTERVAL_S`):
+1. Connect as a BLE central (the same role used for proximity queries, §5.4.1).
+2. Read **WiFi Status** (`ANCHOR_WIFI_STATUS_CHAR_UUID`, §4.4).
+3. If `state` is `0x02` (connected) or `0x01` (connecting), **disconnect and do nothing.** The watch repairs distress; it does not distribute credentials. This is deliberately narrower than the app's policy, which may offer to healthy anchors — the app acts on explicit user configuration, the watch acts autonomously.
+4. If `state` is `0x00`, `0x03`, or `0x04` (distress), write each credential pair from the watch's own NVS credential list (§5.6) to `ANCHOR_WIFI_CRED_CHAR_UUID`, most-recently-successful first, up to `ANCHOR_WIFI_MAX_CRED_SLOTS` pairs. The anchor's slot deduplication (§4.4) makes repeated offers idempotent — re-offering a pair the anchor already holds updates it in place and consumes no additional slot.
+5. Disconnect. Do not wait for the connection outcome; the anchor's retry loop (§4.5.1) carries it from here, and the watch has no reason to hold the link open.
+
+**Backoff.** After offering to a given anchor, the watch suppresses further offers to that UUID for `ANCHOR_REPAIR_BACKOFF_S` (default 4 h) unless its `state` is observed to have changed. An anchor whose AP is genuinely gone should not be re-written every 20 minutes all night.
+
+**No reporting path (decided).** The watch does **not** report repairs to the app; Watch Status is unchanged by this feature. The app learns that an anchor recovered by reading the anchor's own WiFi Status characteristic (MOBILE_APP_SPEC §8.14), which is authoritative anyway. This keeps the v0.8 lockstep batch to the anchor GATT only. Revisit if field experience shows users need to be told a silent repair happened.
+
+**Interaction with the app.** Both healers write to the same slot table, and both are idempotent by SSID, so no coordination is required. The app is the broader mechanism (it can prompt for passwords the watch has never held); the watch is the narrow, always-present safety net for the anchors a commitment actually depends on.
+
 ---
 
 ### 5.6 BLE GATT Service (Watch ↔ Phone)
@@ -1332,6 +1441,9 @@ The watch pushes a notification any time any field in this payload changes.
 [16 bytes: active_event_id (UUID of current enforcement event; zero-filled if none)]
 [1 byte:  condition_met (1 = enforcement condition currently met, grace active, or not
           enforcing; 0 = actively alarming. Added v0.6 — lockstep.)]
+[4 bytes: schedule_crc (uint32, CRC32 of the full schedule blob the watch last accepted,
+          identical to the END-phase CRC of §6.2; 0 if no schedule stored. Added v0.8 —
+          lockstep. Lets the app confirm-vs-infer sync state, MOBILE_APP_SPEC §8.16.)]
 [1 byte:  unreachable_anchor_count N]
 for each unreachable notification (N entries):
     [16 bytes: anchor UUID]
@@ -1637,6 +1749,8 @@ The anchor responds:
 
 The CRC is appended to the HTTP body as the final 4 bytes (little-endian uint32) after all event data.
 
+**Sync verification (v0.8).** A `GET http://<anchor-ip>/schedule` returns `200 OK` with a 4-byte body: the CRC32 (little-endian uint32) of the schedule blob the anchor currently holds in NVS, or `0x00000000` if none. This lets the app confirm — rather than infer — that a given anchor is up to date, and catches an anchor that fell back to a stale persisted schedule after a reset (MOBILE_APP_SPEC §8.16). The anchor also mirrors this value in its WiFi Status characteristic (§4.4) so the app can verify over BLE when the LAN path is unavailable.
+
 ---
 
 ### 6.3 Proximity Protocols **(proximity.cpp)**
@@ -1698,6 +1812,18 @@ DORMANT_TO_SLEEP_IDLE_MS           = 5000      // ms of inactivity before enteri
 ANCHOR_WIFI_RETRY_INTERVAL_S       = 30        // anchor WiFi reconnect attempt interval
 ANCHOR_SEEN_TIMEOUT_S              = 10        // seconds after which an anchor is considered unseen
                                                // for discovery purposes (does not affect proximity scoring)
+
+// Anchor WiFi credential slots (§4.4, §4.5.1)
+ANCHOR_WIFI_MAX_CRED_SLOTS         = 4         // credential pairs stored in anchor NVS; offers are
+                                               // non-destructive until all 4 are occupied
+ANCHOR_WIFI_SLOT_ATTEMPT_LIMIT     = 3         // consecutive failures on one slot before advancing
+
+// Watch-side anchor WiFi repair (§5.5.3)
+ANCHOR_REPAIR_MIN_BATTERY_MV       = 4000      // watch only repairs anchors above this battery voltage
+                                               // (i.e. on/near the charger) — read_battery_mv(), §1
+ANCHOR_REPAIR_SCAN_INTERVAL_S      = 1200      // 20 min between repair checks while gated conditions hold
+ANCHOR_REPAIR_BACKOFF_S            = 14400     // 4 h suppression per anchor UUID after an offer, unless
+                                               // its WiFi Status state is observed to change
 
 // UDP
 ANCHOR_UDP_PORT                    = 5555      // (tunable) UDP listen port on anchors
@@ -2001,4 +2127,30 @@ SCHEDULE_FORMAT_VERSION      = 0x02   // leading version byte of the schedule bl
 
 ---
 
-*End of specification v0.6*
+## 10. Deferred Items & v0.8 Coding-Agent Handoff
+
+### 10.1 Deferred — not in v0.8
+
+- **Toolchain: bump off the frozen ESP-IDF 4.4.7 platform (deferred; do eventually).** The build currently resolves to PlatformIO `platform = espressif32 @ 6.12.0` → Arduino-ESP32 **2.0.17** → **ESP-IDF 4.4.7**, which is the *newest of a dead line*: Espressif stopped maintaining the official PlatformIO `espressif32` platform, and the registry publishes no framework past `3.20017` (there is no 2.0.18 / IDF 4.4.8 package for PlatformIO at all). IDF 4.4.7 has a **WiFi-scan-under-BLE-coexistence heap leak on the ESP32-C3**: `esp_wifi_scan_start()` leaks ~1.5 KB/call, which ran the anchor to OOM `PANIC` every ~20 min (found via the NVS crash-ring; §diagnostics). It is **fixed in IDF 4.4.8** (changelog: *"Fixed scan get AP number issue"*, *"Fixed memory leak issue when BLE SCAN and other BLE events coexist"* [#13747], *"…BLE do not update SCAN status correctly for coexistence module on ESP32C3"*) and in the 5.x line. **Current mitigation (shipped):** the anchor's WiFi AP scan is bounded — 250 s interval, `ANCHOR_PROX_WIFI_MAX_SCANS = 8`, then the scan task self-terminates — turning the unbounded leak into a one-time ~12 KB cost (proximity impact is negligible: the anchor is stationary and its live WiFi RSSI is stale-gated out of Signal A between scans; the fingerprint learns WiFi APs from watch vectors). **Eventual fix:** migrate to the community **pioarduino** platform fork on **Arduino 3.x / IDF 5.x** (e.g. `platform = https://github.com/pioarduino/platform-espressif32/releases/download/53.03.13-1/platform-espressif32.zip` for IDF 5.3.2), which fixes the leak at the source; then `ANCHOR_PROX_WIFI_MAX_SCANS` can go back to `0` (unlimited). Not a version bump but a real migration — Arduino 3.x has breaking API changes (notably the LEDC/servo API: `ledcSetup`/`ledcAttachPin`/`ledcWrite(channel,…)` → `ledcAttach(pin,…)`, used by the anchor servo), and NimBLE-Arduino + the WiFi manager want re-validation against IDF 5.x. Do it on its own branch, off the lockstep batch.
+
+- **Status-characteristic version/length prefix (deferred; do NOT add in v0.8).** Watch Status (`…0016`) and anchor WiFi Status (`…000E`) have no version or length prefix, so every field addition is an exact-byte lockstep change with zero graceful degradation — v0.8 alone adds `schedule_crc` to Watch Status, the third such growth. This is **acceptable only because every device is flashed together and backward compatibility is out of scope.** If OTA or staged rollouts ever become real, prepend a 1-byte `struct_version` (or a `u8 length`) to both characteristics so an older parser can detect and skip unknown trailing fields. Deferred deliberately: adding it now buys nothing while all devices move in lockstep, and it would itself be another wire change to coordinate. Revisit when mixed-firmware fleets become possible.
+
+### 10.2 Build order (v0.8 firmware portion)
+
+The anchor WiFi rework is the foundation the app work depends on; do it first and in this order. Full cross-device order (firmware + app) lives in MOBILE_APP_SPEC §0.3.
+
+1. **Anchor WiFi refactor → event-driven (§4.4, §4.5.1).** Replace the blocking `WiFi.status()` polls in `try_connect_wifi`/`WifiCredCallback` with a `WiFi.onEvent()` handler that classifies disconnect reasons into the `0x03`/`0x04` distress split. This unblocks everything else and removes the 10 s stalls.
+2. **4-slot credential store (§4.4).** NVS slot table with SSID dedup + LRU eviction; non-blocking credential-write response (`0x01` = accepted); slot-cycling retry loop (§4.5.1).
+3. **WiFi Status characteristic `…000E` (§4.4)** including `schedule_crc`, plus `GET /schedule` CRC readback (§6.2) and the `schedule_crc` field in Watch Status `…0016` (§5.6). These are the sync-verification surface the app's §8.16 consumes.
+4. **Watch-side anchor repair (§5.5.3).** Depends on `…000E` existing (step 3) and on the battery ADC (§1, already functional). Gate, interval, schedule-referenced eligibility, backoff.
+
+### 10.3 Clarifying notes for the implementer
+
+- **Lockstep flash.** Steps 3's wire changes (Watch Status +4 bytes, new `…000E`, new `GET`) must land on watch, anchor, and app together — a v1 parser misreads a grown Watch Status payload. Coordinate the flash with the app's `ScheduleEncoder`/status-parser update.
+- **Battery ADC is real** despite the stale in-code comment (§1) — `read_battery_mv()` is authoritative; correct the comment when you touch that file.
+- **`schedule_crc` semantics:** it is the CRC32 of the full schedule *blob the device accepted/stored*, identical to the §6.2 END-phase CRC — not a recomputation over today's derived event list. `0` means no schedule; a genuine blob whose CRC is `0` is astronomically unlikely and harmless (reads as stale, triggers a re-push).
+- **Watch repair vs. app offers differ by design:** the watch offers only to *distress* anchors it has in its *schedule*; the app may offer to healthy anchors too. Don't "simplify" them to match — the asymmetry is the security boundary (§5.5.3 rationale).
+
+---
+
+*End of specification v0.8*
