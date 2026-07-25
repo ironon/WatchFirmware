@@ -89,6 +89,18 @@
 #define ENFORCEMENT_SCAN_WINDOW_MS                100  // BLE scanner active window (~10% duty cycle)
 #define ENFORCEMENT_QUERY_SCAN_DURATION_MS        700  // bounded scan run right before a proximity query
                                                        // to refresh the cache (aligns scan with query)
+
+// ── Calibration burst (§8.5) ────────────────────────────────────────────────
+// App-driven accelerated self-supervision: while active the watch repeatedly
+// submits its real-MAC scan vector to ONE target anchor so that anchor's
+// fingerprint (§4.10.4) fills in seconds instead of days of ambient learning.
+// The phone only orchestrates + shows progress; it never authors fingerprint
+// data — iOS exposes neither BLE MACs nor WiFi BSSIDs, so an app-built
+// fingerprint cannot align with the anchor/watch registry's coordinate space.
+#define CALIB_QUERY_INTERVAL_MS      600   // min gap between burst queries (each also runs a ~700ms scan)
+#define CALIB_MIN_DURATION_S          15
+#define CALIB_MAX_DURATION_S         180   // hard cap: bounds the forced-awake power cost
+#define CALIB_DEFAULT_DURATION_S      75
 #define PROX_QUERY_SCAN_DUTY_MS                   100  // pre-query scan only: window == interval == ~100%
                                                        // duty for dense device capture (restored after)
 #define ENFORCEMENT_IDLE_BEFORE_SLEEP_MS         30000
@@ -215,6 +227,7 @@
 #define WATCH_TIME_CHAR_UUID         "4A0F0019-F8CE-11EE-8001-020304050607"
 #define WATCH_PENDING_CHAR_UUID      "4A0F001A-F8CE-11EE-8001-020304050607"  // §9.5
 #define WATCH_PASS_CHAR_UUID         "4A0F001B-F8CE-11EE-8001-020304050607"  // §9.6
+#define WATCH_CALIB_CTRL_CHAR_UUID   "4A0F001C-F8CE-11EE-8001-020304050607"  // §8.5 calibration burst
 
 // ============================================================
 //  Enumerations
@@ -450,6 +463,17 @@ static uint32_t g_last_motion_ms        = 0;
 static NimBLEServer         *g_ble_server        = nullptr;
 static NimBLECharacteristic *g_seen_anchors_char = nullptr;
 static NimBLECharacteristic *g_status_char       = nullptr;
+static NimBLECharacteristic *g_calib_char        = nullptr;  // §8.5 calibration burst ctrl + progress
+
+// Calibration burst session state (§8.5).
+static bool     g_calib_active      = false;
+static uint8_t  g_calib_uuid[16];       // target anchor UUID
+static uint32_t g_calib_deadline_ms = 0;
+static uint32_t g_calib_next_ms     = 0; // earliest millis() for the next burst query
+static uint16_t g_calib_accepted    = 0; // samples the anchor folded into its fingerprint
+static uint16_t g_calib_queries     = 0; // total queries attempted this session
+static uint8_t  g_calib_last_score  = 0;
+static uint8_t  g_calib_last_flags  = 0;
 
 // Schedule BLE transfer
 static uint8_t  *g_sched_xfer_buf  = nullptr;
@@ -1733,6 +1757,106 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     rec->lastProxScore = result.score;
     Serial.printf("[PROX] Score=%d flags=0x%02X\n", result.score, result.flags);
     return prox_interpret_score(result.score);
+}
+
+// ============================================================
+//  Calibration burst (§8.5)
+// ============================================================
+
+// One accelerated self-supervision cycle against the target anchor: refresh the
+// RF cache, build the real-MAC vector, submit it. The anchor scores + folds the
+// sample into its fingerprint (§4.10.4) and echoes PROX_FLAG_SAMPLE_ACCEPTED
+// when it passed the training gate. Mirrors query_anchor_proximity()'s core but
+// returns the raw result and is keyed by anchor UUID rather than an Event.
+// Returns false (skip, retry next cycle) if the anchor is not yet in range.
+static bool calib_burst_once(const uint8_t uuid[16], ProxScoreResult *out) {
+    prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+
+    AnchorRecord *rec = nullptr;
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, uuid)) {
+            rec = &g_anchor_records[i];
+            break;
+        }
+    }
+    if (!rec || !rec->bleMacValid) return false;  // out of range for now — keep trying
+
+    prox_feed_wifi_aps();
+    ProxScanVector vec;
+    prox_build_scan_vector(&vec);
+
+    ProxScoreResult result;
+    if (!prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result, nullptr)) return false;
+    rec->lastProxScore = result.score;
+    *out = result;
+    return true;
+}
+
+// Emit a progress frame to the app (spec §8.5). Layout (little-endian):
+//   [1 state][2 accepted][2 queries][1 last_score][1 last_flags][2 remaining_s]
+// state: 0 idle, 1 running, 2 done (duration elapsed), 3 aborted (STOP / phone gone).
+static void notify_calib_progress(uint8_t state) {
+    if (!g_calib_char) return;
+    uint32_t now = millis();
+    uint16_t remaining_s = (g_calib_active && (int32_t)(g_calib_deadline_ms - now) > 0)
+                           ? (uint16_t)((g_calib_deadline_ms - now + 999) / 1000) : 0;
+    uint8_t buf[9];
+    buf[0] = state;
+    buf[1] = (uint8_t)(g_calib_accepted & 0xFF);
+    buf[2] = (uint8_t)(g_calib_accepted >> 8);
+    buf[3] = (uint8_t)(g_calib_queries & 0xFF);
+    buf[4] = (uint8_t)(g_calib_queries >> 8);
+    buf[5] = g_calib_last_score;
+    buf[6] = g_calib_last_flags;
+    buf[7] = (uint8_t)(remaining_s & 0xFF);
+    buf[8] = (uint8_t)(remaining_s >> 8);
+    g_calib_char->setValue(buf, sizeof(buf));
+    if (g_bt_connected) g_calib_char->notify();
+}
+
+static void calib_start(const uint8_t uuid[16], uint16_t duration_s) {
+    if (duration_s == 0)                    duration_s = CALIB_DEFAULT_DURATION_S;
+    if (duration_s < CALIB_MIN_DURATION_S)  duration_s = CALIB_MIN_DURATION_S;
+    if (duration_s > CALIB_MAX_DURATION_S)  duration_s = CALIB_MAX_DURATION_S;
+    memcpy(g_calib_uuid, uuid, 16);
+    g_calib_active      = true;
+    g_calib_deadline_ms = millis() + (uint32_t)duration_s * 1000UL;
+    g_calib_next_ms     = 0;   // fire the first query immediately
+    g_calib_accepted    = 0;
+    g_calib_queries     = 0;
+    g_calib_last_score  = 0;
+    g_calib_last_flags  = 0;
+    Serial.printf("[CALIB] Start: %us burst\n", (unsigned)duration_s);
+    notify_calib_progress(1);
+}
+
+static void calib_finish(uint8_t state) {
+    g_calib_active = false;
+    Serial.printf("[CALIB] Finish state=%u accepted=%u queries=%u\n",
+                  (unsigned)state, (unsigned)g_calib_accepted, (unsigned)g_calib_queries);
+    notify_calib_progress(state);
+}
+
+// Runs one burst step when a session is active. Called from loop() on the
+// calibration branch, which owns the loop for the session's duration so the
+// phone link stays up and the watch never sleeps mid-burst.
+static void calib_tick(uint32_t now_ms) {
+    // The app owns this session; if the phone drops, abort rather than burst
+    // unattended — bounds power and matches the app-initiated contract.
+    if (!g_bt_connected)                              { calib_finish(3); return; }
+    if ((int32_t)(now_ms - g_calib_deadline_ms) >= 0) { calib_finish(2); return; }
+    if (g_calib_next_ms != 0 && now_ms < g_calib_next_ms) return;
+
+    ProxScoreResult result;
+    bool ok = calib_burst_once(g_calib_uuid, &result);
+    g_calib_queries++;
+    if (ok) {
+        g_calib_last_score = result.score;
+        g_calib_last_flags = result.flags;
+        if (result.flags & PROX_FLAG_SAMPLE_ACCEPTED) g_calib_accepted++;
+    }
+    g_calib_next_ms = millis() + CALIB_QUERY_INTERVAL_MS;
+    notify_calib_progress(1);
 }
 
 // Donning grace (§5.4.4): true while the active event's grace window is running.
@@ -3852,6 +3976,30 @@ class WatchLedConfigCallback : public NimBLECharacteristicCallbacks {
     }
 };
 
+// §8.5 calibration burst control. Write format (little-endian):
+//   START: [0x01][16 anchor UUID][2 duration_s]   duration 0 → default, clamped.
+//   STOP:  [0x00]
+// Progress is reported back via notify on the same characteristic (see
+// notify_calib_progress). The actual burst runs on loop()'s calibration branch.
+class WatchCalibCallback : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
+        std::string v = pChar->getValue();
+        if (v.empty()) return;
+        uint8_t cmd = (uint8_t)v[0];
+        if (cmd == 0x00) {                 // STOP
+            if (g_calib_active) calib_finish(3);
+            return;
+        }
+        if (cmd == 0x01 && v.size() >= 1 + 16 + 2) {   // START
+            uint8_t uuid[16];
+            memcpy(uuid, v.data() + 1, 16);
+            uint16_t dur = (uint8_t)v[17] | ((uint16_t)(uint8_t)v[18] << 8);
+            calib_start(uuid, dur);
+        }
+        g_last_activity_ms = millis();
+    }
+};
+
 // ============================================================
 //  setup()
 // ============================================================
@@ -4088,6 +4236,11 @@ void setup() {
     g_status_char = svc->createCharacteristic(WATCH_STATUS_CHAR_UUID,
                                                NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
+    g_calib_char = svc->createCharacteristic(WATCH_CALIB_CTRL_CHAR_UUID,   // §8.5
+                                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                             NIMBLE_PROPERTY::NOTIFY);
+    g_calib_char->setCallbacks(new WatchCalibCallback());
+
     auto *anchorIpChar = svc->createCharacteristic(WATCH_ANCHOR_IP_CHAR_UUID,
                                                     NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
     anchorIpChar->setCallbacks(new WatchAnchorIpCallback());
@@ -4296,6 +4449,19 @@ void loop() {
 
     if (g_activity_state == STATE_UNPAIRED) {
         led_update(led_status_input());  // ring stays off until paired (§5.7)
+        delay(10);
+        return;
+    }
+
+    // ---- Calibration burst (§8.5) ----
+    // App-driven accelerated self-supervision against one anchor. While active it
+    // owns the loop: bursts real-MAC vectors at the target anchor, then returns
+    // before the normal state machine / sleep gates so the phone link stays up
+    // and the watch does not sleep mid-burst. calib_tick() self-terminates on
+    // duration expiry, STOP, or phone disconnect.
+    if (g_calib_active) {
+        led_update(led_status_input());
+        calib_tick(now_ms);
         delay(10);
         return;
     }

@@ -287,6 +287,10 @@ struct ProxScoreResult {
     //          devices with sufficient samples to meaningfully contribute to the score.
     //   bit 1 (PROX_FLAG_LOW_DEVICE_COUNT): fewer than PROX_MIN_DEVICE_COUNT devices
     //          were seen in the watch's vector; score is degraded and unreliable.
+    //   bit 2 (PROX_FLAG_SAMPLE_ACCEPTED): the vector just scored passed the
+    //          self-supervised training gate (§4.10.4) and was folded into the
+    //          fingerprint. Set per-query; used by the calibration burst (§4.10.7)
+    //          to count samples that actually taught the anchor.
 }
 ```
 
@@ -712,7 +716,10 @@ Set `PROX_FLAG_FINGERPRINT_ACTIVE` in `result.flags` if Signal B was used.
 
 #### 4.10.4 Self-Supervised Fingerprint Training **(proximity.cpp)**
 
-`prox_maybe_update_fingerprint(watch_vec: ProxScanVector, result: ProxScoreResult)`
+`prox_maybe_update_fingerprint(watch_vec: ProxScanVector, result: ProxScoreResult) -> bool`
+
+Returns `true` if the sample passed the gate below and was folded into the fingerprint. The caller (`anchor_prox_score_and_train`) sets `PROX_FLAG_SAMPLE_ACCEPTED` in the score result's flags on `true`, so the querying watch learns per-query whether its sample taught the anchor (used by the calibration burst, §4.10.7).
+
 
 Called after every score computation. Accepts the sample into the fingerprint's weighted Welford accumulator if and only if the following gating conditions are all met:
 
@@ -743,6 +750,22 @@ This completely replaces the in-memory fingerprint and device registry with the 
 #### 4.10.6 BLE Connection Behaviour During Proximity Query
 
 The anchor must remain connectable at all times (per Section 4.3). When the watch connects for a proximity query, the anchor services the GATT operations in parallel with its background scan tasks — the connection does not pause or interrupt the scan loop. MTU negotiation to `BLE_REQUESTED_MTU` (512 bytes) is initiated by the watch immediately after connection; the anchor accepts whatever MTU the stack negotiates.
+
+#### 4.10.7 App-Guided Calibration Burst
+
+**Motivation.** The anchor's fingerprint is built exclusively by self-supervision (§4.10.4), which only advances when the *watch* submits a scan vector while genuinely near the anchor. In normal operation that happens rarely (enforcement polls, at most every few minutes), so a freshly-placed anchor can take days to build a useful fingerprint. Calibration accelerates this without changing the algorithm: it simply makes the watch submit vectors rapidly for a bounded window while the user walks around the anchor.
+
+**Why the watch, not the phone.** The fingerprint's entire coordinate space is the raw on-air `{mac[6], type}` of surrounding emitters (§4.10.1). Only devices that scan with a real radio — the anchor and the watch — observe those addresses. A phone **cannot** author fingerprint data: iOS never exposes peer BLE MAC addresses (CoreBluetooth returns an opaque per-app `NSUUID`, not the hardware address) and provides no API to enumerate WiFi BSSIDs; and BLE-privacy peripherals rotate Resolvable Private Addresses on both platforms. An app-scanned fingerprint would therefore key on identifiers no anchor or watch ever sees, contributing pure noise to Signal B. Calibration accordingly runs on the watch; the phone only orchestrates and displays progress. This is the honest implementation of the app's guided walk-around calibration screen (MOBILE_APP_SPEC §8.5), which today drives a phone-side progress animation that does not actually train any anchor.
+
+**Protocol.** The app, connected to both the watch and in range of the target anchor:
+1. Writes a **START** command to `WATCH_CALIB_CTRL_CHAR_UUID` (§5.6) carrying the target anchor's UUID and a burst duration in seconds (clamped to `[CALIB_MIN_DURATION_S, CALIB_MAX_DURATION_S]`; `0` ⇒ `CALIB_DEFAULT_DURATION_S`).
+2. The watch enters a burst session that owns its main loop for the duration: every ~`CALIB_QUERY_INTERVAL_MS` it runs an aligned active scan, builds its scan vector (§6.3.1), and submits it to the target anchor exactly as a normal proximity query does — driving §4.10.3 scoring and §4.10.4 training on the anchor. The watch does not sleep during the session and requires the phone link to remain up.
+3. After each query the watch reads back the anchor's score result and counts samples whose `PROX_FLAG_SAMPLE_ACCEPTED` bit is set (i.e. that actually taught the fingerprint). It emits a progress notification on `WATCH_CALIB_CTRL_CHAR_UUID` (format in §5.6).
+4. The session ends on duration expiry (`state = done`), an explicit **STOP** write, or phone disconnect (`state = aborted`) — the watch never bursts unattended.
+
+Because §4.10.4's gate still applies, accelerated samples are only accepted when the watch is genuinely near the anchor and the situation is unambiguous; walking to a boundary simply produces un-accepted queries rather than corrupting the fingerprint. Progress shown to the user should be driven by the accepted-sample count, not elapsed time.
+
+**Companion capability (not in this revision): fingerprint backup/restore.** Because a fingerprint is only ever authored in real-MAC space by an anchor, the app can also treat a fingerprint as an opaque blob it ferries — downloading it from an anchor and re-uploading it (§4.10.5) to restore after a factory reset or seed a replacement anchor in the same room. That is the sole legitimate meaning of "the app sends a fingerprint" (see §6.3.2); it requires an export path (not yet specified) and is deliberately out of scope here.
 
 ### 4.11 Phone Docking Detection
 
@@ -1568,6 +1591,30 @@ for each spent pass still inside the rolling window:
     [4 bytes: seconds until it regenerates (uint32, elapsed-time basis)]
 ```
 
+#### Characteristic: Calibration Control (Write With Response + Read + Notify) **(proximity.cpp, §4.10.7)**
+
+**UUID:** `WATCH_CALIB_CTRL_CHAR_UUID` (`4A0F001C-F8CE-11EE-8001-020304050607`)
+
+Drives an app-guided calibration burst (§4.10.7). All fields little-endian.
+
+**Write payload:**
+```
+START: [1 byte: 0x01][16 bytes: target anchor UUID][2 bytes: duration_s (uint16)]
+STOP:  [1 byte: 0x00]
+```
+`duration_s` is clamped to `[CALIB_MIN_DURATION_S, CALIB_MAX_DURATION_S]`; `0` selects `CALIB_DEFAULT_DURATION_S`. A START while a session is already running restarts it against the new target.
+
+**Notify / Read payload (progress):**
+```
+[1 byte:  state]        0 = idle, 1 = running, 2 = done (duration elapsed), 3 = aborted (STOP or phone disconnect)
+[2 bytes: accepted]     samples the anchor folded into its fingerprint this session (PROX_FLAG_SAMPLE_ACCEPTED count)
+[2 bytes: queries]      total queries attempted this session
+[1 byte:  last_score]   most recent proximity score (0..255)
+[1 byte:  last_flags]   PROX_FLAG_* from the most recent query
+[2 bytes: remaining_s]  seconds left in the session
+```
+The watch notifies on every burst query and on each state transition. The app should render progress from `accepted` (real learning), not elapsed time; a plausible completion target is a fixed accepted-sample count.
+
 ---
 
 ### 5.7 LED Status Indicator
@@ -1923,6 +1970,13 @@ PROX_COLLECT_AMBIGUITY_MARGIN_DBM  = 10        // (tunable) minimum dBm margin b
                                                // for the sample to be considered unambiguous
 PROX_NVS_PERSIST_INTERVAL_S        = 300       // seconds between NVS fingerprint persist operations; limits
                                                // flash wear while allowing recovery on unexpected reboot
+
+// Watch-side app-guided calibration burst (§4.10.7)
+CALIB_QUERY_INTERVAL_MS            = 600       // (tunable, watch) minimum gap between burst proximity queries;
+                                               // each query also runs a ~ENFORCEMENT_QUERY_SCAN_DURATION_MS scan
+CALIB_MIN_DURATION_S               = 15        // (watch) lower clamp on a requested burst duration
+CALIB_MAX_DURATION_S               = 180       // (watch) upper clamp; bounds the forced-awake power cost
+CALIB_DEFAULT_DURATION_S           = 75        // (watch) duration used when the app requests 0
 
 // Anchor-side continuous background scanning
 ANCHOR_PROX_BLE_SCAN_INTERVAL_MS   = 2000      // (tunable) ms between anchor BLE scan cycles
