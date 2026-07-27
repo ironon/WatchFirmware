@@ -1763,6 +1763,32 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
 //  Calibration burst (§8.5)
 // ============================================================
 
+// Resolve an anchor's BLE address (MAC + type) by UUID. Checks schedule-
+// referenced records first, then the passively-seen anchors. Calibration targets
+// are frequently NOT in the schedule yet (the user is still setting the anchor
+// up), so they live only in g_seen_anchors — without this fallback the calib
+// lookup below never found a MAC and never queried the anchor (§8.5 bug).
+static bool find_anchor_ble_addr(const uint8_t uuid[16], uint8_t out_mac[6],
+                                 uint8_t *out_type) {
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        if (g_anchor_records[i].valid && g_anchor_records[i].bleMacValid &&
+            uuid_eq(g_anchor_records[i].uuid, uuid)) {
+            memcpy(out_mac, g_anchor_records[i].bleMac, 6);
+            *out_type = g_anchor_records[i].bleAddrType;
+            return true;
+        }
+    }
+    for (int i = 0; i < MAX_SEEN_ANCHORS; i++) {
+        if (g_seen_anchors[i].valid && g_seen_anchors[i].bleMacValid &&
+            uuid_eq(g_seen_anchors[i].uuid, uuid)) {
+            memcpy(out_mac, g_seen_anchors[i].bleMac, 6);
+            *out_type = g_seen_anchors[i].bleAddrType;
+            return true;
+        }
+    }
+    return false;
+}
+
 // One accelerated self-supervision cycle against the target anchor: refresh the
 // RF cache, build the real-MAC vector, submit it. The anchor scores + folds the
 // sample into its fingerprint (§4.10.4) and echoes PROX_FLAG_SAMPLE_ACCEPTED
@@ -1772,23 +1798,40 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
 static bool calib_burst_once(const uint8_t uuid[16], ProxScoreResult *out) {
     prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
 
-    AnchorRecord *rec = nullptr;
-    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
-        if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, uuid)) {
-            rec = &g_anchor_records[i];
-            break;
-        }
+    uint8_t mac[6];
+    uint8_t addr_type;
+    if (!find_anchor_ble_addr(uuid, mac, &addr_type)) {
+        // Not in a schedule record AND not yet captured in a scan → no BLE MAC to
+        // dial. This was the calibration bug: the old code only checked
+        // g_anchor_records, so an unscheduled target here never got queried.
+        Serial.println("[CALIB] target has no BLE MAC yet (not seen in a scan) — retry");
+        return false;
     }
-    if (!rec || !rec->bleMacValid) return false;  // out of range for now — keep trying
+    Serial.printf("[CALIB] querying anchor %02X:%02X:%02X:%02X:%02X:%02X (type=%d)\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], addr_type);
 
+    // Include WiFi APs in the vector (same as enforcement) for a consistent
+    // fingerprint. Safe here: calibration only queries while the phone is
+    // disconnected (Option A), so a blocking WiFi scan can't drop a phone link.
     prox_feed_wifi_aps();
     ProxScanVector vec;
     prox_build_scan_vector(&vec);
+    Serial.printf("[CALIB] vector built (%d devices)\n", vec.count);
 
     ProxScoreResult result;
-    if (!prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result, nullptr)) return false;
-    rec->lastProxScore = result.score;
+    if (!prox_query_anchor(mac, addr_type, vec, result, nullptr)) {
+        Serial.println("[CALIB] prox_query_anchor failed — see [PROX] lines above");
+        return false;
+    }
+    // Best-effort: stamp lastProxScore on the record if this anchor has one.
+    for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+        if (g_anchor_records[i].valid && uuid_eq(g_anchor_records[i].uuid, uuid)) {
+            g_anchor_records[i].lastProxScore = result.score;
+            break;
+        }
+    }
     *out = result;
+    Serial.printf("[CALIB] query OK: score=%u flags=0x%02X\n", result.score, result.flags);
     return true;
 }
 
@@ -1826,7 +1869,8 @@ static void calib_start(const uint8_t uuid[16], uint16_t duration_s) {
     g_calib_queries     = 0;
     g_calib_last_score  = 0;
     g_calib_last_flags  = 0;
-    Serial.printf("[CALIB] Start: %us burst\n", (unsigned)duration_s);
+    Serial.printf("[CALIB] Start: %us burst (queries run while the phone is disconnected)\n",
+                  (unsigned)duration_s);
     notify_calib_progress(1);
 }
 
@@ -1839,12 +1883,26 @@ static void calib_finish(uint8_t state) {
 
 // Runs one burst step when a session is active. Called from loop() on the
 // calibration branch, which owns the loop for the session's duration so the
-// phone link stays up and the watch never sleeps mid-burst.
+// watch never sleeps mid-burst.
+//
+// Option A (§8.5, deferred-upgrade note in §10.1): this NimBLE/IDF-4.4.7 build
+// crashes (assert ble_hs_timer_exp) if the watch does a central connect to the
+// anchor WHILE holding the phone (peripheral) link. So the watch only queries
+// the anchor while the phone is DISCONNECTED. The app writes START, disconnects,
+// and the watch bursts autonomously; the app reconnects afterward to read the
+// result. A phone reconnect mid-burst simply pauses querying (no crash), so the
+// app may reconnect any time to poll progress. The session ends on duration
+// expiry or an explicit STOP — NOT on phone disconnect (that's the normal case).
 static void calib_tick(uint32_t now_ms) {
-    // The app owns this session; if the phone drops, abort rather than burst
-    // unattended — bounds power and matches the app-initiated contract.
-    if (!g_bt_connected)                              { calib_finish(3); return; }
     if ((int32_t)(now_ms - g_calib_deadline_ms) >= 0) { calib_finish(2); return; }
+
+    // Phone connected → don't touch the anchor (would be the crashing
+    // peripheral+central case). Keep the app's progress view fresh and wait.
+    if (g_bt_connected) {
+        notify_calib_progress(1);
+        return;
+    }
+
     if (g_calib_next_ms != 0 && now_ms < g_calib_next_ms) return;
 
     ProxScoreResult result;
@@ -1856,6 +1914,7 @@ static void calib_tick(uint32_t now_ms) {
         if (result.flags & PROX_FLAG_SAMPLE_ACCEPTED) g_calib_accepted++;
     }
     g_calib_next_ms = millis() + CALIB_QUERY_INTERVAL_MS;
+    // setValue updates the readable char; delivered to the app on reconnect/read.
     notify_calib_progress(1);
 }
 
@@ -4456,9 +4515,9 @@ void loop() {
     // ---- Calibration burst (§8.5) ----
     // App-driven accelerated self-supervision against one anchor. While active it
     // owns the loop: bursts real-MAC vectors at the target anchor, then returns
-    // before the normal state machine / sleep gates so the phone link stays up
-    // and the watch does not sleep mid-burst. calib_tick() self-terminates on
-    // duration expiry, STOP, or phone disconnect.
+    // before the normal state machine / sleep gates so the watch does not sleep
+    // mid-burst (even while the phone is disconnected, which is the normal case
+    // for Option A — see calib_tick). Self-terminates on duration expiry or STOP.
     if (g_calib_active) {
         led_update(led_status_input());
         calib_tick(now_ms);

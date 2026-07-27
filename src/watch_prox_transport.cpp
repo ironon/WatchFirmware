@@ -119,7 +119,7 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
     // Serial.printf("[PROX] Requested MTU=%d\n", BLE_REQUESTED_MTU);
 
     client->setConnectionParams(12, 12, 0, 400); // fast connection
-    // Serial.printf("[PROX] Connecting to %s ...\n", addr.toString().c_str());
+    Serial.printf("[PROX] Connecting to %s ...\n", addr.toString().c_str());
     unsigned long t_connect = millis();
     if (!client->connect(addr)) {
         Serial.printf("[PROX] FAIL: connect() returned false after %lu ms (last rc=%d)\n",
@@ -127,13 +127,13 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
         NimBLEDevice::deleteClient(client);
         return false;
     }
-    // Serial.printf("[PROX] Connected in %lu ms. Connected=%d RSSI=%d\n",
-                //   millis() - t_connect, client->isConnected(), client->getRssi());
+    Serial.printf("[PROX] Connected in %lu ms (RSSI=%d), discovering service...\n",
+                  millis() - t_connect, client->getRssi());
 
     // Serial.printf("[PROX] Discovering service %s ...\n", ANCHOR_SERVICE_UUID);
     NimBLERemoteService *svc = client->getService(ANCHOR_SERVICE_UUID);
     if (!svc) {
-        // Serial.println("[PROX] FAIL: anchor service not found on peer");
+        Serial.println("[PROX] FAIL: anchor service not found on peer");
         client->disconnect();
         NimBLEDevice::deleteClient(client);
         return false;
@@ -186,8 +186,8 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
 
     // Write vector (with response)
     if (!vecChar->writeValue(buf, sz, true)) {
-        // Serial.printf("[PROX] FAIL: writeValue() returned false (rc=%d)\n",
-                    //   client->getLastError());
+        Serial.printf("[PROX] FAIL: writeValue() returned false (rc=%d)\n",
+                      client->getLastError());
         client->disconnect();
         NimBLEDevice::deleteClient(client);
         return false;
