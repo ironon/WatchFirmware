@@ -13,6 +13,7 @@
 #define ANCHOR_PROX_VECTOR_CHAR_UUID  "4A0F0008-F8CE-11EE-8001-020304050607"
 #define ANCHOR_PROX_SCORE_CHAR_UUID   "4A0F0009-F8CE-11EE-8001-020304050607"
 #define ANCHOR_DOCK_STATUS_CHAR_UUID  "4A0F000D-F8CE-11EE-8001-020304050607"  // phone docking (§4.11)
+#define ANCHOR_CALIB_MODE_CHAR_UUID   "4A0F000F-F8CE-11EE-8001-020304050607"  // calibration-v2 phase
 
 // WiFi APs are stationary, so we reuse cached scan results between queries and
 // only rescan when the cache is stale (a blocking, power-hungry scan). Re-homed
@@ -81,8 +82,11 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
                        uint8_t addr_type,
                        const ProxScanVector &vec,
                        ProxScoreResult &result,
-                       int8_t *out_dock) {
+                       int8_t *out_dock,
+                       uint8_t calib_phase,
+                       uint8_t *out_near_threshold) {
     if (out_dock) *out_dock = -1;  // unknown until read (fail-open on the dock signal)
+    if (out_near_threshold) *out_near_threshold = 0;
     // Convert big-endian MAC to NimBLE little-endian format
     // print everything about this query
     // Serial.printf("[PROX] Querying anchor %02X:%02X:%02X:%02X:%02X:%02X (addr_type=%d) with %d devices\n",
@@ -155,6 +159,25 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
         return false;
     }
 
+    // Calibration-v2: set the anchor's phase on this connection before submitting
+    // the vector so it routes training correctly (INSIDE trains, EDGE collects).
+    // The anchor remembers the phase across reconnects; enforcement (0xFF) skips
+    // this. Best-effort: a pre-v2 anchor lacks …000F — degrade to unphased.
+    if (calib_phase != 0xFF) {
+        NimBLERemoteCharacteristic *calibChar =
+            svc->getCharacteristic(ANCHOR_CALIB_MODE_CHAR_UUID);
+        if (calibChar) {
+            uint8_t p = calib_phase;
+            if (!calibChar->writeValue(&p, 1, true))
+                Serial.printf("[CALIB] WARN: …000F phase write failed (rc=%d)\n",
+                              client->getLastError());
+            else
+                Serial.printf("[CALIB] anchor phase set to %u\n", (unsigned)calib_phase);
+        } else {
+            Serial.println("[CALIB] WARN: anchor has no …000F (pre-v2) — unphased");
+        }
+    }
+
     // Serialise the vector; truncate to fit negotiated MTU if necessary
     uint16_t mtu = client->getMTU();
     // Serial.printf("[PROX] Negotiated MTU=%d\n", mtu);
@@ -207,7 +230,12 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
 
     result.score = (uint8_t)score_val[0];
     result.flags = (uint8_t)score_val[1];
-    Serial.printf("[PROX] SUCCESS: score=%d flags=0x%02X\n", result.score, result.flags);
+    // 3rd byte (calibration-v2): the anchor's per-anchor calibrated near-threshold
+    // (0 = uncalibrated). Absent on a pre-v2 anchor (2-byte score) → leave 0.
+    if (out_near_threshold && score_val.size() >= 3)
+        *out_near_threshold = (uint8_t)score_val[2];
+    Serial.printf("[PROX] SUCCESS: score=%d flags=0x%02X thr=%u\n", result.score, result.flags,
+                  (out_near_threshold ? (unsigned)*out_near_threshold : 0u));
 
     // Phone docking (§4.11): for phoneAway the caller wants to know whether the
     // phone is still docked at this anchor. Read the Dock Status characteristic
@@ -230,8 +258,73 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
     return true;
 }
 
-ProxProximity prox_interpret_score(uint8_t score) {
+ProxProximity prox_interpret_score(uint8_t score, uint8_t near_threshold) {
+    if (near_threshold != 0) {
+        // Calibration-v2: per-anchor cutoff with a hysteresis band just below it.
+        if (score >= near_threshold) return PROX_NEAR;
+        uint8_t lo = (near_threshold > PROX_NEAR_HYST_U8)
+                       ? (uint8_t)(near_threshold - PROX_NEAR_HYST_U8) : 0;
+        if (score >= lo) return PROX_AMBIGUOUS;
+        return PROX_AWAY;
+    }
     if (score >= PROX_CONFIDENCE_THRESHOLD_U8) return PROX_NEAR;
     if (score <= (255 - PROX_CONFIDENCE_THRESHOLD_U8)) return PROX_AWAY;
     return PROX_AMBIGUOUS;
+}
+
+bool prox_finalize_anchor(const uint8_t bleMac_be[6],
+                          uint8_t addr_type,
+                          uint8_t *out_thr,
+                          uint16_t *out_inside_n,
+                          uint16_t *out_edge_n,
+                          uint8_t *out_confidence) {
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    if (scan && scan->isScanning()) scan->stop();
+
+    NimBLEAddress addr(bleMac_be, addr_type);
+    NimBLEClient *client = NimBLEDevice::createClient();
+    if (!client) { Serial.println("[CALIB] FINALIZE: createClient null"); return false; }
+    NimBLEDevice::setMTU(BLE_REQUESTED_MTU);
+    client->setConnectionParams(12, 12, 0, 400);
+    Serial.printf("[CALIB] FINALIZE connecting to %s ...\n", addr.toString().c_str());
+    if (!client->connect(addr)) {
+        Serial.printf("[CALIB] FINALIZE: connect failed (rc=%d)\n", client->getLastError());
+        NimBLEDevice::deleteClient(client);
+        return false;
+    }
+    NimBLERemoteService *svc = client->getService(ANCHOR_SERVICE_UUID);
+    NimBLERemoteCharacteristic *calibChar =
+        svc ? svc->getCharacteristic(ANCHOR_CALIB_MODE_CHAR_UUID) : nullptr;
+    if (!calibChar) {
+        Serial.println("[CALIB] FINALIZE: anchor has no …000F char");
+        client->disconnect();
+        NimBLEDevice::deleteClient(client);
+        return false;
+    }
+    // Write FINALIZE (3). The anchor computes + persists the threshold and stashes
+    // the result frame as the char value; read it back on the same connection.
+    uint8_t fin = 3; // CALIB_PHASE_FINALIZE
+    bool ok = false;
+    if (calibChar->writeValue(&fin, 1, true)) {
+        std::string frame = calibChar->readValue();
+        if (frame.size() >= 7 && (uint8_t)frame[0] == 0x01) {
+            if (out_thr)       *out_thr = (uint8_t)frame[1];
+            if (out_inside_n)  *out_inside_n = (uint8_t)frame[2] | ((uint16_t)(uint8_t)frame[3] << 8);
+            if (out_edge_n)    *out_edge_n = (uint8_t)frame[4] | ((uint16_t)(uint8_t)frame[5] << 8);
+            if (out_confidence)*out_confidence = (uint8_t)frame[6];
+            ok = true;
+            Serial.printf("[CALIB] FINALIZE frame: thr=%u inside=%u edge=%u conf=%u\n",
+                          (unsigned)(uint8_t)frame[1],
+                          (unsigned)((uint8_t)frame[2] | ((uint16_t)(uint8_t)frame[3] << 8)),
+                          (unsigned)((uint8_t)frame[4] | ((uint16_t)(uint8_t)frame[5] << 8)),
+                          (unsigned)(uint8_t)frame[6]);
+        } else {
+            Serial.printf("[CALIB] FINALIZE: bad frame (%u bytes)\n", (unsigned)frame.size());
+        }
+    } else {
+        Serial.printf("[CALIB] FINALIZE: write failed (rc=%d)\n", client->getLastError());
+    }
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return ok;
 }

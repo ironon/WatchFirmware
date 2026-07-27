@@ -47,11 +47,31 @@ void prox_feed_wifi_aps();
 // out_dock (optional, phoneAway/Mode B): if non-null, also reads the anchor's
 // Dock Status characteristic and sets *out_dock to 1 (docked), 0 (undocked), or
 // -1 (unknown — char absent or read failed; caller treats unknown as docked).
+// calib_phase: 0xFF (default) leaves the anchor's Calibration Mode untouched
+// (enforcement path). 0/1/2 (NONE/INSIDE/EDGE) is written to the anchor's …000F
+// char (write-with-response) on the same connection, before the vector, so the
+// anchor routes training by phase (calibration-v2). out_near_threshold
+// (optional): receives the anchor's calibrated per-anchor cutoff from the 3rd
+// byte of the score char (0 = uncalibrated).
 bool prox_query_anchor(const uint8_t bleMac_be[6],
                        uint8_t addr_type,
                        const ProxScanVector &vec,
                        ProxScoreResult &result,
-                       int8_t *out_dock = nullptr);
+                       int8_t *out_dock = nullptr,
+                       uint8_t calib_phase = 0xFF,
+                       uint8_t *out_near_threshold = nullptr);
 
-// Interpret a raw score as NEAR / AWAY / AMBIGUOUS using the threshold rule.
-ProxProximity prox_interpret_score(uint8_t score);
+// Calibration-v2 FINALIZE: connect to the anchor, write …000F = FINALIZE (3),
+// read back the result frame (0x01 [thr][inside_n u16][edge_n u16][conf]) and
+// disconnect. Returns true on success with the parsed fields.
+bool prox_finalize_anchor(const uint8_t bleMac_be[6],
+                          uint8_t addr_type,
+                          uint8_t *out_thr,
+                          uint16_t *out_inside_n,
+                          uint16_t *out_edge_n,
+                          uint8_t *out_confidence);
+
+// Interpret a raw score as NEAR / AWAY / AMBIGUOUS. When near_threshold is
+// non-zero, the per-anchor calibrated cutoff is used (NEAR ≥ thr; AMBIGUOUS in
+// [thr - PROX_NEAR_HYST_U8, thr); else AWAY). Otherwise the global rule applies.
+ProxProximity prox_interpret_score(uint8_t score, uint8_t near_threshold = 0);

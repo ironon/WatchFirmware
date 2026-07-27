@@ -465,15 +465,30 @@ static NimBLECharacteristic *g_seen_anchors_char = nullptr;
 static NimBLECharacteristic *g_status_char       = nullptr;
 static NimBLECharacteristic *g_calib_char        = nullptr;  // §8.5 calibration burst ctrl + progress
 
-// Calibration burst session state (§8.5).
+// Calibration-v2 phase (mirrors the anchor/engine enum; the watch only ever
+// bursts NONE/INSIDE/EDGE — FINALIZE/ABORT are one-shot control ops).
+#define CALIB_PHASE_NONE     0
+#define CALIB_PHASE_INSIDE   1
+#define CALIB_PHASE_EDGE     2
+#define CALIB_FINALIZE_TIMEOUT_MS  30000  // safety cap on the FINALIZE reconnect wait
+
+// Calibration burst session state (§8.5 + calibration-v2 phases).
 static bool     g_calib_active      = false;
 static uint8_t  g_calib_uuid[16];       // target anchor UUID
+static uint8_t  g_calib_phase       = CALIB_PHASE_INSIDE; // current burst phase
+static bool     g_calib_finalize_pending = false;         // FINALIZE requested, awaiting disconnect
 static uint32_t g_calib_deadline_ms = 0;
 static uint32_t g_calib_next_ms     = 0; // earliest millis() for the next burst query
 static uint16_t g_calib_accepted    = 0; // samples the anchor folded into its fingerprint
 static uint16_t g_calib_queries     = 0; // total queries attempted this session
 static uint8_t  g_calib_last_score  = 0;
 static uint8_t  g_calib_last_flags  = 0;
+// FINALIZE result (calibration-v2), surfaced to the app in the progress frame.
+static bool     g_calib_have_result = false;
+static uint8_t  g_calib_fin_thr     = 0;
+static uint16_t g_calib_fin_inside  = 0;
+static uint16_t g_calib_fin_edge    = 0;
+static uint8_t  g_calib_fin_conf    = 0;
 
 // Schedule BLE transfer
 static uint8_t  *g_sched_xfer_buf  = nullptr;
@@ -1738,7 +1753,8 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     Serial.printf("[PROX] Scan vector has %d dimensions\n", vec.count);
 
     ProxScoreResult result;
-    if (!prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result, out_dock)) {
+    uint8_t near_thr = 0;
+    if (!prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result, out_dock, 0xFF, &near_thr)) {
         // Connection establishment fails at much weaker RSSI (~-88 dBm) than
         // advertisement reception, so a failed connect + a weak recent ad RSSI
         // is strong evidence the watch is FAR from the anchor.
@@ -1755,8 +1771,11 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     }
 
     rec->lastProxScore = result.score;
-    Serial.printf("[PROX] Score=%d flags=0x%02X\n", result.score, result.flags);
-    return prox_interpret_score(result.score);
+    Serial.printf("[PROX] Score=%d flags=0x%02X near_thr=%u\n",
+                  result.score, result.flags, (unsigned)near_thr);
+    // Per-anchor calibrated cutoff when the anchor reports one (decision 4);
+    // uncalibrated anchors fall back to the global rule inside prox_interpret_score.
+    return prox_interpret_score(result.score, near_thr);
 }
 
 // ============================================================
@@ -1795,7 +1814,7 @@ static bool find_anchor_ble_addr(const uint8_t uuid[16], uint8_t out_mac[6],
 // when it passed the training gate. Mirrors query_anchor_proximity()'s core but
 // returns the raw result and is keyed by anchor UUID rather than an Event.
 // Returns false (skip, retry next cycle) if the anchor is not yet in range.
-static bool calib_burst_once(const uint8_t uuid[16], ProxScoreResult *out) {
+static bool calib_burst_once(const uint8_t uuid[16], uint8_t phase, ProxScoreResult *out) {
     prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
 
     uint8_t mac[6];
@@ -1819,7 +1838,10 @@ static bool calib_burst_once(const uint8_t uuid[16], ProxScoreResult *out) {
     Serial.printf("[CALIB] vector built (%d devices)\n", vec.count);
 
     ProxScoreResult result;
-    if (!prox_query_anchor(mac, addr_type, vec, result, nullptr)) {
+    // Set the anchor's phase on this connection so it routes training (INSIDE
+    // trains + collects; EDGE collects only). The anchor remembers it across the
+    // per-query reconnects (Option A).
+    if (!prox_query_anchor(mac, addr_type, vec, result, nullptr, phase, nullptr)) {
         Serial.println("[CALIB] prox_query_anchor failed — see [PROX] lines above");
         return false;
     }
@@ -1835,33 +1857,46 @@ static bool calib_burst_once(const uint8_t uuid[16], ProxScoreResult *out) {
     return true;
 }
 
-// Emit a progress frame to the app (spec §8.5). Layout (little-endian):
+// Emit a progress frame to the app (spec §8.5, extended for calibration-v2).
+// Layout (little-endian, 16 bytes):
 //   [1 state][2 accepted][2 queries][1 last_score][1 last_flags][2 remaining_s]
-// state: 0 idle, 1 running, 2 done (duration elapsed), 3 aborted (STOP / phone gone).
+//   [1 fin_near_threshold][2 fin_inside_n][2 fin_edge_n][1 fin_confidence][1 have_result]
+// state: 0 idle, 1 running, 2 done (duration elapsed), 3 aborted (STOP/phone gone),
+//        4 finalized (per-anchor threshold computed — result block valid).
 static void notify_calib_progress(uint8_t state) {
     if (!g_calib_char) return;
     uint32_t now = millis();
     uint16_t remaining_s = (g_calib_active && (int32_t)(g_calib_deadline_ms - now) > 0)
                            ? (uint16_t)((g_calib_deadline_ms - now + 999) / 1000) : 0;
-    uint8_t buf[9];
-    buf[0] = state;
-    buf[1] = (uint8_t)(g_calib_accepted & 0xFF);
-    buf[2] = (uint8_t)(g_calib_accepted >> 8);
-    buf[3] = (uint8_t)(g_calib_queries & 0xFF);
-    buf[4] = (uint8_t)(g_calib_queries >> 8);
-    buf[5] = g_calib_last_score;
-    buf[6] = g_calib_last_flags;
-    buf[7] = (uint8_t)(remaining_s & 0xFF);
-    buf[8] = (uint8_t)(remaining_s >> 8);
+    uint8_t buf[16];
+    buf[0]  = state;
+    buf[1]  = (uint8_t)(g_calib_accepted & 0xFF);
+    buf[2]  = (uint8_t)(g_calib_accepted >> 8);
+    buf[3]  = (uint8_t)(g_calib_queries & 0xFF);
+    buf[4]  = (uint8_t)(g_calib_queries >> 8);
+    buf[5]  = g_calib_last_score;
+    buf[6]  = g_calib_last_flags;
+    buf[7]  = (uint8_t)(remaining_s & 0xFF);
+    buf[8]  = (uint8_t)(remaining_s >> 8);
+    buf[9]  = g_calib_fin_thr;
+    buf[10] = (uint8_t)(g_calib_fin_inside & 0xFF);
+    buf[11] = (uint8_t)(g_calib_fin_inside >> 8);
+    buf[12] = (uint8_t)(g_calib_fin_edge & 0xFF);
+    buf[13] = (uint8_t)(g_calib_fin_edge >> 8);
+    buf[14] = g_calib_fin_conf;
+    buf[15] = g_calib_have_result ? 1 : 0;
     g_calib_char->setValue(buf, sizeof(buf));
     if (g_bt_connected) g_calib_char->notify();
 }
 
-static void calib_start(const uint8_t uuid[16], uint16_t duration_s) {
+static void calib_start(const uint8_t uuid[16], uint16_t duration_s, uint8_t phase) {
     if (duration_s == 0)                    duration_s = CALIB_DEFAULT_DURATION_S;
     if (duration_s < CALIB_MIN_DURATION_S)  duration_s = CALIB_MIN_DURATION_S;
     if (duration_s > CALIB_MAX_DURATION_S)  duration_s = CALIB_MAX_DURATION_S;
+    if (phase != CALIB_PHASE_INSIDE && phase != CALIB_PHASE_EDGE) phase = CALIB_PHASE_INSIDE;
     memcpy(g_calib_uuid, uuid, 16);
+    g_calib_phase            = phase;
+    g_calib_finalize_pending = false;
     g_calib_active      = true;
     g_calib_deadline_ms = millis() + (uint32_t)duration_s * 1000UL;
     g_calib_next_ms     = 0;   // fire the first query immediately
@@ -1869,9 +1904,46 @@ static void calib_start(const uint8_t uuid[16], uint16_t duration_s) {
     g_calib_queries     = 0;
     g_calib_last_score  = 0;
     g_calib_last_flags  = 0;
-    Serial.printf("[CALIB] Start: %us burst (queries run while the phone is disconnected)\n",
-                  (unsigned)duration_s);
+    Serial.printf("[CALIB] Start: %us %s burst (queries run while the phone is disconnected)\n",
+                  (unsigned)duration_s, phase == CALIB_PHASE_INSIDE ? "INSIDE" : "EDGE");
     notify_calib_progress(1);
+}
+
+// Calibration-v2 FINALIZE: request the anchor to compute + persist its threshold.
+// Like a burst query it needs the phone disconnected (Option A), so it's deferred
+// to calib_tick; here we just arm it.
+static void calib_begin_finalize(const uint8_t uuid[16]) {
+    memcpy(g_calib_uuid, uuid, 16);
+    g_calib_phase            = CALIB_PHASE_NONE;
+    g_calib_finalize_pending = true;
+    g_calib_have_result      = false;
+    g_calib_active      = true;
+    g_calib_deadline_ms = millis() + CALIB_FINALIZE_TIMEOUT_MS;
+    g_calib_next_ms     = 0;
+    Serial.println("[CALIB] FINALIZE armed — awaiting phone disconnect to query anchor");
+    notify_calib_progress(1);
+}
+
+// Calibration-v2 ABORT: tell the anchor to discard in-progress stats and end the
+// session. Deferred to calib_tick (needs the phone disconnected).
+static void calib_begin_abort(const uint8_t uuid[16]) {
+    memcpy(g_calib_uuid, uuid, 16);
+    g_calib_phase            = CALIB_PHASE_NONE;
+    g_calib_finalize_pending = false;
+    g_calib_active      = false;   // no further bursts
+    // Best-effort: if the phone is already disconnected, push ABORT to the anchor.
+    if (!g_bt_connected) {
+        uint8_t mac[6], addr_type;
+        prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+        if (find_anchor_ble_addr(uuid, mac, &addr_type)) {
+            ProxScanVector vec; prox_build_scan_vector(&vec);
+            ProxScoreResult r;
+            // phase 4 = ABORT (written via the calib-mode char path).
+            prox_query_anchor(mac, addr_type, vec, r, nullptr, 4, nullptr);
+        }
+    }
+    Serial.println("[CALIB] ABORT");
+    notify_calib_progress(3);
 }
 
 static void calib_finish(uint8_t state) {
@@ -1894,8 +1966,6 @@ static void calib_finish(uint8_t state) {
 // app may reconnect any time to poll progress. The session ends on duration
 // expiry or an explicit STOP — NOT on phone disconnect (that's the normal case).
 static void calib_tick(uint32_t now_ms) {
-    if ((int32_t)(now_ms - g_calib_deadline_ms) >= 0) { calib_finish(2); return; }
-
     // Phone connected → don't touch the anchor (would be the crashing
     // peripheral+central case). Keep the app's progress view fresh and wait.
     if (g_bt_connected) {
@@ -1903,10 +1973,48 @@ static void calib_tick(uint32_t now_ms) {
         return;
     }
 
+    // Calibration-v2 FINALIZE: while the phone is disconnected, connect to the
+    // anchor, request the threshold computation, read the result frame.
+    if (g_calib_finalize_pending) {
+        if ((int32_t)(now_ms - g_calib_deadline_ms) >= 0) {  // safety cap: give up
+            Serial.println("[CALIB] FINALIZE timed out (anchor unreachable)");
+            g_calib_finalize_pending = false;
+            calib_finish(2);
+            return;
+        }
+        if (g_calib_next_ms != 0 && now_ms < g_calib_next_ms) return;
+
+        prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+        uint8_t mac[6], addr_type;
+        if (find_anchor_ble_addr(g_calib_uuid, mac, &addr_type)) {
+            uint8_t thr = 0, conf = 0; uint16_t in_n = 0, ed_n = 0;
+            if (prox_finalize_anchor(mac, addr_type, &thr, &in_n, &ed_n, &conf)) {
+                g_calib_fin_thr    = thr;
+                g_calib_fin_inside = in_n;
+                g_calib_fin_edge   = ed_n;
+                g_calib_fin_conf   = conf;
+                g_calib_have_result      = true;
+                g_calib_finalize_pending = false;
+                g_calib_active           = false;
+                Serial.printf("[CALIB] FINALIZE done: thr=%u inside=%u edge=%u conf=%u\n",
+                              (unsigned)thr, (unsigned)in_n, (unsigned)ed_n, (unsigned)conf);
+                notify_calib_progress(4);   // finalized — result block valid
+                return;
+            }
+        } else {
+            Serial.println("[CALIB] FINALIZE: target has no BLE MAC yet — retry");
+        }
+        g_calib_next_ms = millis() + CALIB_QUERY_INTERVAL_MS;
+        notify_calib_progress(1);
+        return;
+    }
+
+    // Normal phased burst.
+    if ((int32_t)(now_ms - g_calib_deadline_ms) >= 0) { calib_finish(2); return; }
     if (g_calib_next_ms != 0 && now_ms < g_calib_next_ms) return;
 
     ProxScoreResult result;
-    bool ok = calib_burst_once(g_calib_uuid, &result);
+    bool ok = calib_burst_once(g_calib_uuid, g_calib_phase, &result);
     g_calib_queries++;
     if (ok) {
         g_calib_last_score = result.score;
@@ -4035,11 +4143,16 @@ class WatchLedConfigCallback : public NimBLECharacteristicCallbacks {
     }
 };
 
-// §8.5 calibration burst control. Write format (little-endian):
-//   START: [0x01][16 anchor UUID][2 duration_s]   duration 0 → default, clamped.
-//   STOP:  [0x00]
+// §8.5 calibration burst control (extended for calibration-v2 phases). Write
+// format (little-endian):
+//   START:    [0x01][16 anchor UUID][2 duration_s][1 phase]  phase 1 INSIDE / 2 EDGE
+//             (duration 0 → default, clamped; phase omitted → INSIDE).
+//   STOP:     [0x00]
+//   FINALIZE: [0x02][16 anchor UUID]   compute + persist the per-anchor threshold
+//   ABORT:    [0x03][16 anchor UUID]   discard in-progress calibration stats
 // Progress is reported back via notify on the same characteristic (see
-// notify_calib_progress). The actual burst runs on loop()'s calibration branch.
+// notify_calib_progress). The actual burst / finalize runs on loop()'s
+// calibration branch while the phone is disconnected (Option A).
 class WatchCalibCallback : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
         std::string v = pChar->getValue();
@@ -4047,13 +4160,20 @@ class WatchCalibCallback : public NimBLECharacteristicCallbacks {
         uint8_t cmd = (uint8_t)v[0];
         if (cmd == 0x00) {                 // STOP
             if (g_calib_active) calib_finish(3);
-            return;
-        }
-        if (cmd == 0x01 && v.size() >= 1 + 16 + 2) {   // START
+        } else if (cmd == 0x01 && v.size() >= 1 + 16 + 2) {   // START [uuid][dur][phase?]
             uint8_t uuid[16];
             memcpy(uuid, v.data() + 1, 16);
-            uint16_t dur = (uint8_t)v[17] | ((uint16_t)(uint8_t)v[18] << 8);
-            calib_start(uuid, dur);
+            uint16_t dur   = (uint8_t)v[17] | ((uint16_t)(uint8_t)v[18] << 8);
+            uint8_t  phase = (v.size() >= 20) ? (uint8_t)v[19] : CALIB_PHASE_INSIDE;
+            calib_start(uuid, dur, phase);
+        } else if (cmd == 0x02 && v.size() >= 1 + 16) {       // FINALIZE [uuid]
+            uint8_t uuid[16];
+            memcpy(uuid, v.data() + 1, 16);
+            calib_begin_finalize(uuid);
+        } else if (cmd == 0x03 && v.size() >= 1 + 16) {       // ABORT [uuid]
+            uint8_t uuid[16];
+            memcpy(uuid, v.data() + 1, 16);
+            calib_begin_abort(uuid);
         }
         g_last_activity_ms = millis();
     }
