@@ -1,4 +1,5 @@
 #include "imu.h"
+#include "proximity.h"
 
 #include <math.h>
 
@@ -169,4 +170,65 @@ Accel read_accel() {
 // Must be called after each interrupt fires or INT1 stays HIGH.
 void lis3dh_clear_int1() {
     read_reg(REG_INT1_SRC);
+}
+
+// ---------------------------------------------------------------
+// Proximity engine v2.1 motion burst (§5.4.5)
+// ---------------------------------------------------------------
+//
+// The engine needs to know whether the wrist could have moved, because a
+// stationary receiver gets no new information from any amount of extra
+// averaging. That question is answered from the existing IA1 interrupt plus one
+// short burst of raw samples per query — read here, classified in proximity.cpp.
+//
+// Samples are milli-g. The data registers are unfiltered (FDS = 0 in CTRL_REG2,
+// so only the interrupt generator sees the high-pass filter); the engine removes
+// gravity itself using the burst's own per-axis mean, which is the honest way to
+// do it in an arbitrary wrist orientation.
+
+#define IMU_BURST_PERIOD_MS  (1000 / IMU_BURST_HZ)
+
+static int16_t  s_burst[IMU_BURST_SAMPLES][3];
+static uint16_t s_burst_n    = 0;
+static uint32_t s_burst_next = 0;
+
+// Right-justify the 12-bit high-resolution sample. At +/-2 g that is 1 mg/LSB,
+// so the raw count and the milli-g value are the same number.
+static void read_accel_mg(int16_t out[3]) {
+    uint8_t buf[6];
+    read_burst(REG_OUT_X_L, buf, 6);
+    out[0] = (int16_t)(((int16_t)((buf[1] << 8) | buf[0])) >> 4);
+    out[1] = (int16_t)(((int16_t)((buf[3] << 8) | buf[2])) >> 4);
+    out[2] = (int16_t)(((int16_t)((buf[5] << 8) | buf[4])) >> 4);
+}
+
+void imu_burst_begin() {
+    s_burst_n    = 0;
+    s_burst_next = millis();
+}
+
+void imu_burst_service() {
+    if (s_burst_n >= IMU_BURST_SAMPLES) return;
+    uint32_t now = millis();
+    if ((int32_t)(now - s_burst_next) < 0) return;
+    read_accel_mg(s_burst[s_burst_n++]);
+    s_burst_next += IMU_BURST_PERIOD_MS;
+    // If the caller's loop stalled (a blocking radio call), resync rather than
+    // firing a catch-up burst of back-to-back reads that would look like noise.
+    if ((int32_t)(now - s_burst_next) > IMU_BURST_PERIOD_MS) s_burst_next = now + IMU_BURST_PERIOD_MS;
+}
+
+void imu_burst_submit() {
+    if (s_burst_n == 0) return;
+    prox_ingest_imu_burst(s_burst, s_burst_n, IMU_BURST_HZ);
+    s_burst_n = 0;
+}
+
+void imu_burst_blocking() {
+    imu_burst_begin();
+    while (s_burst_n < IMU_BURST_SAMPLES) {
+        imu_burst_service();
+        delay(2);
+    }
+    imu_burst_submit();
 }

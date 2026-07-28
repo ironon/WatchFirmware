@@ -34,6 +34,24 @@ void IRAM_ATTR lis3dh_isr();
 // Read the latest X/Y/Z acceleration values (in g).
 Accel read_accel();
 
+// ---- Proximity engine v2.1 motion channel (§5.4.5 obligation 3) -------------
+// One short accelerometer burst per proximity query, sampled *while the radio
+// scans* so it costs no extra awake time, then handed to the engine's motion
+// classifier via prox_ingest_imu_burst().
+//
+// Interleaved use (inside the pre-query scan's wait loop):
+//     imu_burst_begin();
+//     while (scanning) { imu_burst_service(); delay(10); }
+//     imu_burst_submit();
+//
+// Blocking use (no scan to hide behind — e.g. deciding the poll tier just
+// before enforcement light sleep):
+//     imu_burst_blocking();
+void imu_burst_begin();
+void imu_burst_service();   // samples at most one triple, when one is due
+void imu_burst_submit();    // hands whatever was collected to the engine
+void imu_burst_blocking();  // begin + service + submit, ~IMU_BURST_SAMPLES/IMU_BURST_HZ ms
+
 // Clear the latched INT1 activity interrupt.
 // Must be called after each data_ready event to allow the next one to fire.
 void lis3dh_clear_int1();

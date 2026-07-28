@@ -1,6 +1,6 @@
 # ADHD Habit Enforcement Watch & Anchor — Firmware Specification
 
-**Version:** 0.8 (Draft — see Section 0 for spec status, firmware parity, and the change log)
+**Version:** 0.9 (Draft — see Section 0 for spec status, firmware parity, and the change log)
 **Scope:** Firmware for the ESP32-C3-WROOM Watch and ESP32-C3-WROOM Anchor devices, intended as a complete reference for a coding agent.
 
 ---
@@ -14,7 +14,7 @@ This spec changes rapidly. Rules for maintaining this section:
 
 ### 0.1 Spec ↔ firmware parity
 
-Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proximity `proximity_engine`. **Last audited: 2026-07-12.**
+Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proximity `proximity_engine`. **Last audited: 2026-07-28.**
 
 | Spec area | Watch | Anchor | Notes |
 |---|---|---|---|
@@ -30,10 +30,37 @@ Code homes: watch `WatchFIrmware/src`, anchor `AnchorFirmware/src`, shared proxi
 
 | Anchor WiFi credential slots + WiFi Status char (§4.4, §4.5.1) | — | ❌ | **New in v0.8.** 4-slot NVS credential table with dedup/LRU eviction, slot-cycling retry loop, `…000E` WiFi Status (Read+Notify), non-blocking credential write response. **Lockstep** with MOBILE_APP_SPEC §8.14. |
 | Watch-side anchor WiFi repair (§5.5.3) | ❌ | — | **New in v0.8.** Battery-gated (>4000 mV), 20-min interval, schedule-referenced anchors only. No wire-format change on the watch side; depends on the anchor `…000E` characteristic above. |
+| Prox v2 P1: IMU channel + HMM + STILL poll tier (§5.4.1, §5.4.5) | 🟡 shadow | — | **New in v0.9** (2026-07-28). Code complete and green on the §10-A P1 host acceptance suite (`proximity_engine/tests`, 435 checks). Partial hardware verification done 2026-07-28 (two defects found + fixed); motion-dependent and sleep-dependent checks outstanding. Runs in **shadow**: `PROX_V2_AUTHORITATIVE = 0`, both decisions logged per query as `[PROXv2]`, v0.8 still binding. The STILL poll tier is gated on the same flag. Flip after an evening of on-hardware shadow logging. Watch-only; no wire change. |
+| Prox v2 P2: beacon schedule (§4.3, §4.12) | — | ❌ | Blocked on Spikes S1/S2 (hardware). |
+| Prox v2 P2: vector v2 + score2 + side table (§4.10, §6.3) | ❌ | ❌ | **Lockstep** with app parser. Note the score-characteristic collision recorded in the v0.9 change log. |
+| Prox v2 P2: calibration leg byte (§5.6, §4.10.7) | ❌ | — | Same lockstep batch. |
+| Prox v2 P3: coupling detector, per-channel δ (Mode C) | ❌ | — | After P2 field validation. |
+| Prox v2 P4: FTM / CSI | ❌ | ❌ | Spike-gated (S4/S5); CSI additionally needs the anchor IDF 5.x migration. |
 
 Legend: ✅ implemented/verified · 🟡 believed implemented, unverified · ⚠️ diverges from spec · ❌ not started
 
 ### 0.2 Change log
+
+**v0.9 — 2026-07-28 — Proximity engine v2.1, Phase 1 only** (watch only; **no wire-format change**; see `firmware_spec_v0.9_amendment.md` for the full v2.1 plan and `proximity_engine_spec_v2.1.md` for the math)
+
+Phase 1 of the amendment's §10-A roadmap has landed in `proximity_engine/`; Phases 2–4 have not started (P2 is gated on hardware spikes S1/S2, which cannot be run without the devices).
+
+- **Root cause being fixed.** Indoor RSSI reads flat not because distance is unmeasurable but because a *stationary* receiver draws one small-scale fading sample per frequency and then re-measures that same sample forever. v1 averaged those repeats into confident nonsense — a wrist parked in a null averaged its way to "away". v2.1 counts **independent fading draws**, not samples, and lets the decision change only when the IMU says the wrist could have moved.
+- **Motion channel (§5.4.5, new).** STILL / FIDGET / LOCOMOTION / UNKNOWN from three zero-cost inputs: the existing ENFORCEMENT-only IA1 wake verdict over each light-sleep interval (`prox_note_sleep_interval`), awake IA1 firings (`prox_note_motion_interrupt`), and one 32-sample @ 50 Hz accelerometer burst per query, sampled *inside the pre-query scan's wait loop* so it adds no awake time. **DORMANT's v0.7 zero-IMU-interrupt guarantee is unchanged** — no new interrupt source exists, and nothing here runs outside ENFORCEMENT and calibration bursts.
+- **Motion-gated integrator (`ProxIntegrator`).** Replaces the co-location EWMA rings. While STILL: N_eff frozen, mean tracked at `INTEG_STILL_WEIGHT` (enough for genuine slow shadowing), and reported variance **relaxes back outward** toward one draw instead of collapsing on near-zero residuals. STILL → LOCOMOTION restarts the window.
+- **Two-state motion-conditioned HMM (§5.4.1 step 8).** Replaces the threshold interpretation and the co-location two-threshold hysteresis machine, returning the identical `NEAR / AWAY / AMBIGUOUS` interface with the identical criterion-dependent fail-safe, so no downstream consumer changed. Implemented as one scalar log-odds in Q8; the two-state forward update collapses to `lse(L, -c) - lse(L - c, 0)`, two table lookups. No `log`/`exp`/`sqrt` on any tick path — `prox_luts.h` is generated by `proximity_engine/tools/gen_prox_luts.py`.
+- **Connect-failure evidence.** The ad-hoc v0.8 rule ("failed connect + advertisement ≤ `PROX_FAR_RSSI_THRESHOLD_DBM` ⇒ AWAY") is deleted at its call site and routed through `prox_note_connect_failure()` as a log-LR, so it competes on the same scale as everything else instead of overriding the filter. The constant moved from `watch_prox_transport.h` into `proximity.h`.
+- **Third poll tier.** Met + HMM-confident + STILL backs the enforcement poll off to `ENFORCEMENT_POLL_INTERVAL_STILL_S` (600 s). Any IA1 firing exits it immediately. A fresh IMU burst is taken just before enforcement light sleep so the tier decides on current evidence rather than a stale reading.
+- **Shipping in shadow.** `PROX_V2_AUTHORITATIVE = 0`: both decisions are computed on every query and logged side by side (`[PROXv2] … <-- DIVERGED`), with v0.8 still binding and the STILL tier disabled. Flipping that one constant is the entire cutover.
+- **Two recorded deviations from the amendment**, both in code comments and `proximity_engine/tests/prox_v2_p1_notes.md`:
+  1. **`near_thr` in `ProxScoreResult2`.** The amendment's emission `logit((score+0.5)/256)` is centred on score 128, which would silently discard this branch's calibration-v2 per-anchor demonstrated cutoff (a score of 180 would read NEAR-ish for an anchor whose demonstrated cutoff is 210). The emission is centred on the anchor's own decision point instead. **Consequence for P2:** the score characteristic already carries `near_thr` in byte 3, which amendment Part 13 reassigns to `neff`; that payload must become 4 bytes `[score][flags][neff][near_thr]`.
+  2. **`NEFF_LOCO_PER_S` / `NEFF_FIDGET_PER_S` are draws per second, not pre-scaled Q4.** Read as Q4 they credit 0.5 draws per second of walking — 32× below the rate the engine spec's own §1.3 derives (λ/2 = 6.2 cm at ~1 m/s ≈ 16/s) — and no walk-in accumulates enough evidence to flip promptly. N_eff is *stored* Q4; the rates are whole draws.
+- **New constant `HMM_STILL_DRAW_PERIOD_S` (12 h)** replaces the amendment's unspecified "PFLIP_STILL is small, not zero" trickle with a physical quantity: how long a provably-motionless wrist must sit before the engine concedes one fresh independent draw. It alone sets the still-lock strength — at 12 h an all-night frozen fade cannot flip a decision, while a silently stuck IMU still yields to sustained contradiction within half a day.
+- **Two defects found by on-hardware shadow logging, both fixed, both now regression-tested.** They are the same defect twice, in opposite directions, and both concern how a *still* window accounts for evidence:
+  1. **Watch-local evidence must ride the draw gate.** The amendment's §6.1 emission places `l_local` outside the `g(N_eff)` discount. A stationary watch out of comfortable range re-fails its GATT connect on every poll, and each failure added a full `LL_CONNFAIL_AWAY_Q8` — the posterior marched −610 → −1378 → −2146 → −3473 to saturation on one observation repeated. That is precisely the frozen-fade failure this engine exists to prevent, arriving through a different channel. `l_local` is now summed with the anchor's verdict *before* the gate.
+  2. **A still window's evidence is a level, not a per-tick increment.** Fixing (1) alone made whichever observation arrived first in a window spend its single draw and lock out every later one: a weak connect-failure hint pinned the posterior at AMBIGUOUS while the anchor's actual score — unambiguously far — was suppressed as "the same draw", permanently. Each still tick now credits only the *change* since the window's last reading, and only in the direction the observation points. Re-reading the same thing adds nothing; a materially different reading still lands.
+- **Acceptance:** all four §10-A P1 tests (frozen-fade, walk-approach, teleport-rejection, IMU-stale) plus LUT/motion/integrator/coloc/connect-failure coverage — **435 checks green**, host-side, no hardware (`cd proximity_engine/tests && make`).
+- **On-hardware shadow logging: partially done** (2026-07-28, tethered watch, blank NVS, anchor at ≈ −79 dBm, via the `BENCH_NO_SLEEP` bench harness). Verified: clean boot, IMU burst plumbing, motion classifier stable on real sensor noise, the full scan → vector → connect → score → HMM → log path, draw gating under repeated evidence, flat heap over ~10 min of continuous query load, and zero posterior drift across a 4-minute soak of unchanging still evidence (48/48 decisions at an identical log-odds). Measured resting burst variance is **9–33 mg²** against the 400 mg² `IMU_STILL_VAR` placeholder — better than 10× headroom, so STILL is declared robustly. **Still outstanding, and required before flipping `PROX_V2_AUTHORITATIVE`:** anything needing physical motion (FIDGET/LOCOMOTION classification, the cadence detector, the IA1 seam, walk-approach end to end) and the sleep-interval verdict, which a no-sleep bench build cannot exercise. Details in `proximity_engine/tests/prox_v2_p1_notes.md` §4.
 
 **v0.8 — 2026-07-21** (anchor wire-format change — **lockstep with MOBILE_APP_SPEC v1.3 §8.14**)
 - **Anchor WiFi credentials become a 4-slot table (§4.4, §4.5.1).** `ANCHOR_WIFI_MAX_CRED_SLOTS = 4`, deduplicated by SSID, LRU-evicted preferring never-connected slots. Credential offers are now **non-destructive** — the central failure mode of the old single-pair store (overwriting working credentials with wrong ones and stranding an anchor) is closed by construction. Slots are tried most-recently-successful first, so a healthy anchor never drops a working link for a speculative offer.

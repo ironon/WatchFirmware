@@ -15,12 +15,9 @@
 #include <stdint.h>
 #include "proximity.h"
 
-// When a proximity GATT connection cannot be established, a recent advertisement
-// RSSI at or below this level is treated as strong evidence the watch is FAR
-// from the anchor (connection establishment fails ~-88 dBm, well before ad
-// reception does, so a failed connect + weak ad ≈ out of range).
-// (Re-homed from the old src/proximity.h — not provided by the shared engine.)
-#define PROX_FAR_RSSI_THRESHOLD_DBM          -85
+// PROX_FAR_RSSI_THRESHOLD_DBM (the "failed connect + weak advertisement ⇒ far"
+// level) now lives in proximity.h: as of engine v2.1 the rule is a log-LR fed to
+// the HMM through prox_note_connect_failure(), so the engine owns the constant.
 
 // MTU we request before connecting to an anchor.
 // (Re-homed from the old src/proximity.h.)

@@ -1222,11 +1222,18 @@ static void prox_aligned_active_scan(uint32_t duration_ms) {
     g_ble_scan->start(duration_ms, false, true);
     g_last_ble_scan_ms = millis();
     batt_log("prox_active_scan");
+    // Proximity v2.1 §5.4.5: sample the IMU burst concurrently with the scan.
+    // The CPU is idle in this wait loop and the SPI accelerometer read does not
+    // contend with the radio, so the motion evidence the engine needs costs no
+    // extra awake time.
+    imu_burst_begin();
     uint32_t t0 = millis();
     while (g_ble_scan->isScanning() && millis() - t0 < duration_ms + 200) {
+        imu_burst_service();
         delay(10);
     }
     if (g_ble_scan->isScanning()) g_ble_scan->stop();
+    imu_burst_submit();
 
     // Restore the low-power passive enforcement scan configuration.
     g_ble_scan->setActiveScan(false);
@@ -1733,6 +1740,39 @@ static void notify_seen_anchors() {
 //  Enforcement condition checking
 // ============================================================
 
+// Proximity engine v2.1 shadow-then-flip (§10-A cross-cutting rules). Both the
+// shipped v0.8 threshold decision and the new HMM decision are computed on every
+// query and logged side by side; only one is returned. While
+// PROX_V2_AUTHORITATIVE is 0 the v0.8 verdict remains binding, so an evening of
+// field logging can show what v2 *would* have done before it is allowed to do
+// it. Flipping the constant to 1 is the whole of the cutover.
+static ProxProximity prox_decide(ProxProximity v08, ProxDecision v2, const char *what) {
+    static const char *kName[] = { "NEAR", "AWAY", "AMBIG" };
+    ProxProximity v2p = (v2 == PROX_HMM_NEAR) ? PROX_NEAR
+                      : (v2 == PROX_HMM_AWAY) ? PROX_AWAY : PROX_AMBIGUOUS;
+    static const char *kMotion[] = { "STILL", "FIDGET", "LOCO", "UNKNOWN" };
+    Serial.printf("[PROXv2] %s: v0.8=%s v2=%s p_near=%u motion=%s lam=%d%s\n",
+                  what, kName[v08], kName[v2p], prox_hmm_p_near_u8(),
+                  kMotion[prox_motion_state() & 3], (int)prox_hmm_logodds_q8(),
+                  (v08 != v2p) ? "  <-- DIVERGED" : "");
+#if PROX_V2_AUTHORITATIVE
+    return v2p;
+#else
+    return v08;
+#endif
+}
+
+// Map an event criterion onto the engine's cold-start bias: the HMM begins each
+// enforcement window on the criterion-satisfying side, so an uninformed window
+// never opens by alarming (§6.3).
+static uint8_t prox_criterion_of(const Event *e) {
+    if (!e) return PROX_CRIT_STAY_NEAR;
+    switch (e->criteria) {
+        case STAY_NEAR:  return PROX_CRIT_STAY_NEAR;
+        case PHONE_AWAY: return PROX_CRIT_PHONE_AWAY;
+        default:         return PROX_CRIT_GET_AWAY;
+    }
+}
 
 // Perform an anchor-based proximity query and return NEAR / AWAY / AMBIGUOUS.
 // AMBIGUOUS = "could not determine" (anchor not discovered, connect failed
@@ -1774,25 +1814,35 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     if (!prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result, out_dock, 0xFF, &near_thr)) {
         // Connection establishment fails at much weaker RSSI (~-88 dBm) than
         // advertisement reception, so a failed connect + a weak recent ad RSSI
-        // is strong evidence the watch is FAR from the anchor.
+        // is strong evidence the watch is FAR from the anchor. The v0.8 rule
+        // decided outright; v2.1 §6.1 routes the same observation through the
+        // engine seam as a log-LR so it competes with everything else on the
+        // same scale instead of overriding the filter.
         uint32_t now_ts = (uint32_t)time(nullptr);
         bool rssi_fresh = rec->lastSeen != 0 &&
                           (now_ts - rec->lastSeen) <= (uint32_t)ANCHOR_SEEN_TIMEOUT_S;
-        if (rssi_fresh && rec->lastRSSI <= PROX_FAR_RSSI_THRESHOLD_DBM) {
-            Serial.printf("[PROX] Connect failed; recent ad RSSI %d <= %d → AWAY (far)\n",
-                          rec->lastRSSI, PROX_FAR_RSSI_THRESHOLD_DBM);
-            return PROX_AWAY;
-        }
-        Serial.println("[PROX] Anchor query failed — AMBIGUOUS");
-        return PROX_AMBIGUOUS;
+        prox_note_connect_failure(rec->lastRSSI, rssi_fresh);
+        ProxProximity v08 = PROX_AMBIGUOUS;
+        if (rssi_fresh && rec->lastRSSI <= PROX_FAR_RSSI_THRESHOLD_DBM) v08 = PROX_AWAY;
+        return prox_decide(v08, prox_hmm_tick(nullptr), "connect-failed");
     }
 
     rec->lastProxScore = result.score;
     Serial.printf("[PROX] Score=%d flags=0x%02X near_thr=%u\n",
                   result.score, result.flags, (unsigned)near_thr);
-    // Per-anchor calibrated cutoff when the anchor reports one (decision 4);
-    // uncalibrated anchors fall back to the global rule inside prox_interpret_score.
-    return prox_interpret_score(result.score, near_thr);
+
+    // v0.8 interpretation: per-anchor calibrated cutoff when the anchor reports
+    // one (calibration-v2 decision 4); uncalibrated anchors fall back to the
+    // global rule inside prox_interpret_score.
+    ProxProximity v08 = prox_interpret_score(result.score, near_thr);
+
+    // v2.1 §5.4.1 step 8: the same score, plus motion state and watch-local
+    // evidence, through the HMM. neff is left 0 in P1 — the watch has no
+    // per-anchor observation window yet, so the engine counts draws from the
+    // motion channel alone; P2's trailer supplies the anchor's own claim.
+    ProxScoreResult2 r2;
+    r2.score = result.score; r2.flags = result.flags; r2.neff = 0; r2.near_thr = near_thr;
+    return prox_decide(v08, prox_hmm_tick(&r2), "score");
 }
 
 // ============================================================
@@ -1906,6 +1956,24 @@ static void notify_calib_progress(uint8_t state) {
     if (g_bt_connected) g_calib_char->notify();
 }
 
+// Option A radio hand-off (calibration-v2 crash fix). During a session the watch
+// does central connects to the anchor while the phone is disconnected. It MUST be
+// non-connectable throughout that work: if the phone re-establishes a peripheral
+// link while a central connect is in flight, NimBLE asserts (ble_hs_timer_exp,
+// ble_hs.c:466) and the watch reboots — the exact crash seen in the FINALIZE poll,
+// where the app reconnects every few seconds to read the result. Stopping
+// advertising means the phone simply can't connect until the watch hands the radio
+// back at a phase boundary (calib_yield_radio_to_phone), which serialises the two
+// roles instead of letting them collide. `onDisconnect` also honours this: it does
+// NOT re-advertise while g_calib_active.
+static void calib_radio_go_dark() {
+    NimBLEDevice::getAdvertising()->stop();
+}
+static void calib_yield_radio_to_phone() {
+    // Re-advertise so the app can reconnect (to advance a phase or read a result).
+    NimBLEDevice::getAdvertising()->start();
+}
+
 static void calib_start(const uint8_t uuid[16], uint16_t duration_s, uint8_t phase) {
     if (duration_s == 0)                    duration_s = CALIB_DEFAULT_DURATION_S;
     if (duration_s < CALIB_MIN_DURATION_S)  duration_s = CALIB_MIN_DURATION_S;
@@ -1959,6 +2027,9 @@ static void calib_begin_abort(const uint8_t uuid[16]) {
             prox_query_anchor(mac, addr_type, vec, r, nullptr, 4, nullptr);
         }
     }
+    // Session over: make sure the watch is connectable again (advertising may have
+    // been suppressed mid-session by onDisconnect).
+    calib_yield_radio_to_phone();
     Serial.println("[CALIB] ABORT");
     notify_calib_progress(3);
 }
@@ -1966,8 +2037,11 @@ static void calib_begin_abort(const uint8_t uuid[16]) {
 static void calib_finish(uint8_t state) {
     g_calib_active = false;
     // The phone is disconnected (Option A) and must now reconnect to advance the
-    // flow. Stay awake/connectable through that reconnect gap so it can rediscover
-    // the calibration characteristic (see CALIB_INTERPHASE_AWAKE_MS).
+    // flow. Hand the radio back (re-advertise) and stay awake/connectable through
+    // the reconnect gap so it can rediscover the calibration characteristic
+    // (see CALIB_INTERPHASE_AWAKE_MS). Set g_calib_active=false FIRST so onDisconnect
+    // no longer suppresses advertising.
+    calib_yield_radio_to_phone();
     g_calib_awake_until_ms = millis() + CALIB_INTERPHASE_AWAKE_MS;
     Serial.printf("[CALIB] Finish state=%u accepted=%u queries=%u\n",
                   (unsigned)state, (unsigned)g_calib_accepted, (unsigned)g_calib_queries);
@@ -2017,8 +2091,9 @@ static void calib_tick(uint32_t now_ms) {
                 g_calib_have_result      = true;
                 g_calib_finalize_pending = false;
                 g_calib_active           = false;
-                // Stay awake/connectable so the app can reconnect and read the
-                // result frame before the watch drops back to light sleep.
+                // Hand the radio back and stay awake/connectable so the app can
+                // reconnect and read the result frame before the watch light-sleeps.
+                calib_yield_radio_to_phone();
                 g_calib_awake_until_ms   = millis() + CALIB_INTERPHASE_AWAKE_MS;
                 Serial.printf("[CALIB] FINALIZE done: thr=%u inside=%u edge=%u conf=%u\n",
                               (unsigned)thr, (unsigned)in_n, (unsigned)ed_n, (unsigned)conf);
@@ -2121,6 +2196,88 @@ static bool is_enforcement_condition_met(const Event *e) {
     return false;
 }
 
+#if BENCH_NO_SLEEP
+// ============================================================
+//  Bench harness — proximity v2.1 P1 shadow logging (§10-A P1 acceptance)
+//
+//  Compiled ONLY into a -DBENCH_NO_SLEEP build. The shadow-logging acceptance
+//  item needs the v2 decision computed beside the v0.8 one on real hardware, but
+//  reaching ENFORCEMENT normally requires a paired phone, a pushed schedule, a
+//  set clock and a live window. This drives the *same* code path directly:
+//  it synthesises a stayNear event against whichever anchor the scan finds and
+//  calls the real is_enforcement_condition_met() path, so everything under test
+//  (aligned scan -> IMU burst -> vector -> query -> prox_hmm_tick -> prox_decide)
+//  is exactly the shipping code.
+//
+//  With no anchor in range it still logs the motion channel every cycle, which
+//  is the raw data Spike S3 needs (burst variance on a real wrist vs the
+//  placeholder IMU_STILL_VAR / IMU_LOCO_VAR).
+// ============================================================
+static Event    g_bench_event;
+static uint32_t g_bench_next_ms  = 0;
+static bool     g_bench_armed    = false;
+static uint32_t g_bench_cycle    = 0;
+
+static void bench_tick() {
+    if ((int32_t)(millis() - g_bench_next_ms) < 0) return;
+    g_bench_next_ms = millis() + 5000;
+    g_bench_cycle++;
+
+    // Find any anchor the scan has seen (records first, then raw sightings).
+    const uint8_t *uuid = nullptr;
+    for (int i = 0; i < MAX_ANCHOR_RECORDS && !uuid; i++)
+        if (g_anchor_records[i].valid && g_anchor_records[i].bleMacValid) uuid = g_anchor_records[i].uuid;
+    for (int i = 0; i < MAX_SEEN_ANCHORS && !uuid; i++)
+        if (g_seen_anchors[i].valid && g_seen_anchors[i].bleMacValid) uuid = g_seen_anchors[i].uuid;
+
+    if (!uuid) {
+        // No anchor: exercise the scan + IMU burst path anyway and report the
+        // motion channel, which is the half of P1 that needs no RF at all.
+        prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+        static const char *kMotion[] = { "STILL", "FIDGET", "LOCO", "UNKNOWN" };
+        Serial.printf("[BENCH %lu] no anchor in range | motion=%s burst_var=%lu mg^2 cadence=%u\n",
+                      (unsigned long)g_bench_cycle, kMotion[prox_motion_state() & 3],
+                      (unsigned long)prox_motion_burst_var(), prox_motion_burst_cadence());
+        return;
+    }
+
+    if (!g_bench_armed) {
+        // query_anchor_proximity() resolves the anchor through g_anchor_records,
+        // which is normally populated from the pushed schedule. On a blank bench
+        // watch the anchor exists only as a raw sighting, so promote it — the
+        // same gap calib_burst_once() works around with find_anchor_ble_addr().
+        for (int i = 0; i < MAX_SEEN_ANCHORS; i++) {
+            if (!g_seen_anchors[i].valid || !g_seen_anchors[i].bleMacValid) continue;
+            if (!uuid_eq(g_seen_anchors[i].uuid, uuid)) continue;
+            AnchorRecord *rec = ensure_anchor_record(uuid);
+            if (rec) {
+                memcpy(rec->bleMac, g_seen_anchors[i].bleMac, 6);
+                rec->bleAddrType = g_seen_anchors[i].bleAddrType;
+                rec->bleMacValid = true;
+                rec->lastRSSI    = g_seen_anchors[i].rssi;
+                rec->lastSeen    = (uint32_t)time(nullptr);
+            }
+            break;
+        }
+        memset(&g_bench_event, 0, sizeof(g_bench_event));
+        g_bench_event.criteria    = STAY_NEAR;
+        g_bench_event.hasAnchorId = true;
+        memcpy(g_bench_event.anchorId, uuid, 16);
+        g_bench_armed = true;
+        Serial.printf("[BENCH] armed stayNear against anchor %s — cold-starting HMM\n",
+                      convertAnchoridToString(g_bench_event.anchorId).c_str());
+        prox_hmm_reset(prox_criterion_of(&g_bench_event));
+    }
+
+    static const char *kMotion[] = { "STILL", "FIDGET", "LOCO", "UNKNOWN" };
+    bool met = is_enforcement_condition_met(&g_bench_event);
+    Serial.printf("[BENCH %lu] met=%d | motion=%s burst_var=%lu cadence=%u | heap=%lu\n",
+                  (unsigned long)g_bench_cycle, met ? 1 : 0, kMotion[prox_motion_state() & 3],
+                  (unsigned long)prox_motion_burst_var(), prox_motion_burst_cadence(),
+                  (unsigned long)ESP.getFreeHeap());
+}
+#endif // BENCH_NO_SLEEP
+
 // ============================================================
 //  Enforcement profile playback
 // ============================================================
@@ -2195,6 +2352,19 @@ static void enforcement_update() {
 static uint32_t enforcement_poll_interval_ms() {
     uint32_t s = g_enf.condition_met ? ENFORCEMENT_POLL_INTERVAL_MET_S
                                      : ENFORCEMENT_POLL_INTERVAL_S;
+#if PROX_V2_AUTHORITATIVE
+    // Third tier (§5.4.1 / §9): met, HMM confident, and the wrist provably
+    // STILL. Not polling here is *correct*, not merely cheap — a stationary user
+    // cannot change proximity class, which is the HMM's whole premise, and the
+    // IA1 interrupt restores full responsiveness the instant that premise breaks.
+    if (g_enf.condition_met && g_active_event &&
+        (g_active_event->criteria == STAY_NEAR || g_active_event->criteria == GET_AWAY ||
+         g_active_event->criteria == PHONE_AWAY) &&
+        prox_hmm_decision() != PROX_HMM_AMBIGUOUS &&
+        prox_motion_state() == PROX_MOTION_STILL) {
+        s = ENFORCEMENT_POLL_INTERVAL_STILL_S;
+    }
+#endif
     return s * 1000UL;
 }
 
@@ -2265,6 +2435,12 @@ static void enter_enforcement(Event *e) {
         // Use modem sleep between operations to reduce idle current.
         esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
     }
+
+    // Proximity v2.1 §5.4.1: the engine holds no state between windows, so cold
+    // -start the HMM here — biased to the criterion-satisfying side — before the
+    // first condition check runs its query.
+    if (e->criteria == STAY_NEAR || e->criteria == GET_AWAY || e->criteria == PHONE_AWAY)
+        prox_hmm_reset(prox_criterion_of(e));
 
     g_enf.condition_met = is_enforcement_condition_met(e);
     if (!g_enf.condition_met) enforcement_start(e->profile);
@@ -3400,6 +3576,17 @@ static void usage_report() {
 // ============================================================
 
 static void enter_dormant_sleep() {
+#if BENCH_NO_SLEEP
+    // Bench builds only (PLATFORMIO_BUILD_FLAGS=-DBENCH_NO_SLEEP=1). Light sleep
+    // powers down the USB-serial peripheral, after which the board cannot be
+    // re-flashed without a physical reset — which makes iterating on a tethered
+    // watch impossible. Never define this for a shipping build: the watch would
+    // stay awake permanently and flatten the battery in hours.
+    static uint32_t last_note = 0;
+    if (millis() - last_note > 30000) { Serial.println("[BENCH] DORMANT_SLEEP suppressed"); last_note = millis(); }
+    delay(50);
+    return;
+#endif
     Serial.println("[STATE] DORMANT_SLEEP");
 #if DIAG_AWAKE
     if (g_dbg_burst_start_ms != 0)
@@ -3514,12 +3701,34 @@ static void enter_dormant_sleep() {
 static void enter_enforcement_sleep() {
     // Preconditions: condition_met == true, user still, no scan in progress.
     // Stays in STATE_ENFORCEMENT; wakes to re-check the condition.
+#if BENCH_NO_SLEEP
+    // See enter_dormant_sleep(). NOTE for the shadow-log reading: with this
+    // defined the watch never sleeps, so prox_note_sleep_interval() never fires
+    // and the motion channel runs on bursts + awake IA1 firings only. The
+    // sleep-interval verdict path needs a sleep-enabled run to exercise.
+    static uint32_t last_note = 0;
+    if (millis() - last_note > 30000) { Serial.println("[BENCH] ENFORCEMENT sleep suppressed"); last_note = millis(); }
+    delay(50);
+    return;
+#endif
 
     // Stop any active BLE scan before sleeping.
     if (g_ble_scan && g_ble_scan->isScanning()) g_ble_scan->stop();
 
+    // Proximity v2.1 §5.4.1: the poll tier below asks whether the wrist is STILL
+    // *now*, and the last burst rode a scan at least ENFORCEMENT_IDLE_BEFORE_SLEEP_MS
+    // ago — long past IMU_STALE_MS. Take one fresh burst here (radio off, CPU
+    // otherwise idle, ~0.6 s once per sleep entry) so the tier decides on
+    // current evidence rather than defaulting to UNKNOWN.
+    imu_burst_blocking();
+    // The burst widened the window between the caller's !data_ready check and
+    // the ISR detach below; if the wrist moved during it, bail out and let the
+    // loop service the interrupt rather than sleeping through it.
+    if (data_ready) return;
+
     // Sleep until the next poll (adaptive cadence — this path runs only while
-    // compliant, so it uses the backed-off MET interval), capped at time until
+    // compliant, so it uses the backed-off MET interval, or the STILL tier when
+    // the engine is confident and the wrist has not moved), capped at time until
     // event end so the event never terminates late.
     uint64_t sleep_us = (uint64_t)enforcement_poll_interval_ms() * 1000ULL;
     if (g_active_event) {
@@ -3566,10 +3775,20 @@ static void enter_enforcement_sleep() {
     usage_before_sleep();
     uint64_t _use_t0 = esp_timer_get_time();
 #endif
+    uint32_t _slept_t0 = millis();
     esp_light_sleep_start();
 #if MEASURE_USAGE
     usage_after_sleep(esp_timer_get_time() - _use_t0, /*is_enforcement=*/true);
 #endif
+
+    // Proximity v2.1 §5.4.5 obligation 1: report the interval and whether IA1
+    // broke it. A motionless interval is authoritative STILL evidence for its
+    // whole span — the cheapest and strongest such evidence the watch has, and
+    // precisely the case v1 got most wrong (a parked wrist averaging a frozen
+    // fade into false confidence). esp_timer keeps counting through light sleep,
+    // so millis() gives the true slept duration.
+    prox_note_sleep_interval(millis() - _slept_t0,
+                             esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO ? 1 : 0);
 
     // Wakeup — re-arm ISR.
     lis3dh_clear_int1();
@@ -3726,7 +3945,17 @@ class WatchServerCallbacks : public NimBLEServerCallbacks {
         g_last_activity_ms = millis();
         recalculate_and_rearm();
         push_watch_status();
-        NimBLEDevice::getAdvertising()->start();
+        // Option A (§8.5): if a calibration session is active the phone has
+        // disconnected so the watch can central-connect to the anchor. Do NOT
+        // re-advertise — staying connectable lets the phone reconnect straight into
+        // an in-flight anchor connect and crash NimBLE (assert ble_hs_timer_exp).
+        // The session re-advertises itself at each phase boundary
+        // (calib_yield_radio_to_phone). Otherwise, restore advertising as normal.
+        if (g_calib_active) {
+            NimBLEDevice::getAdvertising()->stop();
+        } else {
+            NimBLEDevice::getAdvertising()->start();
+        }
     }
 };
 
@@ -4620,6 +4849,10 @@ void loop() {
             // MINIMUM_BLE_DELAY_ENFORCEMENT; the deferred re-arm block clears it.
             g_last_motion_ms   = now_ms;
             g_last_activity_ms = now_ms;
+            // Proximity v2.1 §5.4.5 obligation 2: report the firing to the motion
+            // channel before the re-check, so this query is evaluated knowing the
+            // wrist just moved (which is what unlocks HMM transitions).
+            prox_note_motion_interrupt();
             // check_enforcement_condition() runs its own aligned active scan
             // immediately before the query, so no separate scan is needed here.
             check_enforcement_condition();
@@ -4662,6 +4895,12 @@ void loop() {
             g_last_mday = ti.tm_mday;
         }
     }
+
+#if BENCH_NO_SLEEP
+    // Ahead of the UNPAIRED early-return: the bench harness must run on a
+    // factory-blank watch, which is exactly the state a tethered board is in.
+    bench_tick();
+#endif
 
     if (g_activity_state == STATE_UNPAIRED) {
         led_update(led_status_input());  // ring stays off until paired (§5.7)
