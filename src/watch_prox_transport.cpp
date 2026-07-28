@@ -20,6 +20,14 @@
 // from the old src/proximity.h. See §8.2.
 #define PROX_WIFI_SCAN_INTERVAL_MS  300000  // 5 minutes
 
+// Bound on the blocking central connect to the anchor. NimBLE's default is 30 s;
+// that is far too long here. If a connect collides with the phone reconnecting
+// to the watch (the single C3 radio can't do both at once — the Option A crash
+// window), the connect can stall for many seconds and blow the calibration phase
+// deadline. A short timeout lets the connect fail fast so the caller's retry loop
+// can recover on the next tick. See §8.5 and firmware_spec_v2.md calibration bugs.
+#define PROX_CONNECT_TIMEOUT_MS     5000
+
 // ── WiFi AP cache ─────────────────────────────────────────────
 // APs are stationary, so scan results are reused between queries (refreshed at
 // most every PROX_WIFI_SCAN_INTERVAL_MS). Re-homed from the old proximity.cpp;
@@ -123,6 +131,7 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
     // Serial.printf("[PROX] Requested MTU=%d\n", BLE_REQUESTED_MTU);
 
     client->setConnectionParams(12, 12, 0, 400); // fast connection
+    client->setConnectTimeout(PROX_CONNECT_TIMEOUT_MS); // fail fast on a radio collision (default 30 s)
     Serial.printf("[PROX] Connecting to %s ...\n", addr.toString().c_str());
     unsigned long t_connect = millis();
     if (!client->connect(addr)) {
@@ -286,6 +295,7 @@ bool prox_finalize_anchor(const uint8_t bleMac_be[6],
     if (!client) { Serial.println("[CALIB] FINALIZE: createClient null"); return false; }
     NimBLEDevice::setMTU(BLE_REQUESTED_MTU);
     client->setConnectionParams(12, 12, 0, 400);
+    client->setConnectTimeout(PROX_CONNECT_TIMEOUT_MS); // fail fast on a radio collision (default 30 s)
     Serial.printf("[CALIB] FINALIZE connecting to %s ...\n", addr.toString().c_str());
     if (!client->connect(addr)) {
         Serial.printf("[CALIB] FINALIZE: connect failed (rc=%d)\n", client->getLastError());

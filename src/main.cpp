@@ -101,6 +101,21 @@
 #define CALIB_MIN_DURATION_S          15
 #define CALIB_MAX_DURATION_S         180   // hard cap: bounds the forced-awake power cost
 #define CALIB_DEFAULT_DURATION_S      75
+// Quiet tail (calibration-v2 bug fix): stop starting new anchor queries this long
+// before the phase deadline. A query is a blocking central connect; if one is
+// in-flight when the app reconnects to the watch (peripheral) at the deadline,
+// the two collide on the single C3 radio (the Option A crash window) — the connect
+// hangs, the anchor stops being scored, and FINALIZE fails. Going quiet near the
+// boundary guarantees the radio is idle when the phone comes back. See §8.5.
+#define CALIB_QUIET_TAIL_MS         3000
+// Inter-phase awake window (calibration-v2 bug fix): after a burst finishes the
+// phone is still disconnected (Option A) and must reconnect to advance. Hold the
+// watch in DORMANT (advertising/connectable, no light sleep) this long so that
+// reconnect + service (re)discovery is reliable — otherwise the watch can drop to
+// DORMANT_SLEEP in the gap, the app reconnects onto a degraded link, fails to
+// rediscover the calibration characteristic, and the next phase button throws
+// "watch doesn't support this feature". Bounded, and re-armed at each boundary.
+#define CALIB_INTERPHASE_AWAKE_MS  45000
 #define PROX_QUERY_SCAN_DUTY_MS                   100  // pre-query scan only: window == interval == ~100%
                                                        // duty for dense device capture (restored after)
 #define ENFORCEMENT_IDLE_BEFORE_SLEEP_MS         30000
@@ -471,6 +486,7 @@ static NimBLECharacteristic *g_calib_char        = nullptr;  // §8.5 calibratio
 #define CALIB_PHASE_INSIDE   1
 #define CALIB_PHASE_EDGE     2
 #define CALIB_FINALIZE_TIMEOUT_MS  30000  // safety cap on the FINALIZE reconnect wait
+#define CALIB_FINALIZE_RETRY_MS     1200  // settle gap between FINALIZE attempts (let the radio recover)
 
 // Calibration burst session state (§8.5 + calibration-v2 phases).
 static bool     g_calib_active      = false;
@@ -479,6 +495,7 @@ static uint8_t  g_calib_phase       = CALIB_PHASE_INSIDE; // current burst phase
 static bool     g_calib_finalize_pending = false;         // FINALIZE requested, awaiting disconnect
 static uint32_t g_calib_deadline_ms = 0;
 static uint32_t g_calib_next_ms     = 0; // earliest millis() for the next burst query
+static uint32_t g_calib_awake_until_ms = 0; // keep out of light sleep until this (inter-phase reconnect gap)
 static uint16_t g_calib_accepted    = 0; // samples the anchor folded into its fingerprint
 static uint16_t g_calib_queries     = 0; // total queries attempted this session
 static uint8_t  g_calib_last_score  = 0;
@@ -1948,6 +1965,10 @@ static void calib_begin_abort(const uint8_t uuid[16]) {
 
 static void calib_finish(uint8_t state) {
     g_calib_active = false;
+    // The phone is disconnected (Option A) and must now reconnect to advance the
+    // flow. Stay awake/connectable through that reconnect gap so it can rediscover
+    // the calibration characteristic (see CALIB_INTERPHASE_AWAKE_MS).
+    g_calib_awake_until_ms = millis() + CALIB_INTERPHASE_AWAKE_MS;
     Serial.printf("[CALIB] Finish state=%u accepted=%u queries=%u\n",
                   (unsigned)state, (unsigned)g_calib_accepted, (unsigned)g_calib_queries);
     notify_calib_progress(state);
@@ -1996,6 +2017,9 @@ static void calib_tick(uint32_t now_ms) {
                 g_calib_have_result      = true;
                 g_calib_finalize_pending = false;
                 g_calib_active           = false;
+                // Stay awake/connectable so the app can reconnect and read the
+                // result frame before the watch drops back to light sleep.
+                g_calib_awake_until_ms   = millis() + CALIB_INTERPHASE_AWAKE_MS;
                 Serial.printf("[CALIB] FINALIZE done: thr=%u inside=%u edge=%u conf=%u\n",
                               (unsigned)thr, (unsigned)in_n, (unsigned)ed_n, (unsigned)conf);
                 notify_calib_progress(4);   // finalized — result block valid
@@ -2004,13 +2028,26 @@ static void calib_tick(uint32_t now_ms) {
         } else {
             Serial.println("[CALIB] FINALIZE: target has no BLE MAC yet — retry");
         }
-        g_calib_next_ms = millis() + CALIB_QUERY_INTERVAL_MS;
+        // A failed FINALIZE (bad frame / connect fail) retries until the safety cap.
+        // Give the radio a slightly longer settle than a normal burst query so a
+        // controller left unsettled by an earlier collision can recover.
+        g_calib_next_ms = millis() + CALIB_FINALIZE_RETRY_MS;
         notify_calib_progress(1);
         return;
     }
 
     // Normal phased burst.
     if ((int32_t)(now_ms - g_calib_deadline_ms) >= 0) { calib_finish(2); return; }
+    // Quiet tail: once within CALIB_QUIET_TAIL_MS of the deadline, stop starting
+    // new anchor queries so the radio is idle when the app reconnects to the watch
+    // to advance the phase. A query in flight at that moment collides with the
+    // phone reconnect on the single C3 radio (Option A crash window) — which is
+    // what stalled the connect and stopped the anchor being scored near the end of
+    // the EDGE phase, then broke FINALIZE. Just idle until the deadline.
+    if ((int32_t)(g_calib_deadline_ms - now_ms) <= CALIB_QUIET_TAIL_MS) {
+        notify_calib_progress(1);
+        return;
+    }
     if (g_calib_next_ms != 0 && now_ms < g_calib_next_ms) return;
 
     ProxScoreResult result;
@@ -4765,6 +4802,7 @@ void loop() {
     if (g_activity_state == STATE_DORMANT &&
         !g_bt_connected &&
         !(g_ble_scan && g_ble_scan->isScanning()) &&
+        (int32_t)(now_ms - g_calib_awake_until_ms) >= 0 &&   // inter-phase reconnect gap: stay connectable
         (now_ms - g_last_activity_ms) > DORMANT_TO_SLEEP_IDLE_MS) {
         // Motion no longer blocks DORMANT sleep — it is not a wake source here
         // and is ignored above (§8.4), so the idle timer alone governs sleep.
