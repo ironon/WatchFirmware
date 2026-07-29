@@ -21,6 +21,7 @@
   - **Anchor scoring (§4.10.3):** `prox_compute_score2` folds trailer features via location-trained distributions; new per-peer-anchor side table + **away-training gate** (§4.10.8); training gate becomes motion-qualified (§4.10.4).
   - **Calibration START gains a leg byte (§5.6):** near/away legs; away leg trains away distributions at burst speed.
   - **Observation window:** anchor-based enforcement queries use a full-duty `PROX_OBSERVE_WINDOW_MS` (1800 ms) scan in place of the 700 ms pre-query scan; power offset by the STILL poll tier (§8 amendment).
+- **Phase 5 (lockstep batch — occlusion & tamper resistance; engine spec §13):** the first phase written against an *adversarial* RF environment rather than merely a noisy one. Deliberate or accidental attenuation — a watch under a body in a mattress, 15–25 dB — is amplitude-indistinguishable from a 6–17× distance increase, and three shipped paths convert it into a confident AWAY: the starved-vector fallback's score-50 branch, connect-failure evidence with no motion witness, and Signal B's dependence on *absolute* dBm. Phase 5 adds the common-mode/differential discriminant (a blanket attenuator shifts every emitter by the same amount and censors them in rank order; displacement does neither), makes Signal B affine-invariant, and enforces the governing asymmetry that **an attenuating adversary can fabricate AWAY but never NEAR** — so every abstention path must require more evidence to conclude far than near. Gated on Spike **S6** (distribution-gathering, not feasibility). New flag `PROX_FLAG_OCCLUDED`; new event `occlusionSustained`.
 - **Deferred (Phase 4, feasibility-gated):** Wi-Fi FTM tie-breaker (needs anchor APSTA under IDF 4.4.7 — Spike S5) and **reversed-link Wi-Fi CSI** (watch transmits an ESP-NOW ping burst — stock 2.0.17 TX; the **anchor** captures CSI and folds channel-shape features into the score — engine spec §3.5). CSI rides the already-planned anchor pioarduino/IDF 5.x migration (§10.1) with a CSI-enabled build; watch-side CSI capture is explicitly ruled out (compile-time option absent from Arduino 2.0.17's precompiled libs; 4.4.7 RX coexistence risk). Do not start either without its spike passing.
 - New constants: §7 amendment block. New flags: `PROX_FLAG_V2_TRAILER`, `PROX_FLAG_TXLO_MISCAL`.
 
@@ -34,6 +35,9 @@
 | Prox v2 P2: calibration leg byte (§5.6, §4.10.7) | ❌ | — | Same lockstep batch. |
 | Prox v2 P3: coupling detector, per-channel δ (Mode C) | ❌ | — | After P2 field validation. |
 | Prox v2 P4: FTM / CSI | ❌ | ❌ | Spike-gated; see §10.1 toolchain notes. |
+| Prox v2 P5: occlusion hardening R1/R4 (§4.10.3, §5.4.5) | ❌ | ❌ | No wire change; **pull-forward candidates** — these close live exploits (engine spec §13.9). |
+| Prox v2 P5: offset-invariant Signal B (R2, §4.10.3) | — | ❌ | Anchor-only; must land **no later than** the first fleet-wide fingerprint training. |
+| Prox v2 P5: occlusion classifier + trailer fields (R3/R5, §5.4.6, §6.3.1) | ❌ | ❌ | **Lockstep** with app (`PROX_FLAG_OCCLUDED`, `occlusionSustained`). S6-gated. |
 
 ---
 
@@ -239,6 +243,7 @@ Execute phases strictly in order. Every phase ends green on its acceptance tests
 | **S3** | LIS3DH burst thresholds: STILL/FIDGET/LOCOMOTION confusion on ≥2 real wrists (desk work, typing, walking, sleeping) | STILL false-LOCOMOTION < 20%, LOCOMOTION false-STILL ≈ 0 | Raise `IMU_STILL_VAR`; misclass toward LOCOMOTION is safe by design |
 | **S4** *(pre-P4 only)* | Reversed-link CSI (engine spec §3.5): (a) **first step** — grep the anchor's target IDF-5.x framework sdkconfig for `CONFIG_ESP_WIFI_CSI_ENABLED`; if absent, the build route is Arduino-as-IDF-component with an owned sdkconfig; (b) anchor CSI RX callback + BLE + STA stable 60 min on IDF 5.x, receiving frames from watch pings; (c) watch ESP-NOW TX burst beside NimBLE on stock 4.4.7, stable | Flat heap, no WDT/panic, tagged CSI frames received end-to-end | CSI stays deferred; all other phases unaffected (CSI is non-load-bearing by design) |
 | **S5** *(pre-P4 only)* | Anchor APSTA + FTM responder + BLE under 4.4.7: stable, and does FTM to a C3 initiator range within ±2 m indoors? | 60 min stability + ranging sanity | FTM deferred; consider post-IDF-5.x anchor migration |
+| **S6** *(pre-P5 only)* | **Distributions, not feasibility.** Log full vector + per-channel RSSI + motion at ~1 Hz, ≥3 min per condition, ≥2 wrists × ≥2 homes, over engine spec §13.7 conditions (a)–(g): duvet, pillow, arm-under-torso, watch removed and buried, walk to next room, walk within room, rolling over. Do thresholds exist that separate occlusion from displacement? | ≥90 % detection on (c) arm-under-torso; ≤5 % false positive across (a),(b),(e),(f) | Ship R1/R2/R4 alone (they close the exploits without classifying) and set `OCC_ENABLE=0`; R3/R5 stay dark |
 
 ### Phase P1 — Watch-only inference upgrade (no wire change; ship alone)
 
@@ -287,6 +292,34 @@ Per-channel $\delta$ with epoch offset; coupling detector (`CPL_*`) added as a c
 
 **FTM:** trigger-gated ambiguity-dwell tie-breaker via `prox_ingest_ftm()`; anchor APSTA FTM responder; gated entirely on S5. Wire TBD at that point.
 
+### Phase P5 — Occlusion & tamper resistance (lockstep batch; engine spec §13)
+
+**Premise.** P1–P4 harden the engine against a *noisy* channel. P5 is the first phase written against a channel someone is *steering*. Where a criterion rewards the user for appearing far — `getAway`, and sunrise lock in particular — 15–25 dB of body/bedding attenuation is a free, equipment-less, accidentally-reproducible AWAY spoof. Read engine spec §13 in full before starting; §13.0's asymmetry rule (**AWAY is forgeable, NEAR is not — so far must always cost more evidence than near**) governs every decision in this phase.
+
+**Files:** `proximity.cpp/.h` (occlusion statistics, offset-invariant Signal B, classifier, evidence suppression), watch `main.cpp` (reference-vector lifecycle hooks, trailer assembly, `occlusionSustained` event), anchor `main.cpp` (score flag), app (flag + event — MOBILE_APP_SPEC batch).
+
+**Order within P5** — deliberately front-loads the parts that need no S6 data and no wire change:
+
+1. **R1 — starved-vector abstention** (anchor, `prox_compute_score()`): delete the score-50 branch; return `PROX_STARVED_SCORE` (128) with `neff = 0` and `PROX_FLAG_LOW_DEVICE_COUNT`. **Retain** the score-200 own-anchor branch — asymmetric on purpose (§13.4-R1).
+2. **R4 — connect-failure motion witness** (watch): `prox_note_connect_failure()` contributes `LL_CONNFAIL_AWAY_Q8` only when LOCOMOTION has been seen since the last successful connect to that anchor; otherwise exactly 0, not down-weighted.
+3. **R2 — offset-invariant Signal B** (anchor): median-offset $\hat\delta$ over present fingerprint-active devices; evaluate the shape term at $x_i - \hat\delta$; impute censored devices at $\mu_i + \hat\delta$ rather than `PROX_MISSING_RSSI_DBM`; re-admit absolute level as a separate capped `LL_LEVEL_MAX_Q8` term that abstains under OCCLUDED.
+4. **R3 — occlusion classifier** (watch): reference-vector lifecycle per §13.5, the four statistics (δ, MAD, C, F) in integer histogram form per §13.4-R3, log-LR combination with latch hysteresis.
+5. **R5 — evidence suppression** (watch): under OCCLUDED force `neff = 0`, abstain $\ell_{\text{level}}$, suppress connect-failure, let the transition prior continue. **Suppress, never invert** — inverting creates the mirror exploit.
+6. Wire + event surfacing (Part 17), and the §13.6 product decision **resolved by a person before ship**.
+
+Steps 1–3 need no S6 data. Steps 4–6 are S6-gated.
+
+**Acceptance (host-side, `proximity_engine/tests/`):**
+- *Blanket-attenuation invariance:* take any recorded near vector; subtract a uniform 20 dB from every entry and censor everything below −95 dBm. The score must not cross to the far side of the anchor's cutoff, and (with R3 enabled) OCCLUDED must assert.
+- *Displacement must not trip:* replay a recorded genuine walk-to-next-room trace — OCCLUDED must stay clear; assert on MAD and C individually so a regression names which statistic drifted.
+- *Starvation abstains:* a vector trimmed below `PROX_MIN_DEVICE_COUNT` returns 128 / `neff = 0`; the resulting HMM emission is exactly 0. The own-anchor-strong case still returns 200.
+- *Connect-failure without a motion witness contributes exactly 0*, and with one contributes `LL_CONNFAIL_AWAY_Q8` — this is a direct regression test on the L2 exploit.
+- *Signal B affine invariance:* a fingerprint-scored vector shifted by a uniform −15 dB changes score by less than the emission dead zone.
+- *Stale-reference safety:* a legitimately relocated user whose reference is not re-set must not read as permanently occluded (§13.5's named failure mode).
+- *Regression:* with `OCC_ENABLE = 0`, byte-identical behaviour to P4.
+
+**Acceptance (hardware):** the S6 corpus replayed through the shipped classifier at its final thresholds, meeting S6's own pass criterion; plus one full night of shadow logging on a real sleeper — a compliant user who rolls onto their watch must not generate a false AWAY, which is the outcome this phase most needs to be right about.
+
 ### Cross-cutting rules for the agent
 
 - **proximity.cpp modularity is inviolate** (master spec's modularity note): no HMM/integrator/feature code outside the shared module; firmware files implement only the documented seams.
@@ -294,3 +327,66 @@ Per-channel $\delta$ with epoch offset; coupling detector (`CPL_*`) added as a c
 - **Fail-open bias preserved:** every new abstention/unknown path must resolve toward the v0.8 criterion-satisfying behavior; grep-test that AMBIGUOUS handling call sites are unchanged.
 - **Shadow-then-flip:** each phase runs its new decision path in shadow (logged, non-authoritative) on hardware before the authority flag flips.
 - **Parity table + change log** updated at each phase landing, per §0 rules; P2's app-side changes are flagged lockstep in MOBILE_APP_SPEC §0.
+
+---
+
+## Part 17 — Phase 5 wire, constant, and event deltas (occlusion & tamper resistance)
+
+Applied **on top of** Parts 12–14, as a second lockstep batch. Kept separate from the P2 blocks so P2 can ship without carrying speculative fields.
+
+### 17.1 §6.3.1 Proximity Vector Payload: **append** to the trailer
+
+The v2 trailer gains 6 bytes after `neff`, before the anchor-feature count:
+
+```
+[1 byte:  occ_flags]       bit0 OCCLUSION_SUSPECT (watch verdict, latched per §13.5)
+                           bit1 REF_VALID (0 ⇒ every field below is unknown)
+[1 byte:  delta_db]        common-mode offset vs reference, dB + 128; 0x00 = unknown
+[1 byte:  mad_db]          differential dispersion (MAD of residuals), dB; 0xFF = unknown
+[1 byte:  censor_u8]       rank-monotonicity of dropouts, 255 = perfectly monotone; 0xFF = unknown
+[1 byte:  chflat_db]       per-channel spread of the offset, dB; 0xFF = unknown
+                           (always 0xFF while BEACON_CHANNEL_CONTROL = 0)
+[1 byte:  shared_dropped]  high nibble |S| (shared, saturating 15), low nibble |D| (dropouts)
+```
+
+Format version becomes `0x03`. Max size at N=60, K=4 grows to 540 bytes; the existing trim rule (weakest device entries first, never the trailer) absorbs it unchanged. **The watch sends the raw statistics as well as its verdict** so the anchor can retrain distributions from field data without a firmware change, and so S6-style corpora can be gathered from production units.
+
+### 17.2 §4.4 Proximity Score characteristic: **flag bit only, no length change**
+
+`flags` gains **bit 5 `PROX_FLAG_OCCLUDED`** — the anchor echoes the watch's latched verdict so the notify consumer (app debug view) sees it without parsing the vector. No new payload byte.
+
+> **Pre-existing collision to resolve during P2, noted here because it affects this byte layout:** the shipped calibration-v2 code already returns a 4th byte (`near_thr`) from this characteristic, while Part 13 specifies 3 bytes `[score][flags][neff]`. P2 must reconcile these to `[score][flags][neff][near_thr]` before any further growth. P5 adds no byte precisely to avoid compounding it.
+
+### 17.3 §7 Constants: **insert** block
+
+```
+// ── Occlusion & tamper resistance (Phase 5 — provisional until S6) ───────
+OCC_ENABLE                         = 1       // 0 ⇒ byte-identical to P4
+OCC_REF_MAX_AGE_S                  = 900     // reference-vector expiry
+OCC_MIN_SHARED                     = 6       // |S| below this ⇒ delta/MAD abstain
+OCC_MIN_DROPOUTS                   = 3       // |D| or |R| below this ⇒ censor term abstains
+OCC_DELTA_DB                       = -10     // common-mode drop making occlusion plausible
+                                             // (must sit ABOVE the bedding-only regime of
+                                             //  §13.1, ~3-5 dB, or every sleeper trips it)
+OCC_MAD_DB                         = 4       // residual dispersion below this ⇒ homogeneous
+OCC_CENSOR_MIN_U8                  = 204     // 0.80 rank-monotonicity
+OCC_CHFLAT_DB                      = 5       // offset spread below this ⇒ absorptive
+OCC_LOGLR_TAU_Q8                   = 512     // +2.0 nats ⇒ latch OCCLUDED
+OCC_CLEAR_TAU_Q8                   = 128     // +0.5 nats ⇒ clear latch (hysteresis)
+OCC_SUSTAIN_S                      = 120     // continuous OCCLUDED ⇒ reportable event
+LL_LEVEL_MAX_Q8                    = 384     // cap on the separated absolute-level term
+PROX_STARVED_SCORE                 = 128     // criterion-neutral; replaces the score-50 branch
+```
+
+### 17.4 New §5.4.6 Occlusion Channel **(proximity.cpp seams; watch main.cpp glue)**: **insert**
+
+The watch maintains one reference vector per enforcement window and evaluates the §13.4-R3 statistics once per observation window, immediately before the vector is written:
+
+1. `prox_occlusion_eval(v, &occ)` returns the Q8 log-LR and fills the trailer fields; the watch copies them into the vector trailer verbatim.
+2. Reference lifecycle per engine spec §13.5 — **set** on confident-HMM windows with `neff >= NEFF_TRAIN_MIN`; **re-set** after any sustained LOCOMOTION segment; **expire** at `OCC_REF_MAX_AGE_S`; **discard** on ENFORCEMENT entry. With no valid reference the log-LR is 0 and the engine reverts to P4 behaviour.
+3. `prox_is_occluded()` gates the evidence suppression of §13.4-R5 inside `prox_hmm_tick()`.
+4. `prox_occlusion_sustained_ms() >= OCC_SUSTAIN_S * 1000` raises **`occlusionSustained`** once per enforcement window (event payload: anchor MAC, δ, MAD, censor, duration).
+
+### 17.5 Product decision required before P5 ships
+
+Engine spec §13.6: detection is not prevention. A user who simply stays buried produces no usable evidence, and R5 correctly freezes the posterior — which is right for `stayNear` and a denial of service for `getAway`. The recommended resolution is **sustained occlusion counts as non-compliant for `getAway`-family criteria (sunrise lock) and is merely surfaced for `stayNear`**, because the user benefits from apparent-far in one case and not the other. This is a policy and UX call — a sleeping user who rolls onto their watch is not cheating — and this amendment deliberately does not choose it by default. Record the decision in MOBILE_APP_SPEC alongside the `occlusionSustained` handler.
