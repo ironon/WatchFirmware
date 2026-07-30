@@ -87,8 +87,21 @@
 #define ENFORCEMENT_SCAN_DURATION_MS              300
 #define ENFORCEMENT_SCAN_INTERVAL_MS             1000  // BLE scanner slot interval during enforcement
 #define ENFORCEMENT_SCAN_WINDOW_MS                100  // BLE scanner active window (~10% duty cycle)
-#define ENFORCEMENT_QUERY_SCAN_DURATION_MS        700  // bounded scan run right before a proximity query
-                                                       // to refresh the cache (aligns scan with query)
+#define ENFORCEMENT_QUERY_SCAN_DURATION_MS        700  // DORMANT-side aligned discovery scan (unchanged)
+// Observation window for anchor-based proximity queries (engine spec §3.3,
+// amendment Part 14). 1800 ms at full duty, replacing the 700 ms pre-query scan.
+//
+// A scan window is a random subset of the BLE population, not a census: BLE
+// advertising intervals run 100 ms to 10 s, so a 700 ms window catches a 2 s
+// advertiser only ~35% of the time. Field measurement showed vector sizes of
+// 8..31 devices across one stationary calibration leg, and the resulting shared
+// device count (which is what Pearson's sample size actually is) swinging 8..23.
+// At 1800 ms the same advertiser is caught ~90% of the time.
+//
+// Costs ~2.6x the per-query radio time of the largest BLE consumer; the §9 power
+// reconciliation pays for it with the STILL poll tier (600 s vs 180 s), which
+// applies to the still-and-compliant bulk of a real enforcement window.
+#define PROX_OBSERVE_WINDOW_MS                   1800
 
 // ── Calibration burst (§8.5) ────────────────────────────────────────────────
 // App-driven accelerated self-supervision: while active the watch repeatedly
@@ -97,7 +110,8 @@
 // The phone only orchestrates + shows progress; it never authors fingerprint
 // data — iOS exposes neither BLE MACs nor WiFi BSSIDs, so an app-built
 // fingerprint cannot align with the anchor/watch registry's coordinate space.
-#define CALIB_QUERY_INTERVAL_MS      600   // min gap between burst queries (each also runs a ~700ms scan)
+#define CALIB_QUERY_INTERVAL_MS      600   // min gap between burst queries (each also runs a
+                                           // PROX_OBSERVE_WINDOW_MS scan, so this rarely binds)
 #define CALIB_MIN_DURATION_S          15
 #define CALIB_MAX_DURATION_S         180   // hard cap: bounds the forced-awake power cost
 #define CALIB_DEFAULT_DURATION_S      75
@@ -1161,6 +1175,27 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
         uint8_t anchor_uuid[16];
         memcpy(anchor_uuid, mfr.data() + 4, 16);
 
+        // Beacon-schedule slot attribution (§3.2). Minor is big-endian on air, so
+        // slot_id sits in the high nibble of mfr[22]. The engine filters by MAC
+        // and ignores the legacy all-zero Minor itself, so every parsed beacon can
+        // be handed over unconditionally.
+        const uint16_t minor = (uint16_t)(((uint8_t)mfr[22] << 8) | (uint8_t)mfr[23]);
+        prox_obs_note(mac_be, minor, rssi);
+
+        // Is this a reduced-power slot? Everything below that records an RSSI as
+        // if it described the anchor's distance must ignore those, because a LO
+        // slot is ~15 dB down BY DESIGN. Feeding them into lastRSSI would make it
+        // oscillate across PROX_FAR_RSSI_THRESHOLD_DBM every 250 ms, and lastRSSI
+        // is what prox_note_connect_failure() and the v0.8 AWAY fallback judge
+        // "far" by — so enabling the schedule would manufacture AWAY evidence out
+        // of the schedule itself. A legacy anchor (Minor 0) fails to decode and is
+        // treated as full power, which is correct.
+        uint8_t beacon_slot = 0;
+        uint16_t beacon_cyc = 0;
+        const bool lo_slot = prox_beacon_minor_decode(minor, &beacon_slot, &beacon_cyc) &&
+                             prox_beacon_slot_is_lo(beacon_slot);
+        if (lo_slot) return;
+
         Serial.printf("[SCAN] Impulse anchor confirmed! RSSI=%d\n", rssi);
 
 #if DEBUG_MODE
@@ -1214,8 +1249,27 @@ static void prox_aligned_active_scan(uint32_t duration_ms) {
     if (!g_ble_scan) return;
     if (g_ble_scan->isScanning()) g_ble_scan->stop();
 
-    // Temporarily crank to active + ~100% duty (window == interval).
-    g_ble_scan->setActiveScan(true);
+    // Temporarily crank to ~100% duty (window == interval).
+    //
+    // Active vs passive is NOT a free choice once the beacon schedule is on.
+    // Spike S1a measured, with everything else held constant: a passive window
+    // received 100% of the anchor's advertising slots at every one of 12 power
+    // levels, while an active window received 30-95% of them, erratically, at
+    // identical RSSI — the receiver is off transmitting SCAN_REQs and awaiting
+    // responses instead of listening, and the advertiser stalls its own schedule
+    // to answer them. That displaced the measured PDR cliff by ~9 dB, which is
+    // three whole power levels: PDR simply cannot be measured on an active scan.
+    //
+    // Scan responses add payload but never new devices, and the anchor UUID is
+    // carried in the ADV_IND manufacturer data, so nothing in the parse path
+    // needs active scanning. The reason this is gated rather than simply flipped:
+    // the same window builds the proximity vector, and while losing 40-70% of
+    // advertisements is very likely hurting the device census too (a plausible
+    // contributor to the n=8..31 vector-size churn seen in the field), that part
+    // is an inference from a single-advertiser bench, not a measurement. Gating
+    // it on the schedule keeps today's scoring behaviour bit-identical until PDR
+    // is actually switched on.
+    g_ble_scan->setActiveScan(BEACON_SCHEDULE_ENABLE ? false : true);
     g_ble_scan->setInterval(PROX_QUERY_SCAN_DUTY_MS);
     g_ble_scan->setWindow(PROX_QUERY_SCAN_DUTY_MS);
 
@@ -1234,6 +1288,11 @@ static void prox_aligned_active_scan(uint32_t duration_ms) {
     }
     if (g_ble_scan->isScanning()) g_ble_scan->stop();
     imu_burst_submit();
+
+    // Close the scan window so this window's per-device maxima fold into the
+    // cache's rolling history. Must land after the scan has stopped and before
+    // any prox_build_scan_vector() call, so the vector sees a complete window.
+    prox_scan_window_close();
 
     // Restore the low-power passive enforcement scan configuration.
     g_ble_scan->setActiveScan(false);
@@ -1788,7 +1847,40 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     // cache, this is the only thing that (re)discovers the anchor's BLE MAC (the
     // scan callbacks populate the AnchorRecord as a side effect), so it must run
     // before the MAC check — there is no separate background scan in enforcement.
-    prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+    // Full-duty observation window (§3.3), not the 700 ms discovery scan: this is
+    // the sample the score is computed from, and 700 ms was too short to census
+    // the device population reliably.
+    //
+    // PDR must know whose slots to count BEFORE the window opens, so the anchor's
+    // MAC is looked up first. On the very first query after provisioning it is not
+    // known yet — the scan below is what discovers it — and passing nullptr makes
+    // the PDR channel abstain for that one poll rather than count a stranger's
+    // beacons.
+    {
+        const uint8_t *pre_mac = nullptr;
+        for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
+            if (g_anchor_records[i].valid && g_anchor_records[i].bleMacValid &&
+                uuid_eq(g_anchor_records[i].uuid, e->anchorId)) {
+                pre_mac = g_anchor_records[i].bleMac;
+                break;
+            }
+        }
+        prox_obs_begin(pre_mac);
+    }
+
+    prox_aligned_active_scan(PROX_OBSERVE_WINDOW_MS);
+
+    // Reduce the window to hits/covered and queue the log-LR for this tick's
+    // emission. Must happen before prox_hmm_tick() below, on every path.
+    uint8_t pdr_hits = 0, pdr_cov = 0;
+    const int pdr_used = prox_obs_close(&pdr_hits, &pdr_cov);
+    if (pdr_cov) {
+        int32_t pdr_ll = 0;
+        prox_pdr_state(nullptr, nullptr, &pdr_ll);
+        Serial.printf("[PROX] PDR %u/%u slots%s ll_q8=%d\n",
+                      (unsigned)pdr_hits, (unsigned)pdr_cov,
+                      pdr_used ? "" : " (abstained)", (int)pdr_ll);
+    }
 
     AnchorRecord *rec = nullptr;
     for (int i = 0; i < MAX_ANCHOR_RECORDS; i++) {
@@ -1882,7 +1974,7 @@ static bool find_anchor_ble_addr(const uint8_t uuid[16], uint8_t out_mac[6],
 // returns the raw result and is keyed by anchor UUID rather than an Event.
 // Returns false (skip, retry next cycle) if the anchor is not yet in range.
 static bool calib_burst_once(const uint8_t uuid[16], uint8_t phase, ProxScoreResult *out) {
-    prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+    prox_aligned_active_scan(PROX_OBSERVE_WINDOW_MS);
 
     uint8_t mac[6];
     uint8_t addr_type;
@@ -1895,6 +1987,14 @@ static bool calib_burst_once(const uint8_t uuid[16], uint8_t phase, ProxScoreRes
     }
     Serial.printf("[CALIB] querying anchor %02X:%02X:%02X:%02X:%02X:%02X (type=%d)\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], addr_type);
+
+    // Hold one GATT link open for the whole burst instead of reconnecting per
+    // sample. At the EDGE position the connect alone costs seconds, which is why
+    // a time-boxed EDGE leg collected 3 samples against INSIDE's 16 and the
+    // calibration was rejected for having too few — with scores that separated
+    // cleanly. Best-effort: if the session cannot open, every query just falls
+    // back to its own connect exactly as before.
+    if (!prox_session_active()) prox_session_begin(mac, addr_type);
 
     // Include WiFi APs in the vector (same as enforcement) for a consistent
     // fingerprint. Safe here: calibration only queries while the phone is
@@ -2031,11 +2131,13 @@ static void calib_begin_abort(const uint8_t uuid[16]) {
     // been suppressed mid-session by onDisconnect).
     calib_yield_radio_to_phone();
     Serial.println("[CALIB] ABORT");
+    prox_session_end();
     notify_calib_progress(3);
 }
 
 static void calib_finish(uint8_t state) {
     g_calib_active = false;
+    prox_session_end();
     // The phone is disconnected (Option A) and must now reconnect to advance the
     // flow. Hand the radio back (re-advertise) and stay awake/connectable through
     // the reconnect gap so it can rediscover the calibration characteristic
@@ -2079,7 +2181,9 @@ static void calib_tick(uint32_t now_ms) {
         }
         if (g_calib_next_ms != 0 && now_ms < g_calib_next_ms) return;
 
-        prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+        // FINALIZE opens its own link; never leave a burst session behind it.
+        prox_session_end();
+        prox_aligned_active_scan(PROX_OBSERVE_WINDOW_MS);
         uint8_t mac[6], addr_type;
         if (find_anchor_ble_addr(g_calib_uuid, mac, &addr_type)) {
             uint8_t thr = 0, conf = 0; uint16_t in_n = 0, ed_n = 0;
@@ -2120,6 +2224,10 @@ static void calib_tick(uint32_t now_ms) {
     // what stalled the connect and stopped the anchor being scored near the end of
     // the EDGE phase, then broke FINALIZE. Just idle until the deadline.
     if ((int32_t)(g_calib_deadline_ms - now_ms) <= CALIB_QUIET_TAIL_MS) {
+        // Drop the burst session here, not just the in-flight query: an open
+        // link to the anchor is the same Option A collision hazard as a query
+        // when the phone comes back to advance the phase.
+        prox_session_end();
         notify_calib_progress(1);
         return;
     }
@@ -2233,7 +2341,8 @@ static void bench_tick() {
     if (!uuid) {
         // No anchor: exercise the scan + IMU burst path anyway and report the
         // motion channel, which is the half of P1 that needs no RF at all.
-        prox_aligned_active_scan(ENFORCEMENT_QUERY_SCAN_DURATION_MS);
+        // Same window as the real query path so the timing is representative.
+        prox_aligned_active_scan(PROX_OBSERVE_WINDOW_MS);
         static const char *kMotion[] = { "STILL", "FIDGET", "LOCO", "UNKNOWN" };
         Serial.printf("[BENCH %lu] no anchor in range | motion=%s burst_var=%lu mg^2 cadence=%u\n",
                       (unsigned long)g_bench_cycle, kMotion[prox_motion_state() & 3],
@@ -2439,8 +2548,12 @@ static void enter_enforcement(Event *e) {
     // Proximity v2.1 §5.4.1: the engine holds no state between windows, so cold
     // -start the HMM here — biased to the criterion-satisfying side — before the
     // first condition check runs its query.
-    if (e->criteria == STAY_NEAR || e->criteria == GET_AWAY || e->criteria == PHONE_AWAY)
+    if (e->criteria == STAY_NEAR || e->criteria == GET_AWAY || e->criteria == PHONE_AWAY) {
         prox_hmm_reset(prox_criterion_of(e));
+        // Same cold-start rule for the scan cache: history gathered before this
+        // window was taken somewhere else entirely.
+        prox_scan_cache_reset();
+    }
 
     g_enf.condition_met = is_enforcement_condition_met(e);
     if (!g_enf.condition_met) enforcement_start(e->profile);
