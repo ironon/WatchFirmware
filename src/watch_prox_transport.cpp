@@ -86,6 +86,64 @@ void prox_feed_wifi_aps() {
     }
 }
 
+// ── Persistent query session ────────────────────────────────────────────────
+// See watch_prox_transport.h for why this exists. Only one session at a time.
+static NimBLEClient *g_sess_client    = nullptr;
+static uint8_t       g_sess_mac[6]    = {0};
+static bool          g_sess_valid     = false;
+
+bool prox_session_active(void) {
+    return g_sess_valid && g_sess_client && g_sess_client->isConnected();
+}
+
+void prox_session_end(void) {
+    if (g_sess_client) {
+        if (g_sess_client->isConnected()) g_sess_client->disconnect();
+        NimBLEDevice::deleteClient(g_sess_client);
+        Serial.println("[PROX] Session closed");
+    }
+    g_sess_client = nullptr;
+    g_sess_valid  = false;
+    memset(g_sess_mac, 0, sizeof(g_sess_mac));
+}
+
+bool prox_session_begin(const uint8_t bleMac_be[6], uint8_t addr_type) {
+    prox_session_end();     // never stack sessions
+
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    if (scan && scan->isScanning()) scan->stop();
+
+    NimBLEAddress addr(bleMac_be, addr_type);
+    NimBLEClient *client = NimBLEDevice::createClient();
+    if (!client) return false;
+
+    NimBLEDevice::setMTU(BLE_REQUESTED_MTU);
+    client->setConnectionParams(12, 12, 0, 400);
+    client->setConnectTimeout(PROX_CONNECT_TIMEOUT_MS);
+
+    unsigned long t0 = millis();
+    if (!client->connect(addr)) {
+        Serial.printf("[PROX] Session connect failed after %lu ms (rc=%d) — "
+                      "falling back to per-query connects\n",
+                      millis() - t0, client->getLastError());
+        NimBLEDevice::deleteClient(client);
+        return false;
+    }
+    if (!client->getService(ANCHOR_SERVICE_UUID)) {
+        Serial.println("[PROX] Session: anchor service not found");
+        client->disconnect();
+        NimBLEDevice::deleteClient(client);
+        return false;
+    }
+
+    g_sess_client = client;
+    g_sess_valid  = true;
+    memcpy(g_sess_mac, bleMac_be, 6);
+    Serial.printf("[PROX] Session open (connected in %lu ms, RSSI=%d)\n",
+                  millis() - t0, client->getRssi());
+    return true;
+}
+
 bool prox_query_anchor(const uint8_t bleMac_be[6],
                        uint8_t addr_type,
                        const ProxScanVector &vec,
@@ -95,6 +153,10 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
                        uint8_t *out_near_threshold) {
     if (out_dock) *out_dock = -1;  // unknown until read (fail-open on the dock signal)
     if (out_near_threshold) *out_near_threshold = 0;
+
+    // Reuse an open session only if it is still connected AND aimed at this
+    // anchor; anything else takes the ordinary connect-per-query path.
+    const bool reuse = prox_session_active() && memcmp(g_sess_mac, bleMac_be, 6) == 0;
     // Convert big-endian MAC to NimBLE little-endian format
     // print everything about this query
     // Serial.printf("[PROX] Querying anchor %02X:%02X:%02X:%02X:%02X:%02X (addr_type=%d) with %d devices\n",
@@ -113,43 +175,55 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
     // The ESP32 controller cannot reliably initiate a connection while a scan is
     // in progress. Stop the background scan first (and report it, so a recurring
     // "scan was active" line flags this as the failure mode if connects still fail).
-    NimBLEScan *scan = NimBLEDevice::getScan();
-    if (scan && scan->isScanning()) {
-        Serial.println("[PROX] Scan was active — stopping before connect");
-        scan->stop();
+    NimBLEClient *client = g_sess_client;
+    if (!reuse) {
+        NimBLEScan *scan = NimBLEDevice::getScan();
+        if (scan && scan->isScanning()) {
+            Serial.println("[PROX] Scan was active — stopping before connect");
+            scan->stop();
+        }
+
+        client = NimBLEDevice::createClient();
+        if (!client) {
+            Serial.println("[PROX] FAIL: createClient() returned null");
+            return false;
+        }
+
+        // Set desired MTU before connecting so it is negotiated on connection
+        NimBLEDevice::setMTU(BLE_REQUESTED_MTU);
+
+        client->setConnectionParams(12, 12, 0, 400); // fast connection
+        client->setConnectTimeout(PROX_CONNECT_TIMEOUT_MS); // fail fast on a radio collision (default 30 s)
+        Serial.printf("[PROX] Connecting to %s ...\n", addr.toString().c_str());
+        unsigned long t_connect = millis();
+        if (!client->connect(addr)) {
+            Serial.printf("[PROX] FAIL: connect() returned false after %lu ms (last rc=%d)\n",
+                          millis() - t_connect, client->getLastError());
+            NimBLEDevice::deleteClient(client);
+            return false;
+        }
+        Serial.printf("[PROX] Connected in %lu ms (RSSI=%d), discovering service...\n",
+                      millis() - t_connect, client->getRssi());
     }
 
-    NimBLEClient *client = NimBLEDevice::createClient();
-    if (!client) {
-        Serial.println("[PROX] FAIL: createClient() returned null");
-        return false;
-    }
-    // Serial.println("[PROX] Client created");
-
-    // Set desired MTU before connecting so it is negotiated on connection
-    NimBLEDevice::setMTU(BLE_REQUESTED_MTU);
-    // Serial.printf("[PROX] Requested MTU=%d\n", BLE_REQUESTED_MTU);
-
-    client->setConnectionParams(12, 12, 0, 400); // fast connection
-    client->setConnectTimeout(PROX_CONNECT_TIMEOUT_MS); // fail fast on a radio collision (default 30 s)
-    Serial.printf("[PROX] Connecting to %s ...\n", addr.toString().c_str());
-    unsigned long t_connect = millis();
-    if (!client->connect(addr)) {
-        Serial.printf("[PROX] FAIL: connect() returned false after %lu ms (last rc=%d)\n",
-                      millis() - t_connect, client->getLastError());
-        NimBLEDevice::deleteClient(client);
-        return false;
-    }
-    Serial.printf("[PROX] Connected in %lu ms (RSSI=%d), discovering service...\n",
-                  millis() - t_connect, client->getRssi());
+    // Single exit path. A one-shot connection is always torn down; a reused
+    // session is kept alive on success and dropped on any failure, so a stale
+    // or half-dead link can never be handed to the next query.
+    auto finish = [&](bool ok) -> bool {
+        if (!reuse) {
+            client->disconnect();
+            NimBLEDevice::deleteClient(client);
+        } else if (!ok) {
+            prox_session_end();
+        }
+        return ok;
+    };
 
     // Serial.printf("[PROX] Discovering service %s ...\n", ANCHOR_SERVICE_UUID);
     NimBLERemoteService *svc = client->getService(ANCHOR_SERVICE_UUID);
     if (!svc) {
         Serial.println("[PROX] FAIL: anchor service not found on peer");
-        client->disconnect();
-        NimBLEDevice::deleteClient(client);
-        return false;
+        return finish(false);
     }
     // Serial.println("[PROX] Service found");
 
@@ -163,9 +237,7 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
                   scoreChar ? "found" : "MISSING");
     if (!vecChar || !scoreChar) {
         Serial.println("[PROX] FAIL: required characteristic missing");
-        client->disconnect();
-        NimBLEDevice::deleteClient(client);
-        return false;
+        return finish(false);
     }
 
     // Calibration-v2: set the anchor's phase on this connection before submitting
@@ -196,11 +268,29 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
         size_t sz = 1u + (size_t)send_vec.count * 8u;
         if (sz <= max_payload) break;
         send_vec.count--;
-        if (mtu < PROX_MIN_MTU_BYTES) {
-            Serial.printf("[PROX] MTU %d below minimum; truncating vector\n", mtu);
-        }
     }
     if (send_vec.count != vec.count) {
+        // The target anchor's OWN beacon must survive truncation. The vector is
+        // ordered strongest-first and truncation drops the tail, but the anchor
+        // is not necessarily loud — measured at -80 dBm in a real install, which
+        // in a busy room sits below plenty of third-party emitters. The anchor
+        // now scores that level directly (self_score_delta), and it is also what
+        // gates fingerprint training, so dropping it silently disarms both.
+        // Displace the weakest surviving entry instead.
+        bool kept = false;
+        for (int i = 0; i < send_vec.count && !kept; ++i)
+            kept = (send_vec.devices[i].type == PROX_TYPE_BLE) &&
+                   memcmp(send_vec.devices[i].mac, bleMac_be, 6) == 0;
+        if (!kept && send_vec.count > 0) {
+            for (int i = send_vec.count; i < vec.count; ++i) {
+                if (vec.devices[i].type == PROX_TYPE_BLE &&
+                    memcmp(vec.devices[i].mac, bleMac_be, 6) == 0) {
+                    send_vec.devices[send_vec.count - 1] = vec.devices[i];
+                    Serial.println("[PROX] (anchor's own beacon rescued from truncation)");
+                    break;
+                }
+            }
+        }
         Serial.printf("[PROX] Vector truncated from %d to %d devices to fit MTU\n",
                       vec.count, send_vec.count);
     }
@@ -208,10 +298,7 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
     uint8_t buf[1 + PROX_MAX_DEVICES * 8];
     size_t sz = prox_serialize_vector(&send_vec, buf, sizeof(buf));
     if (sz == 0) {
-        // Serial.println("[PROX] FAIL: prox_serialize_vector returned 0 bytes");
-        client->disconnect();
-        NimBLEDevice::deleteClient(client);
-        return false;
+        return finish(false);
     }
     // Serial.printf("[PROX] Writing %u-byte vector (%d devices) to vector char ...\n",
                 //   (unsigned)sz, send_vec.count);
@@ -220,9 +307,7 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
     if (!vecChar->writeValue(buf, sz, true)) {
         Serial.printf("[PROX] FAIL: writeValue() returned false (rc=%d)\n",
                       client->getLastError());
-        client->disconnect();
-        NimBLEDevice::deleteClient(client);
-        return false;
+        return finish(false);
     }
     // Serial.println("[PROX] Vector write acknowledged");
 
@@ -231,10 +316,7 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
     std::string score_val = scoreChar->readValue();
     // Serial.printf("[PROX] Score read returned %u bytes\n", (unsigned)score_val.size());
     if (score_val.size() < 2) {
-        // Serial.println("[PROX] FAIL: score read too short (<2 bytes)");
-        client->disconnect();
-        NimBLEDevice::deleteClient(client);
-        return false;
+        return finish(false);
     }
 
     result.score = (uint8_t)score_val[0];
@@ -262,9 +344,7 @@ bool prox_query_anchor(const uint8_t bleMac_be[6],
         }
     }
 
-    client->disconnect();
-    NimBLEDevice::deleteClient(client);
-    return true;
+    return finish(true);
 }
 
 ProxProximity prox_interpret_score(uint8_t score, uint8_t near_threshold) {
