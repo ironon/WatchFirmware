@@ -1805,14 +1805,40 @@ static void notify_seen_anchors() {
 // PROX_V2_AUTHORITATIVE is 0 the v0.8 verdict remains binding, so an evening of
 // field logging can show what v2 *would* have done before it is allowed to do
 // it. Flipping the constant to 1 is the whole of the cutover.
-static ProxProximity prox_decide(ProxProximity v08, ProxDecision v2, const char *what) {
+static ProxProximity prox_decide(ProxProximity v08, ProxDecision v2, const char *what,
+                                 int score = -1, int thr = -1) {
     static const char *kName[] = { "NEAR", "AWAY", "AMBIG" };
     ProxProximity v2p = (v2 == PROX_HMM_NEAR) ? PROX_NEAR
                       : (v2 == PROX_HMM_AWAY) ? PROX_AWAY : PROX_AMBIGUOUS;
     static const char *kMotion[] = { "STILL", "FIDGET", "LOCO", "UNKNOWN" };
-    Serial.printf("[PROXv2] %s: v0.8=%s v2=%s p_near=%u motion=%s lam=%d%s\n",
+
+    // The inputs, not just the verdict. lam alone cannot be debugged after the
+    // fact: a stalled posterior looks identical whether the score sat in the
+    // dead zone, the draw gate withheld the weight, or PDR abstained. Print the
+    // emission and the PDR channel so a night of logs is self-explaining.
+    char emit[40]; emit[0] = '\0';
+    if (score >= 0 && thr > 0) {
+        int d = score - thr;
+        int raw = (d > HMM_EMIT_DEADZONE_U8)  ? (d - HMM_EMIT_DEADZONE_U8) * HMM_EMIT_SLOPE_Q8
+                : (d < -HMM_EMIT_DEADZONE_U8) ? (d + HMM_EMIT_DEADZONE_U8) * HMM_EMIT_SLOPE_Q8
+                : 0;
+            if (raw >  HMM_EMIT_MAX_Q8) raw =  HMM_EMIT_MAX_Q8;
+        if (raw < -HMM_EMIT_MAX_Q8) raw = -HMM_EMIT_MAX_Q8;
+        snprintf(emit, sizeof(emit), " score=%d/%d emit=%+d%s",
+                 score, thr, raw, raw == 0 ? "(DEADZONE)" : "");
+    }
+    char pdr[40]; pdr[0] = '\0';
+    {
+        uint8_t rate = 0, cov = 0; int32_t llr = 0;
+        if (prox_pdr_state(&rate, &cov, &llr))
+            snprintf(pdr, sizeof(pdr), " pdr=%u%%/%u llr=%+d", (rate * 100u) / 255u, cov, (int)llr);
+        else
+            snprintf(pdr, sizeof(pdr), " pdr=ABSTAIN(cov=%u)", cov);
+    }
+    Serial.printf("[PROXv2] %s: v0.8=%s v2=%s p_near=%u motion=%s lam=%d%s%s%s\n",
                   what, kName[v08], kName[v2p], prox_hmm_p_near_u8(),
                   kMotion[prox_motion_state() & 3], (int)prox_hmm_logodds_q8(),
+                  emit, pdr,
                   (v08 != v2p) ? "  <-- DIVERGED" : "");
 #if PROX_V2_AUTHORITATIVE
     return v2p;
@@ -1934,7 +1960,8 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     // motion channel alone; P2's trailer supplies the anchor's own claim.
     ProxScoreResult2 r2;
     r2.score = result.score; r2.flags = result.flags; r2.neff = 0; r2.near_thr = near_thr;
-    return prox_decide(v08, prox_hmm_tick(&r2), "score");
+    return prox_decide(v08, prox_hmm_tick(&r2), "score", result.score,
+                       near_thr ? near_thr : PROX_CONFIDENCE_THRESHOLD_U8);
 }
 
 // ============================================================
@@ -1974,6 +2001,30 @@ static bool find_anchor_ble_addr(const uint8_t uuid[16], uint8_t out_mac[6],
 // returns the raw result and is keyed by anchor UUID rather than an Event.
 // Returns false (skip, retry next cycle) if the anchor is not yet in range.
 static bool calib_burst_once(const uint8_t uuid[16], uint8_t phase, ProxScoreResult *out) {
+    // Close the burst session BEFORE the observation window, not after it.
+    //
+    // This is what kept the self-RSSI discriminant permanently disarmed. BLE
+    // legacy advertising stops on connection establishment, and the burst
+    // session (opened below) is held across samples — so from the second sample
+    // onward the observation scan ran while the link was up and the anchor was
+    // silent. Measured, one INSIDE leg: self=-70 on the first query and self=0
+    // on all fifteen that followed, once the 40 s cache TTL aged out the last
+    // pre-session beacon. calib_learn_self_levels() then found nothing to learn
+    // and FINALIZE reported "self-RSSI term OFF" — losing the single most
+    // discriminative feature in the score (12 dB between demonstrated positions
+    // at a real install, d' ~ 4-6 on its own, against d' = 1.2 for everything
+    // else combined).
+    //
+    // The anchor re-arms its advertiser every 250 ms from the beacon schedule,
+    // but that cannot help while the watch itself is holding the connection
+    // open. The only reliable fix is for the window not to overlap the link.
+    //
+    // The cost is the per-sample connect the session existed to avoid. That is
+    // the right trade here: the same speedup also collapsed per-sample
+    // advertising coverage (vector sizes 13..31, shared counts 10..19 in that
+    // run), and Pearson's standard error goes as 1/sqrt(k-3). Reconnecting buys
+    // back both the self-RSSI term and the sample size the correlation needs.
+    prox_session_end();
     prox_aligned_active_scan(PROX_OBSERVE_WINDOW_MS);
 
     uint8_t mac[6];
@@ -1988,12 +2039,17 @@ static bool calib_burst_once(const uint8_t uuid[16], uint8_t phase, ProxScoreRes
     Serial.printf("[CALIB] querying anchor %02X:%02X:%02X:%02X:%02X:%02X (type=%d)\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], addr_type);
 
-    // Hold one GATT link open for the whole burst instead of reconnecting per
-    // sample. At the EDGE position the connect alone costs seconds, which is why
-    // a time-boxed EDGE leg collected 3 samples against INSIDE's 16 and the
-    // calibration was rejected for having too few — with scores that separated
-    // cleanly. Best-effort: if the session cannot open, every query just falls
-    // back to its own connect exactly as before.
+    // Open the link for the write/read only — the scan above deliberately ran
+    // without it (see the note at the top of this function). The session is
+    // still used rather than a bare connect so the write and the read share one
+    // link, and so a failure drops it cleanly for the next sample.
+    //
+    // Historical note: this session originally spanned the whole burst, to stop
+    // a time-boxed EDGE leg collecting 3 samples against INSIDE's 16 when the
+    // per-sample connect cost seconds. If the EDGE leg starves again, fix it by
+    // making the anchor advertise while connected (its onConnect already tries;
+    // verify with the [BLE] adv diagnostic) — NOT by holding the link across the
+    // observation window again, which is what disarmed self-RSSI.
     if (!prox_session_active()) prox_session_begin(mac, addr_type);
 
     // Include WiFi APs in the vector (same as enforcement) for a consistent
@@ -2255,7 +2311,25 @@ static bool is_enforcement_condition_met(const Event *e) {
     if (!e) return false;
     // Donning grace (§5.4.4): during the grace window the condition short-circuits
     // to met — no motor/buzzer output — regardless of the physical criteria.
-    if (grace_active()) return true;
+    //
+    // The ENGINE still runs, though. Grace is precisely when the user is putting
+    // the watch on, and that is the only burst of genuine LOCOMOTION most
+    // enforcement windows ever see. The HMM counts evidence in independent
+    // fading draws, not in samples (§4.2): a tick taken while moving is worth a
+    // full draw, while a motionless wrist earns ~0 and is capped at a single
+    // one-draw level for the entire window. Returning early therefore threw away
+    // the only draws on offer and left the filter sitting at its cold start when
+    // grace expired — with a wrist that had just gone still, i.e. structurally
+    // unable to accumulate its way to a verdict afterwards.
+    //
+    // Observe during grace; enforce after it. The query's cost is one scan per
+    // poll over a bounded window, and the return value is deliberately discarded.
+    if (grace_active()) {
+        if (e->criteria == STAY_NEAR || e->criteria == GET_AWAY ||
+            e->criteria == PHONE_AWAY)
+            (void)query_anchor_proximity(e);
+        return true;
+    }
     switch (e->criteria) {
         case STAY_NEAR:
         case GET_AWAY: {
@@ -2304,11 +2378,28 @@ static bool is_enforcement_condition_met(const Event *e) {
     return false;
 }
 
-#if BENCH_NO_SLEEP
+#if BENCH_HARNESS
 // ============================================================
 //  Bench harness — proximity v2.1 P1 shadow logging (§10-A P1 acceptance)
 //
-//  Compiled ONLY into a -DBENCH_NO_SLEEP build. The shadow-logging acceptance
+//  Opt-in via -DBENCH_HARNESS=1, and SEPARATE from -DBENCH_NO_SLEEP.
+//
+//  These two used to be the same flag, which is what made "NO_SLEEP builds
+//  crash occasionally" true: the harness central-connects to an anchor every
+//  5 s (is_enforcement_condition_met -> query_anchor_proximity), with no check
+//  on whether the phone holds the peripheral link. Phone connects while one of
+//  those is in flight -> concurrent central+peripheral -> the NimBLE
+//  ble_hs_timer_exp / ble_gap_update_next_exp crash (§10.1 spike). A tethered
+//  build needs sleep suppressed so USB-CDC survives for reflashing; it does NOT
+//  need a synthetic enforcement loop. Keeping them separate means the tethered
+//  builds used for phone-facing work carry no synthetic central connects at all.
+//
+//  The harness now also honours the same radio serialisation as every other
+//  central-connect site (see radio_central_acquire), so enabling it alongside a
+//  phone is no longer an instant crash — but leave it off unless you are
+//  actually collecting shadow logs.
+//
+//  The shadow-logging acceptance
 //  item needs the v2 decision computed beside the v0.8 one on real hardware, but
 //  reaching ENFORCEMENT normally requires a paired phone, a pushed schedule, a
 //  set clock and a live window. This drives the *same* code path directly:
@@ -2369,7 +2460,14 @@ static void bench_tick() {
             break;
         }
         memset(&g_bench_event, 0, sizeof(g_bench_event));
+        // -DBENCH_PHONE_AWAY=1 drives the Mode B fusion (dock read + near_phone +
+        // tolerance) instead of stayNear, so the phoneAway path can be exercised
+        // on hardware without encoding and pushing a whole schedule blob.
+#if BENCH_PHONE_AWAY
+        g_bench_event.criteria    = PHONE_AWAY;
+#else
         g_bench_event.criteria    = STAY_NEAR;
+#endif
         g_bench_event.hasAnchorId = true;
         memcpy(g_bench_event.anchorId, uuid, 16);
         g_bench_armed = true;
@@ -2385,7 +2483,7 @@ static void bench_tick() {
                   (unsigned long)prox_motion_burst_var(), prox_motion_burst_cadence(),
                   (unsigned long)ESP.getFreeHeap());
 }
-#endif // BENCH_NO_SLEEP
+#endif // BENCH_HARNESS
 
 // ============================================================
 //  Enforcement profile playback
@@ -5009,7 +5107,7 @@ void loop() {
         }
     }
 
-#if BENCH_NO_SLEEP
+#if BENCH_HARNESS
     // Ahead of the UNPAIRED early-return: the bench harness must run on a
     // factory-blank watch, which is exactly the state a tethered board is in.
     bench_tick();
