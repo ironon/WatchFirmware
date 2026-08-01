@@ -1859,6 +1859,58 @@ static uint8_t prox_criterion_of(const Event *e) {
     }
 }
 
+// ── Radio role serialisation (ble_hs_timer_exp crash fix) ───────────────────
+//
+// This chip cannot be a BLE peripheral and a BLE central at the same time. Doing
+// both asserts inside NimBLE's host timer:
+//
+//     assert failed: ble_hs_timer_exp ble_hs.c:466 (0)
+//
+// captured on hardware 2026-08-01 at the exact instant of "[PROX] Connecting to
+// 38:44:be:8a:e5:26 ..." with the app connected. The 2026-07 toolchain spike
+// (tests/version_bump.md §6) reproduced the same failure on IDF 5.5.5 /
+// NimBLE-Arduino 2.5.0 as a Load access fault in ble_gap_update_next_exp, so it
+// is a genuine NimBLE concurrency bug and not a config artifact — upgrading does
+// not fix it, and Option A exists precisely because of it.
+//
+// Calibration has always serialised the two roles (calib_radio_go_dark). The
+// enforcement poll never did, which is why a phoneAway window — where the watch
+// central-connects to the anchor on every poll while the user is told to keep
+// the app open — crashed the watch and rebooted it mid-commitment.
+//
+// The phone link is EVICTED rather than deferred to. Deferring ("skip the poll
+// while the app is connected") would make an open app a way to silence
+// enforcement, which §9 explicitly forbids: the app must never be an
+// in-the-moment escape hatch. Dropping the link is recoverable — the app
+// reconnects — whereas a suppressed poll is a hole in the commitment.
+static bool g_radio_yielded_for_central = false;
+
+static void radio_acquire_for_central(const char *why) {
+    // Non-connectable first, so the app cannot race back in behind the
+    // disconnect and land us in the very state we are clearing.
+    NimBLEDevice::getAdvertising()->stop();
+    g_radio_yielded_for_central = true;
+
+    NimBLEServer *srv = NimBLEDevice::getServer();
+    if (srv && g_bt_connected) {
+        Serial.printf("[RADIO] evicting phone link for %s (central connect)\n", why);
+        for (uint16_t h : srv->getPeerDevices()) srv->disconnect(h);
+        // Let the host actually tear the link down before we start the central
+        // procedure; returning too early is the same race in slow motion.
+        uint32_t t0 = millis();
+        while (g_bt_connected && (millis() - t0) < 600) delay(10);
+        if (g_bt_connected)
+            Serial.println("[RADIO] WARNING: phone link still up after 600ms");
+    }
+}
+
+static void radio_release_after_central() {
+    if (!g_radio_yielded_for_central) return;
+    g_radio_yielded_for_central = false;
+    // Calibration owns the radio across a whole phase; don't re-advertise under it.
+    if (!g_calib_active) NimBLEDevice::getAdvertising()->start();
+}
+
 // Perform an anchor-based proximity query and return NEAR / AWAY / AMBIGUOUS.
 // AMBIGUOUS = "could not determine" (anchor not discovered, connect failed
 // without a clear far-RSSI signal, or a mid-range score). Callers map AMBIGUOUS
@@ -1929,7 +1981,15 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
 
     ProxScoreResult result;
     uint8_t near_thr = 0;
-    if (!prox_query_anchor(rec->bleMac, rec->bleAddrType, vec, result, out_dock, 0xFF, &near_thr)) {
+    // Central connect starts here — the phone link must be gone before it does.
+    // Calibration drives its own serialisation (Option A) and has already gone
+    // dark, so don't fight it for the radio.
+    const bool own_radio = !g_calib_active;
+    if (own_radio) radio_acquire_for_central("proximity poll");
+    const bool queried = prox_query_anchor(rec->bleMac, rec->bleAddrType, vec,
+                                           result, out_dock, 0xFF, &near_thr);
+    if (own_radio) radio_release_after_central();
+    if (!queried) {
         // Connection establishment fails at much weaker RSSI (~-88 dBm) than
         // advertisement reception, so a failed connect + a weak recent ad RSSI
         // is strong evidence the watch is FAR from the anchor. The v0.8 rule
@@ -4162,7 +4222,12 @@ class WatchServerCallbacks : public NimBLEServerCallbacks {
         // an in-flight anchor connect and crash NimBLE (assert ble_hs_timer_exp).
         // The session re-advertises itself at each phase boundary
         // (calib_yield_radio_to_phone). Otherwise, restore advertising as normal.
-        if (g_calib_active) {
+        // Same reasoning for g_radio_yielded_for_central: this callback fires as a
+        // direct result of the eviction in radio_acquire_for_central(), and
+        // re-advertising here would hand the phone a window to reconnect straight
+        // into the central connect we just cleared the radio for — the exact race,
+        // one callback later. radio_release_after_central() restores advertising.
+        if (g_calib_active || g_radio_yielded_for_central) {
             NimBLEDevice::getAdvertising()->stop();
         } else {
             NimBLEDevice::getAdvertising()->start();
