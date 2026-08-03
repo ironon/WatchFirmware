@@ -17,12 +17,14 @@
 #include <time.h>
 #include <sys/time.h>   // settimeofday() for the Time characteristic (§5.6)
 #include <string.h>
+#include "beep_vocab.h"   // shared watch/anchor buzzer vocabulary
 #include "imu.h"
 #include "led_status.h"           // LED status ring (§5.7)
 #include "proximity.h"            // shared proximity engine (../proximity_engine)
 #include "watch_prox_transport.h" // re-homed transport/interpret + WiFi feeding
 #include <ArduinoLog.h>
 #include <esp_system.h>
+#include <nvs_flash.h>            // BENCH_NO_SLEEP serial NVS wipe (0xAF)
 
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
@@ -180,7 +182,7 @@
 #define IR_WORN_DEBOUNCE_SAMPLES           5     // consecutive equal samples to flip state
 #define IR_WORN_SAMPLE_INTERVAL_MS      1000     // ms between reflection samples
 #define IR_EMIT_SETTLE_US                500     // emitter rise/settle before ADC read
-#define IR_WORN_THRESHOLD                500     // min ambient-subtracted ADC delta to count as worn
+#define IR_WORN_THRESHOLD                320     // min ambient-subtracted ADC delta to count as worn
 #define IR_WORN_HIGHER_MEANS_WORN       false     // false if the readout is inverted (skin lowers the delta)
 
 // Enforcement escalation
@@ -271,6 +273,10 @@ enum EnforcementProfile      : uint8_t {
 };
 enum AnchorEnforcementProfile : uint8_t { AP_LIGHT=0, AP_MEDIUM=1, AP_HARD=2 };
 enum ActivityState            { STATE_UNPAIRED, STATE_DORMANT, STATE_DORMANT_SLEEP, STATE_ENFORCEMENT };
+
+// Stub proximity engine for bisecting enforcement failures. Included here rather
+// than with the other headers because it switches on Criteria, defined above.
+#include "prox_v0_dummy.h"
 
 // ============================================================
 //  Data structures
@@ -645,20 +651,37 @@ static uint16_t read_battery_mv() {
 // ---- LED status helpers (§5.7) ----
 static time_t local_now();  // fwd decl (defined below) — for the DORMANT clock
 
-// Snapshot current watch state for the LED renderer. Decouples led_status.cpp
-// from the state machine — it just gets the bits it needs, plus the current
-// local time for the DORMANT analog clock (§5.7.4).
-static LedStatusInput led_status_input() {
-    LedStatusInput in;
-    in.unpaired      = (g_activity_state == STATE_UNPAIRED);
-    in.enforcing     = (g_activity_state == STATE_ENFORCEMENT);
-    in.condition_met = g_enf.condition_met;
-    time_t lt = local_now();
-    struct tm ti;
-    gmtime_r(&lt, &ti);
-    in.hour   = ti.tm_hour;
-    in.minute = ti.tm_min;
-    return in;
+// Is the active commitment compliant ONLY because a tolerance window is still
+// running? Derived from g_phone_near_since_ts rather than a second flag set
+// inside is_enforcement_condition_met(), so there is one source of truth and no
+// way for the LED to latch on after the condition changes.
+//
+// phoneAway is currently the only criterion with a tolerance of this shape: the
+// user is demonstrably near the docked phone (the criterion is failing) but
+// PHONE_AWAY_TOLERANCE_S has not elapsed, so "a quick check is fine" still
+// holds. Donning grace (§5.4.4) is deliberately NOT included — it short-circuits
+// before the criterion is evaluated, so during it the watch genuinely does not
+// know whether the criterion would fail, and showing a countdown would be a
+// claim it cannot support.
+//
+// When `out_progress_u8` is non-NULL and the window is running, it receives how
+// far through it we are, which drives how much of the LED ring is lit — so the
+// user can see how long they have, not merely that a clock is ticking.
+//
+// Scaled on elapsed+1 rather than elapsed, because time() is whole seconds: the
+// last second the window is alive is elapsed == TOLERANCE-1, and that has to map
+// to 255 (a full ring, "the alarm is next"). Scaling on elapsed alone would top
+// out at 250/255 and the ring would never actually fill.
+static bool tolerance_grace_active(uint8_t *out_progress_u8 = nullptr) {
+    if (g_activity_state != STATE_ENFORCEMENT) return false;
+    if (!g_active_event || g_active_event->criteria != PHONE_AWAY) return false;
+    if (g_phone_near_since_ts == 0) return false;      // away from the phone = plainly compliant
+    uint32_t now_ts   = (uint32_t)time(nullptr);
+    uint32_t elapsed  = now_ts - g_phone_near_since_ts;
+    if (elapsed >= (uint32_t)PHONE_AWAY_TOLERANCE_S) return false;
+    if (out_progress_u8)
+        *out_progress_u8 = (uint8_t)(((elapsed + 1) * 255UL) / (uint32_t)PHONE_AWAY_TOLERANCE_S);
+    return true;
 }
 
 // Map the ESP light-sleep wakeup cause to the LED wake-cause flash. In DORMANT
@@ -673,17 +696,100 @@ static LedWakeCause led_wake_cause_from_esp() {
     }
 }
 
+// Output transition logging (`[OUT]`). The enforcement bug under investigation is
+// "the watch stops beeping for 30–90 s and then beeps again", which is a claim
+// about *when the buzzer pin changed* — and nothing in the firmware recorded
+// that. Every path that drives an output goes through these two setters, so
+// logging the edges here (and only the edges — the profile runner calls them
+// every loop pass) gives an exact, complete timeline with no other call site
+// needing to remember to log. `who` names the caller so a silence can be
+// attributed: profile step, condition transition, or one of the beep helpers.
+static bool g_out_motor_on  = false;
+static bool g_out_buzzer_on = false;
+static const char *g_out_who = "boot";
+
+// Combined output envelope, for the LED renderer (§5.7). The alarm ring blinks
+// in phase with this rather than free-running on millis(), so light and sound
+// rise and fall together instead of drifting against each other. Tracked here,
+// off the actual setters, rather than off the profile table: every path that
+// drives an output funnels through set_motor/set_buzzer, so this also covers the
+// standalone beep helpers, and it cannot fall out of step with what the pins are
+// really doing.
+static bool     g_out_any_on   = false;
+static uint32_t g_out_edge_ms  = 0;
+
+static inline void outputs_note_caller(const char *who) { g_out_who = who; }
+
+// Called after each setter; records when the combined envelope last flipped.
+static inline void outputs_mark_edge() {
+    bool any = g_out_motor_on || g_out_buzzer_on;
+    if (any != g_out_any_on) {
+        g_out_any_on  = any;
+        g_out_edge_ms = millis();
+    }
+}
+
+// How the beep-vocabulary player drives the buzzer. Deliberately NOT set_buzzer:
+// that one cancels any running pattern (see below), so routing the player
+// through it would have the player stop itself on its first edge. This keeps the
+// output-envelope bookkeeping up to date, which is what the LED ring follows —
+// so the ring now flashes in exact lockstep with each chirp of the pattern
+// rather than blinking on its own timebase. Edge logging is handled by the
+// player at group granularity; per-chirp [OUT] lines would be six a second.
+static void buzz_pin(bool on) {
+    g_out_buzzer_on = on;
+    outputs_mark_edge();
+    digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
+}
+
 static void set_motor(bool on)  {
+    if (on != g_out_motor_on) {
+        g_out_motor_on = on;
+        Serial.printf("[OUT] motor %s  t=%lums  by=%s\n",
+                      on ? "ON " : "OFF", (unsigned long)millis(), g_out_who);
+    }
+    outputs_mark_edge();
 #if DISABLE_MOTOR
     (void)on;  // motor compiled out — GPIO 10 is the LED ring this rev
 #else
     digitalWrite(VIBRO_PIN, on ? HIGH : LOW);
 #endif
 }
-// set_motor should do nothing for now
-// static void set_motor(bool on)  { }
-static void set_buzzer(bool on) { digitalWrite(BUZZER_PIN, on ? HIGH : LOW); }
+// Direct, un-patterned buzzer control. Manual control WINS: it cancels whatever
+// pattern is playing, so every pre-existing call site (outputs_off(), crash and
+// boot paths) still means exactly what it used to and cannot be overridden a few
+// milliseconds later by a player that is still running.
+static void set_buzzer(bool on) {
+    if (beep_active()) beep_stop(g_out_who);
+    if (on != g_out_buzzer_on) {
+        g_out_buzzer_on = on;
+        Serial.printf("[OUT] buzzer %s t=%lums  by=%s\n",
+                      on ? "ON " : "OFF", (unsigned long)millis(), g_out_who);
+    }
+    outputs_mark_edge();
+    digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
+}
 static void outputs_off()       { set_motor(false); set_buzzer(false); }
+
+// Snapshot current watch state for the LED renderer. Defined here, after the
+// output setters, because the alarm ring blinks in phase with the real output
+// envelope (g_out_any_on / g_out_edge_ms) rather than free-running.
+static LedStatusInput led_status_input() {
+    LedStatusInput in;
+    in.unpaired          = (g_activity_state == STATE_UNPAIRED);
+    in.enforcing         = (g_activity_state == STATE_ENFORCEMENT);
+    in.condition_met     = g_enf.condition_met;
+    in.grace_progress_u8 = 0;
+    in.in_grace          = tolerance_grace_active(&in.grace_progress_u8);
+    in.output_active     = g_out_any_on;
+    in.output_since_ms   = g_out_edge_ms;
+    time_t lt = local_now();
+    struct tm ti;
+    gmtime_r(&lt, &ti);
+    in.hour   = ti.tm_hour;
+    in.minute = ti.tm_min;
+    return in;
+}
 
 // ============================================================
 //  Forward declarations
@@ -1127,12 +1233,13 @@ static AnchorRecord *ensure_anchor_record(const uint8_t *uuid) {
     return &r;
 }
 
+// Generic debug helper: `count` bare ticks. Not part of the vocabulary — it has
+// no assigned meaning, so keep it out of anything a user is meant to interpret.
 void beep(int count) {
+    outputs_note_caller("beep()");
     for (int i = 0; i < count; i++) {
-        set_buzzer(true);
-        delay(100);
-        set_buzzer(false);
-        delay(100);
+        beep_play_blocking(&BEEP_WATCH_TICK, "beep()");
+        if (i < count - 1) delay(120);
     }
 }
 
@@ -1199,10 +1306,9 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
         Serial.printf("[SCAN] Impulse anchor confirmed! RSSI=%d\n", rssi);
 
 #if DEBUG_MODE
-        digitalWrite(BUZZER_PIN, HIGH); delay(60);
-        digitalWrite(BUZZER_PIN, LOW);  delay(80);
-        digitalWrite(BUZZER_PIN, HIGH); delay(60);
-        digitalWrite(BUZZER_PIN, LOW);
+        beep_play_blocking(&BEEP_WATCH_TICK, "dbg_anchor_seen");
+        delay(120);
+        beep_play_blocking(&BEEP_WATCH_TICK, "dbg_anchor_seen");
 #endif
 
         // Populate bleMac in the AnchorRecord if we know this anchor
@@ -1232,8 +1338,7 @@ static void start_ble_scan(uint32_t duration_ms = 300) {
     if (!g_ble_scan) return;
     if (g_ble_scan->isScanning()) return;
 #if DEBUG_MODE
-    digitalWrite(BUZZER_PIN, HIGH); delay(80);
-    digitalWrite(BUZZER_PIN, LOW);
+    beep_play_blocking(&BEEP_WATCH_TICK, "dbg_scan_start");
 #endif
     g_ble_scan->start(duration_ms, false, true);
     g_last_ble_scan_ms = millis();
@@ -1284,6 +1389,12 @@ static void prox_aligned_active_scan(uint32_t duration_ms) {
     uint32_t t0 = millis();
     while (g_ble_scan->isScanning() && millis() - t0 < duration_ms + 200) {
         imu_burst_service();
+        // This loop is where the watch spends most of a poll, and a poll happens
+        // while the alarm may be sounding. Without this the whole scan would land
+        // inside one chirp and hold the buzzer on for a second or more — which is
+        // exactly the anchor's blare, i.e. the one confusion the vocabulary
+        // exists to prevent.
+        beep_service(millis());
         delay(10);
     }
     if (g_ble_scan->isScanning()) g_ble_scan->stop();
@@ -1571,10 +1682,20 @@ static void encode_udp_cmd(uint8_t *buf, uint8_t cmd,
 // Attempt UDP send with retries; returns true on any successful delivery
 static bool udp_send_with_retry(uint32_t ip_nbo, uint16_t port,
                                  const uint8_t *payload, int len) {
-    IPAddress ip(ip_nbo);  // network byte order → IPAddress accepts uint32_t host order
-    // Convert NBO to host order
-    uint32_t host_order = ntohl(ip_nbo);
-    IPAddress dest(host_order);
+    // No byte swap. `ip_nbo` holds the four address octets in on-wire order as
+    // memcpy'd from the app's Anchor IP Table write (§5.6) — i.e. 192.168.1.56
+    // is stored as 0x3801A8C0 on this little-endian core. Arduino's
+    // `IPAddress(uint32_t)` is `_address.dword = address`, a raw union write,
+    // so it wants exactly that layout and reads the octets straight back out.
+    //
+    // The previous `ntohl()` reversed a value that was already correct, sending
+    // every datagram to 56.1.168.192. It failed silently and completely:
+    // `endPacket()` reports success for any routable address, so `success`
+    // became true, which then skipped the broadcast fallback below — the one
+    // path that did work. Net effect: pushing the anchor IP table *disabled*
+    // anchor beeping. Verified by A/B on hardware 2026-08-02 (no stored IP →
+    // anchor beeps the full window; stored IP → anchor never receives a byte).
+    IPAddress dest(ip_nbo);
     for (int attempt = 0; attempt < UDP_RETRY_COUNT; attempt++) {
         if (g_udp.beginPacket(dest, port)) {
             g_udp.write(payload, len);
@@ -1594,7 +1715,11 @@ static void queue_unreachable(const uint8_t *anchor_uuid, const char *name) {
 }
 
 static void send_to_anchors(uint8_t cmd, const Event *e) {
-    if (!g_wifi_connected) return;
+    if (!g_wifi_connected) {
+        Serial.printf("[UDP-TX] cmd=0x%02x NOT SENT: no WiFi — anchor beeping is UDP-only (§5.5.1)\n",
+                      cmd);
+        return;
+    }
     uint8_t pkt[33];
     encode_udp_cmd(pkt, cmd, g_watch_uuid, e->id);
 
@@ -1610,8 +1735,26 @@ static void send_to_anchors(uint8_t cmd, const Event *e) {
                 break;
             }
         }
+        // Log the address actually handed to the socket, dotted-quad, as the UDP
+        // layer will read it. Nothing here reported where a datagram went, and
+        // `endPacket()` succeeds for any routable address — so a wrong
+        // destination is indistinguishable from a delivered one.
+        {
+            char uuid_str[37];
+            uuid_to_str(anchor_uuid, uuid_str);
+            uint32_t raw = rec ? rec->ipAddress : 0;
+            IPAddress as_sent(raw);
+            Serial.printf("[UDP-TX] cmd=0x%02x anchor=%s record=%s ip_stored=0x%08lx "
+                          "as_IPAddress=%s\n",
+                          cmd, uuid_str, rec ? "yes" : "MISSING",
+                          (unsigned long)raw, as_sent.toString().c_str());
+        }
         if (rec && rec->ipAddress != 0) {
             success = udp_send_with_retry(rec->ipAddress, ANCHOR_UDP_PORT, pkt, 33);
+            Serial.printf("[UDP-TX]   direct-IP attempt -> %s\n",
+                          success ? "endPacket() OK (NOTE: says sent, not delivered)" : "failed");
+        } else {
+            Serial.println("[UDP-TX]   no stored IP — falling through to broadcast");
         }
 
         // Attempt 2: mDNS fallback
@@ -1633,12 +1776,36 @@ static void send_to_anchors(uint8_t cmd, const Event *e) {
             // Attempt 3: broadcast (best-effort)
             if (!success) {
                 IPAddress broadcast(255, 255, 255, 255);
+                bool bcast_ok = false;
                 if (g_udp.beginPacket(broadcast, ANCHOR_UDP_PORT)) {
                     g_udp.write(pkt, 33);
-                    g_udp.endPacket();
+                    bcast_ok = g_udp.endPacket();
                     // broadcast = best effort, no success tracking
                 }
-                queue_unreachable(anchor_uuid, rec ? rec->name : "");
+                // Only cry wolf when we actually have reason to.
+                //
+                // §5.5.1's pseudocode queues an unreachable notification after
+                // every broadcast, but broadcast is the *designed* delivery path
+                // for an anchor whose IP the app has never pushed — and it
+                // works. Queueing there fires a user-visible "couldn't reach
+                // this anchor" every single time an anchor beeps correctly,
+                // which is exactly how a real warning gets trained into noise.
+                //
+                // So: report unreachable when a known address failed, or when we
+                // could not even emit the broadcast. Stay quiet when the only
+                // available path was broadcast and it went out fine. The app has
+                // an authoritative health signal anyway (the anchor's own WiFi
+                // Status characteristic, §4.4 / MOBILE_APP_SPEC §8.14); this
+                // queue is a hint, and a hint that is usually wrong is worse
+                // than no hint. Deviation from §5.5.1 — revert here if the spec
+                // is preferred over the behaviour.
+                bool had_address = (rec && rec->ipAddress != 0);
+                bool suspect     = had_address || !bcast_ok;
+                Serial.printf("[UDP-TX]   broadcast 255.255.255.255:%d -> %s; %s\n",
+                              ANCHOR_UDP_PORT, bcast_ok ? "sent" : "failed",
+                              suspect ? "queuing unreachable"
+                                      : "not queuing unreachable (broadcast is the expected path here)");
+                if (suspect) queue_unreachable(anchor_uuid, rec ? rec->name : "");
             }
         }
     }
@@ -1921,6 +2088,22 @@ static void radio_release_after_central() {
 // anchor (MAC unknown / connect fail) — callers treat unknown as docked.
 static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = nullptr) {
     if (out_dock) *out_dock = -1;
+
+#if V0_ENABLED
+    // Stub engine (prox_v0_dummy.h): return the verdict that fails this
+    // criterion, without scanning or connecting. Everything downstream — the
+    // criterion test, phoneAway's tolerance timer, donning grace, escalation —
+    // runs for real, so this isolates the enforcement logic from the engine.
+    // dock is left -1 (unknown → treated as docked), which does not matter:
+    // phoneAway's near_phone is already forced true by the NEAR verdict.
+    {
+        ProxProximity forced = v0_forced_proximity(e ? e->criteria : STAY_NEAR);
+        static const char *kName[] = { "NEAR", "AWAY", "AMBIG" };
+        Serial.printf("[V0] STUB ENGINE: forcing %s (no scan, no connect) — "
+                      "every commitment is noncompliant\n", kName[forced]);
+        return forced;
+    }
+#endif
     // Align a fresh BLE scan with this query FIRST. Besides refreshing the RF
     // cache, this is the only thing that (re)discovers the anchor's BLE MAC (the
     // scan callbacks populate the AnchorRecord as a side effect), so it must run
@@ -2428,12 +2611,26 @@ static bool is_enforcement_condition_met(const Event *e) {
                           undocked ? "undocked" : "at dock", (unsigned)near_for);
             return false;      // grace exceeded → enforce
         }
+        // The WiFi criteria never touch the proximity engine, so the stub above
+        // cannot reach them. Force them here so "every commitment is
+        // noncompliant" holds for all five criteria, not just the three that
+        // route through an anchor query.
         case GET_ON_WIFI:
+#if V0_ENABLED
+            Serial.println("[V0] STUB ENGINE: forcing getOnWifi noncompliant");
+            return false;
+#else
             return g_wifi_connected &&
                    strncmp(g_current_ssid, e->wifiSSID, 63) == 0;
+#endif
         case GET_OFF_WIFI:
+#if V0_ENABLED
+            Serial.println("[V0] STUB ENGINE: forcing getOffWifi noncompliant");
+            return false;
+#else
             return !g_wifi_connected ||
                    strncmp(g_current_ssid, e->wifiSSID, 63) != 0;
+#endif
     }
     return false;
 }
@@ -2549,8 +2746,22 @@ static void bench_tick() {
 //  Enforcement profile playback
 // ============================================================
 
+// The buzzer half of a profile step. A step that asks for sound gets the WATCH
+// ALARM PATTERN (three 90 ms chirps a second) rather than a held tone — that is
+// what distinguishes the watch from the anchor, which blares. The profile still
+// owns *when* and *for how long*; the vocabulary owns what it sounds like. The
+// pattern's 1000 ms group divides the 2000 ms burst exactly, so a burst is
+// always two whole groups (see beep_vocab.h).
+static void set_alarm_sound(bool on) {
+    if (on) {
+        if (beep_current() != &BEEP_WATCH_ALARM) beep_play(&BEEP_WATCH_ALARM, g_out_who);
+    } else {
+        set_buzzer(false);   // cancels the pattern and drops the pin
+    }
+}
+
 static void enforcement_start(EnforcementProfile prof) {
- 
+
     const ProfileDefinition *def = find_profile(prof);
     g_enf.step_idx        = 0;
     g_enf.cycle_count     = 0;
@@ -2559,14 +2770,21 @@ static void enforcement_start(EnforcementProfile prof) {
     g_enf.active          = true;
     // Initial wait duration = second step's duration (step_idx 1)
     g_enf.current_wait_ms = (def->step_count > 1) ? def->steps[1].duration_ms : 0;
+    Serial.printf("[ENF] profile start id=%d steps=%d loops=%d floor=%lums wait0=%lums\n",
+                  (int)prof, (int)def->step_count, def->loops ? 1 : 0,
+                  (unsigned long)def->floor_interval_ms,
+                  (unsigned long)g_enf.current_wait_ms);
     // Apply first step outputs
     const ProfileStep &s = def->steps[0];
+    outputs_note_caller("profile_start");
     set_motor(s.motor_on);
-    set_buzzer(s.buzzer_on);
+    set_alarm_sound(s.buzzer_on);
 }
 
 static void enforcement_stop() {
+    if (g_enf.active) Serial.printf("[ENF] profile stop t=%lums\n", (unsigned long)millis());
     g_enf.active = false;
+    outputs_note_caller("profile_stop");
     outputs_off();
 }
 
@@ -2608,8 +2826,14 @@ static void enforcement_update() {
 
     g_enf.step_start_ms = millis();
     const ProfileStep &next = def->steps[g_enf.step_idx];
+    Serial.printf("[ENF] step -> %d cycle=%lu dur=%lums (waited %lums)\n",
+                  (int)g_enf.step_idx, (unsigned long)g_enf.cycle_count,
+                  (unsigned long)(g_enf.step_idx == 1 && def->loops && def->floor_interval_ms
+                                      ? g_enf.current_wait_ms : next.duration_ms),
+                  (unsigned long)elapsed);
+    outputs_note_caller("profile_step");
     set_motor(next.motor_on);
-    set_buzzer(next.buzzer_on);
+    set_alarm_sound(next.buzzer_on);
 }
 
 // Adaptive enforcement poll cadence (§8.2): back off when the user is compliant
@@ -2637,10 +2861,19 @@ static uint32_t enforcement_poll_interval_ms() {
 
 static void check_enforcement_condition() {
     if (!g_active_event) return;
+    uint32_t t0 = millis();
     bool met = is_enforcement_condition_met(g_active_event);
+    // One line per poll, always — a poll that quietly returned "met" is exactly
+    // the event that would explain an unexplained silence, and until now it
+    // logged nothing at all.
+    Serial.printf("[ENF] poll met=%d (was %d) active=%d grace=%d took=%lums t=%lums\n",
+                  met ? 1 : 0, g_enf.condition_met ? 1 : 0, g_enf.active ? 1 : 0,
+                  grace_active() ? 1 : 0,
+                  (unsigned long)(millis() - t0), (unsigned long)millis());
     if (met && !g_enf.condition_met) {
         // Condition became met → stop outputs
         g_enf.condition_met = true;
+        Serial.println("[ENF] Condition met — stopping enforcement");
         enforcement_stop();
     } else if (!met && g_enf.condition_met) {
         // Condition became not-met → start enforcement
@@ -2649,6 +2882,8 @@ static void check_enforcement_condition() {
         enforcement_start(g_active_event->profile);
     } else if (!met && !g_enf.condition_met) {
         // Still not met: advance profile playback
+        if (!g_enf.active)
+            Serial.println("[ENF] WARN not-met but profile inactive — nothing is driving the outputs");
         enforcement_update();
     }
 }
@@ -2733,7 +2968,24 @@ static void exit_enforcement() {
     g_ble_scan->setWindow(DORMANT_SCAN_WINDOW_MS);
 
     if (g_wifi_connected) {
-        esp_wifi_set_ps(WIFI_PS_NONE);
+        // MIN_MODEM, never NONE.
+        //
+        // `WIFI_PS_NONE` while the BLE stack is up is not merely inefficient —
+        // it is fatal. The two radios share one antenna path, so IDF requires
+        // WiFi modem sleep whenever both are enabled; asking for NONE trips
+        // `Error! Should enable WiFi modem sleep when both WiFi and Bluetooth
+        // are enabled!!!!!!` and calls abort(). The watch panicked here on 4/4
+        // instrumented runs (2026-08-02), which is invisible from outside: the
+        // reboot drops the GPIOs, so the alarm goes silent, and §5.1.3 boot
+        // recovery then re-enters the still-active window and restarts the
+        // profile ~15-30 s later. That is the "stops enforcing, then beeps
+        // again on its own" field report.
+        //
+        // MIN_MODEM keeps the station associated (still listening every DTIM,
+        // so inbound UDP and the app's LAN pushes still arrive) while staying
+        // inside the coexistence rule. ENFORCEMENT uses MAX_MODEM for power;
+        // DORMANT wants lower latency, hence MIN rather than MAX.
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     }
 
     arm_next_boundary();
@@ -3983,6 +4235,33 @@ static void enter_enforcement_sleep() {
     return;
 #endif
 
+    // Do not sleep through a running tolerance window.
+    //
+    // Two separate problems, both real, both fixed by staying awake here:
+    //
+    // 1. CORRECTNESS. This path runs "while compliant", and phoneAway's tolerance
+    //    returns compliant — so the watch slept the backed-off MET interval
+    //    (180 s) through a 60 s tolerance. The alarm could therefore start up to
+    //    120 s after the user had actually blown the grace. The donning-grace cap
+    //    below exists for exactly this reason; this window needed the same
+    //    treatment and did not have it.
+    // 2. VISIBILITY. led_off() below darkens the ring for the whole sleep, and a
+    //    halted CPU cannot repaint, so the yellow countdown bar would have been
+    //    invisible precisely when it is the only thing the user needs to see.
+    //    The SK6805 does latch its last frame through sleep, so a *static* bar
+    //    would survive — but a countdown that is frozen at the wrong count is
+    //    worse than none, since the whole claim it makes is "this many left".
+    //
+    // Bounded by construction: PHONE_AWAY_TOLERANCE_S is 60 s, it only runs while
+    // the user is genuinely near the docked phone, and it ends by either the user
+    // walking away (compliant, sleep resumes) or the alarm starting (which keeps
+    // the watch awake anyway). Staying awake for it costs at most one minute of
+    // radio-idle CPU per violation.
+    if (tolerance_grace_active()) {
+        delay(20);          // let loop() advance the countdown bar
+        return;
+    }
+
     // Stop any active BLE scan before sleeping.
     if (g_ble_scan && g_ble_scan->isScanning()) g_ble_scan->stop();
 
@@ -4014,6 +4293,17 @@ static void enter_enforcement_sleep() {
     if (grace_active()) {
         uint64_t us_to_grace = (uint64_t)(g_grace_deadline - time(nullptr)) * 1000000ULL;
         if (us_to_grace < sleep_us) sleep_us = us_to_grace;
+    }
+    // Same cap for phoneAway's tolerance. The early return above already keeps the
+    // watch awake for the whole window, so this only matters if the user drifts
+    // near the phone in the instant after that check — belt and braces, because
+    // oversleeping this window delays the alarm rather than merely dimming a LED.
+    if (g_active_event && g_active_event->criteria == PHONE_AWAY && g_phone_near_since_ts != 0) {
+        uint32_t elapsed = (uint32_t)time(nullptr) - g_phone_near_since_ts;
+        if (elapsed < (uint32_t)PHONE_AWAY_TOLERANCE_S) {
+            uint64_t us_left = (uint64_t)(PHONE_AWAY_TOLERANCE_S - elapsed) * 1000000ULL;
+            if (us_left < sleep_us) sleep_us = us_left;
+        }
     }
     if (sleep_us < 1000000ULL) sleep_us = 1000000ULL; // minimum 1 s
 
@@ -4198,9 +4488,11 @@ class WatchServerCallbacks : public NimBLEServerCallbacks {
             prefs.begin("watch", false);
             prefs.putBool("paired", true);
             prefs.end();
-            set_buzzer(true);
-            delay(UNPAIRED_BEEP_DURATION_MS);
-            set_buzzer(false);
+            outputs_note_caller("pairing");
+            // Blocking on purpose: this runs on the NimBLE host task, which must
+            // not touch the loop task's player state. The watch is UNPAIRED here,
+            // so nothing else is using the buzzer.
+            beep_play_blocking(&BEEP_WATCH_PAIRED, "pairing");
             set_motor(true);
             delay(UNPAIRED_VIBRATE_DURATION_MS);
             set_motor(false);
@@ -4615,7 +4907,7 @@ class WatchPassCallback : public NimBLECharacteristicCallbacks {
 };
 
 void indicate_successful_boot() {
-    beep(3);
+    beep_play_blocking(&BEEP_WATCH_BOOT, "boot");
 }
 class WatchAnchorIpCallback : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo&) override {
@@ -4798,7 +5090,53 @@ void setup() {
     delay(100);
     Log.begin(LOG_LEVEL_VERBOSE, &Serial);
 
+#if V0_ENABLED
+    // Loud on every boot: with the stub engine active the watch alarms through
+    // every window and never stops, which is indistinguishable from a serious
+    // bug if you have forgotten the flag is set. See src/prox_v0_dummy.h.
+    Serial.println("\n****************************************************************");
+    Serial.println("**  V0 STUB PROXIMITY ENGINE ACTIVE  (V0_ENABLED = 1)          **");
+    Serial.println("**  Every commitment is forced NONCOMPLIANT, all criteria.     **");
+    Serial.println("**  Proximity is never measured: no scan, no anchor connect.   **");
+    Serial.println("**  This is a test build. Set V0_ENABLED = 0 in                **");
+    Serial.println("**  src/prox_v0_dummy.h to restore the real engine.            **");
+    Serial.println("****************************************************************\n");
+#endif
+
     delay(1000);
+
+    // Why we just booted, and how many times we have.
+    //
+    // A watch that reboots mid-window is indistinguishable from a watch that
+    // stopped enforcing: the GPIOs reset (buzzer off), and §5.1.3 boot recovery
+    // then walks straight back into the active window and starts the profile
+    // again — a silence exactly as long as a boot, followed by the alarm
+    // resuming on its own. That is the shape of the "beeps, quiet 30–90 s,
+    // beeps again" report, and until now nothing on the watch recorded it. The
+    // anchor has had this since the 2026-07-12 audit; the watch never did.
+    //
+    // Note the anchor's caveat applies here too if the brownout detector is
+    // ever disabled: genuine rail dips then surface as PANIC/garbage rather
+    // than ESP_RST_BROWNOUT.
+    {
+        esp_reset_reason_t rr = esp_reset_reason();
+        static const char *kReason[] = {
+            "UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT", "TASK_WDT",
+            "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO",
+        };
+        prefs.begin("watch", false);
+        uint32_t boots = prefs.getULong("boots", 0) + 1;
+        prefs.putULong("boots", boots);
+        if (rr != ESP_RST_POWERON && rr != ESP_RST_SW)
+            prefs.putUChar("last_abn", (uint8_t)rr);
+        uint8_t last_abn = prefs.getUChar("last_abn", 0);
+        prefs.end();
+        Serial.printf("[BOOT] reason=%s(%d) boot_count=%lu last_abnormal=%s(%u)\n",
+                      rr < (sizeof(kReason) / sizeof(kReason[0])) ? kReason[rr] : "?",
+                      (int)rr, (unsigned long)boots,
+                      last_abn < (sizeof(kReason) / sizeof(kReason[0])) ? kReason[last_abn] : "?",
+                      (unsigned)last_abn);
+    }
 
     bp;
 
@@ -4808,6 +5146,7 @@ void setup() {
 
     // Hardware pins first so buzzer works for crash reporting
     pinMode(BUZZER_PIN, OUTPUT);
+    beep_player_init(buzz_pin);
 #if !DISABLE_MOTOR
     pinMode(VIBRO_PIN,  OUTPUT);  // skipped when disabled so GPIO 10 is left for the LED ring
 #endif
@@ -5099,6 +5438,11 @@ void loop() {
     uint32_t now_ms  = millis();
     uint32_t now_min = local_minutes_now();
 
+    // Advance the buzzer pattern first: it is the only thing here with sub-100 ms
+    // timing, and running it before the rest of the pass keeps a chirp from being
+    // stretched by whatever this iteration turns out to do.
+    beep_service(now_ms);
+
 #if DIAG_AWAKE
     // Per-iteration timing: a healthy loop turns over in ~10–20 ms (the trailing
     // delay(10) plus light work). A much longer gap means a blocking call ran
@@ -5338,6 +5682,26 @@ void loop() {
             batt_log_clear();
             Serial.println("BATTLOG_CLEARED");
         }
+#if BENCH_NO_SLEEP
+        // 0xAF → wipe NVS and reboot. Bench builds only.
+        //
+        // Needed because the §9 integrity gate is doing its job: a test harness
+        // that pushes a fresh schedule every run is, from the watch's point of
+        // view, deleting yesterday's commitment — a loosening, quarantined for
+        // 24 h. Without a wipe every repeat run inherits the previous run's
+        // schedule, pending queue and settle state, and the second test of an
+        // evening measures something other than what it thinks. A cable is
+        // already required to read this log, so this grants no escape a
+        // reflash would not.
+        else if (cmd == 0xAF) {
+            Serial.println("BENCH_NVS_ERASE — wiping NVS and rebooting");
+            Serial.flush();
+            nvs_flash_deinit();
+            nvs_flash_erase();
+            delay(100);
+            ESP.restart();
+        }
+#endif
 #if MEASURE_USAGE
         else if (cmd == 0xAD) {
             usage_report();

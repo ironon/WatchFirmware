@@ -22,7 +22,16 @@ enum LedStatusSlot : uint8_t {
     LED_SLOT_WAKE_MOTION   = 3,  // momentary flash: woke on motion         (default green)
     LED_SLOT_WAKE_TIMER    = 4,  // momentary flash: woke on RTC/timer      (default light blue)
     LED_SLOT_WAKE_BLE      = 5,  // momentary flash: woke on incoming BLE   (default white)
-    LED_SLOT_COUNT         = 6,
+    // Enforcement, criterion currently FAILING, but a tolerance window is still
+    // suppressing the alarm — "you are near the dock; you have a bit longer".
+    // Rendered as a filling progress bar around the ring rather than a blink, so
+    // it never reads as an alarm and it says how much longer, not just "soon".
+    // This slot's on_ms/off_ms are unused (the bar is steady); only the colour
+    // applies. Appended rather than inserted on purpose: the values above are
+    // on-wire slot ids in the app's LED Configuration characteristic, so
+    // renumbering them would silently remap every configured colour.
+    LED_SLOT_ENFORCE_GRACE = 6,  // grace/tolerance countdown              (default yellow)
+    LED_SLOT_COUNT         = 7,
 };
 
 // Why the watch just came out of light sleep, used to pick the wake-cause flash.
@@ -39,6 +48,22 @@ struct LedStatusInput {
     bool unpaired;       // activity_state == UNPAIRED  → ring off
     bool enforcing;      // activity_state == ENFORCEMENT
     bool condition_met;  // enforcement condition currently satisfied
+    // True when condition_met is only true BECAUSE a grace/tolerance window is
+    // running — i.e. the criterion is actually failing right now and the alarm
+    // starts when the window expires. Currently set for phoneAway's
+    // PHONE_AWAY_TOLERANCE_S. Ignored unless condition_met is also true.
+    bool in_grace;
+    // How far through that window we are: 0 = just started, 255 = about to
+    // expire. Drives how much of the ring is lit. Ignored unless in_grace.
+    uint8_t grace_progress_u8;
+    // Current enforcement output envelope, so the alarm ring rises and falls with
+    // the buzzer/motor instead of free-running against it. `output_active` is true
+    // while either output is being driven; `output_since_ms` is the millis() of
+    // the last transition between the two, and anchors the blink phase so the
+    // ring's first ON edge coincides with the buzzer's. Both ignored unless
+    // enforcing && !condition_met.
+    bool     output_active;
+    uint32_t output_since_ms;
     int  hour;           // current local hour (0–23), for the DORMANT analog clock
     int  minute;         // current local minute (0–59), for the DORMANT analog clock
 };
