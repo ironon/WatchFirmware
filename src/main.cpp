@@ -1389,6 +1389,68 @@ static void start_ble_scan(uint32_t duration_ms = 300) {
     batt_log("ble_scan_start");
 }
 
+#if PROX_WATCH_WIFI_SCAN_ENABLED
+// Fold the local access points into the scan cache — see the commentary at
+// PROX_WATCH_WIFI_SCAN_ENABLED in proximity.h for why APs are worth the awake
+// time, and why the channel list is only three long.
+//
+// MUST be called with the BLE scan stopped. One radio serves both on the C3, and
+// this is a blocking scan that transmits probe requests; running it against a
+// live BLE scan would corrupt the very vector it is contributing to.
+static void prox_wifi_ap_scan(void) {
+    // The driver has to be up. It normally is — setup() puts the watch in
+    // WIFI_STA and leaves it there — but a scan does NOT require an association,
+    // which is the point: this keeps working through an enforcement window with
+    // the AP long since dropped.
+    wifi_mode_t mode;
+    if (esp_wifi_get_mode(&mode) != ESP_OK) return;
+    if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA) return;
+
+    static const uint8_t channels[] = PROX_WATCH_WIFI_CHANNELS;
+    int found = 0;
+
+    for (int c = 0; c < PROX_WATCH_WIFI_CHANNEL_COUNT; ++c) {
+        wifi_scan_config_t cfg = {};
+        cfg.channel     = channels[c];        // one channel per call, short dwell
+        cfg.show_hidden = false;
+        cfg.scan_type   = WIFI_SCAN_TYPE_ACTIVE;
+        cfg.scan_time.active.min = PROX_WATCH_WIFI_DWELL_MIN_MS;
+        cfg.scan_time.active.max = PROX_WATCH_WIFI_DWELL_MAX_MS;
+        if (esp_wifi_scan_start(&cfg, true) != ESP_OK) continue;   // blocking
+
+        uint16_t ap_count = 0;
+        esp_wifi_scan_get_ap_num(&ap_count);
+
+        // Mirror the anchor's leak discipline (anchor_prox_tasks.cpp): the
+        // internal AP list is allocated by the driver and is only released by a
+        // successful get_ap_records() or an explicit clear. Every early exit
+        // below has to release it, or a scan per poll becomes an overnight OOM.
+        bool drained = false;
+        if (ap_count > 0) {
+            wifi_ap_record_t *aps =
+                (wifi_ap_record_t *)malloc(ap_count * sizeof(wifi_ap_record_t));
+            if (aps) {
+                if (esp_wifi_scan_get_ap_records(&ap_count, aps) == ESP_OK) {
+                    drained = true;
+                    for (int i = 0; i < ap_count; ++i) {
+                        // A BSSID is already big-endian (on-air) order, matching
+                        // what the anchor ingests and what the vector wire format
+                        // carries — no byte-swap, unlike the NimBLE path.
+                        prox_ingest_scan_result(aps[i].bssid, PROX_TYPE_WIFI,
+                                                (int8_t)aps[i].rssi);
+                        found++;
+                    }
+                }
+                free(aps);
+            }
+        }
+        if (!drained) esp_wifi_clear_ap_list();
+    }
+
+    if (found) Serial.printf("[PROX] WiFi APs into vector: %d\n", found);
+}
+#endif  // PROX_WATCH_WIFI_SCAN_ENABLED
+
 // One-shot ACTIVE, full-duty BLE scan to densely populate the proximity cache
 // immediately before a query, then restore the low-power passive enforcement
 // scan settings. Active scanning (which transmits scan requests and costs more
@@ -1443,6 +1505,14 @@ static void prox_aligned_active_scan(uint32_t duration_ms) {
     }
     if (g_ble_scan->isScanning()) g_ble_scan->stop();
     imu_burst_submit();
+
+#if PROX_WATCH_WIFI_SCAN_ENABLED
+    // Between the BLE scan stopping and the window closing: the radio is free,
+    // and the APs land in the SAME window as the BLE devices, so both go through
+    // one per-window maximum and one median. Ingesting after the close would put
+    // them in the next window and desynchronise the two halves of the vector.
+    prox_wifi_ap_scan();
+#endif
 
     // Close the scan window so this window's per-device maxima fold into the
     // cache's rolling history. Must land after the scan has stopped and before
