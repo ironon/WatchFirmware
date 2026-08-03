@@ -18,6 +18,7 @@
 #include <sys/time.h>   // settimeofday() for the Time characteristic (§5.6)
 #include <string.h>
 #include "beep_vocab.h"   // shared watch/anchor buzzer vocabulary
+#include "prox_capture.h"  // structured capture of the engine's inputs (corpus)
 #include "imu.h"
 #include "led_status.h"           // LED status ring (§5.7)
 #include "proximity.h"            // shared proximity engine (../proximity_engine)
@@ -535,6 +536,24 @@ static bool      g_sched_xfer_act  = false;
 
 // UDP
 static WiFiUDP g_udp;
+
+#if PROX_CAPTURE_ENABLED
+// Capture corpus sink — see proximity_engine/src/prox_capture.h. Broadcast, so
+// nothing has to be configured and a listener may join mid-session. Transport
+// only: swapping ESP-NOW in here changes nothing else.
+#define PROX_CAPTURE_UDP_PORT 49001
+static WiFiUDP g_cap_udp;
+static bool    g_cap_udp_up = false;
+
+static int capture_udp_sink(const uint8_t *buf, uint16_t len) {
+    if (!g_cap_udp_up || !g_wifi_connected) return 0;   // stay buffered
+    IPAddress bcast = WiFi.localIP();
+    bcast[3] = 255;
+    if (!g_cap_udp.beginPacket(bcast, PROX_CAPTURE_UDP_PORT)) return 0;
+    g_cap_udp.write(buf, len);
+    return g_cap_udp.endPacket() ? 1 : 0;
+}
+#endif
 
 // ---- Battery event log ring buffer ----
 struct BattLogEntry {
@@ -1405,6 +1424,19 @@ static void prox_aligned_active_scan(uint32_t duration_ms) {
     // any prox_build_scan_vector() call, so the vector sees a complete window.
     prox_scan_window_close();
 
+#if PROX_CAPTURE_ENABLED
+    // THE flush point on the watch. Records were timestamped when taken, so
+    // shipping them here costs nothing; shipping them any earlier would put a
+    // WiFi transmit inside the BLE scan that builds the vector, and on the C3
+    // one radio serves both. Capture that shrinks the vector it is capturing is
+    // worse than no capture, because the corpus would look authoritative.
+    {
+        const uint32_t nowt = (uint32_t)time(nullptr);
+        if (nowt > 1700000000u) prox_capture_set_wall(nowt);
+        prox_capture_flush();
+    }
+#endif
+
     // Restore the low-power passive enforcement scan configuration.
     g_ble_scan->setActiveScan(false);
     g_ble_scan->setInterval(ENFORCEMENT_SCAN_INTERVAL_MS);
@@ -1597,6 +1629,10 @@ static void on_wifi_associated(const char *ssid) {
     g_wifi_connected = true;
     strlcpy(g_current_ssid, ssid, sizeof(g_current_ssid));
     g_udp.begin(0); // any local port for sending
+#if PROX_CAPTURE_ENABLED
+    g_cap_udp.begin(0);
+    g_cap_udp_up = true;
+#endif
     configTime((long)g_tz_offset_min * 60, 0, "pool.ntp.org");
     Serial.printf("[WiFi] Connected to %s\n", g_current_ssid);
     batt_log("wifi_connect");
@@ -2192,6 +2228,21 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     Serial.printf("[PROX] Score=%d flags=0x%02X near_thr=%u\n",
                   result.score, result.flags, (unsigned)near_thr);
 
+#if PROX_CAPTURE_ENABLED
+    // The motion burst that this query rode. An engine input, and the one the
+    // draw gate weights everything else by — a replay without it cannot
+    // reproduce a single tick.
+    {
+        ProxCapMotion m;
+        m.burst_var = prox_motion_burst_var();
+        m.cadence   = prox_motion_burst_cadence();
+        m.state     = prox_motion_state();
+        m.ints      = 0;
+        m.reserved  = 0;
+        prox_capture_emit(CAP_MOTION, &m, sizeof(m));
+    }
+#endif
+
     // v0.8 interpretation: per-anchor calibrated cutoff when the anchor reports
     // one (calibration-v2 decision 4); uncalibrated anchors fall back to the
     // global rule inside prox_interpret_score.
@@ -2203,7 +2254,25 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     // motion channel alone; P2's trailer supplies the anchor's own claim.
     ProxScoreResult2 r2;
     r2.score = result.score; r2.flags = result.flags; r2.neff = 0; r2.near_thr = near_thr;
-    return prox_decide(v08, prox_hmm_tick(&r2), "score", result.score,
+    const ProxDecision decision = prox_hmm_tick(&r2);
+
+#if PROX_CAPTURE_ENABLED
+    // The tick's OUTPUT, captured as an assertion rather than as an input:
+    // replay recomputes lambda from the same inputs and compares. A mismatch is
+    // either a regression or a change you are about to review on purpose.
+    {
+        ProxCapHmm h;
+        h.lambda_q8   = prox_hmm_logodds_q8();
+        h.emit_q8     = 0;
+        h.decision    = (uint8_t)decision;
+        h.motion_state = prox_motion_state();
+        h.neff        = r2.neff;
+        h.score       = result.score;
+        prox_capture_emit(CAP_HMM, &h, sizeof(h));
+    }
+#endif
+
+    return prox_decide(v08, decision, "score", result.score,
                        near_thr ? near_thr : PROX_CONFIDENCE_THRESHOLD_U8);
 }
 
@@ -2601,6 +2670,19 @@ static bool is_enforcement_condition_met(const Event *e) {
                           (int)prox, (unsigned)prox_motion_state(),
                           (unsigned)gate_hits, PROX_AWAY_ARM_HITS,
                           (unsigned)gate_armed, admits);
+#if PROX_CAPTURE_ENABLED
+            {
+                uint32_t last_move = 0;
+                prox_away_gate_state(NULL, NULL, &last_move);
+                ProxCapAwayGate g;
+                g.armed        = gate_armed;
+                g.hits         = gate_hits;
+                g.admits       = (uint8_t)admits;
+                g.motion_state = prox_motion_state();
+                g.still_for_s  = (last_move && now_s >= last_move) ? (now_s - last_move) : 0;
+                prox_capture_emit(CAP_AWAYGATE, &g, sizeof(g));
+            }
+#endif
 
             // A confident NEAR is the engine saying you are in the room. No
             // amount of walking makes that compliant, and it needs no
@@ -2915,9 +2997,29 @@ static void check_enforcement_condition() {
     if (met && !g_enf.condition_met) {
         // Condition became met → stop outputs
         g_enf.condition_met = true;
+#if PROX_CAPTURE_ENABLED
+    {
+        ProxCapEnforce e_;
+        e_.event = CAP_ENF_MET; e_.criteria = (uint8_t)(g_active_event->criteria);
+        e_.condition_met = 1; e_.reserved = 0;
+        memcpy(e_.event_uuid, g_active_event->id, 16);
+        prox_capture_emit(CAP_ENFORCE, &e_, sizeof(e_));
+    }
+#endif
+
         Serial.println("[ENF] Condition met — stopping enforcement");
         enforcement_stop();
     } else if (!met && g_enf.condition_met) {
+#if PROX_CAPTURE_ENABLED
+    {
+        ProxCapEnforce e_;
+        e_.event = CAP_ENF_UNMET; e_.criteria = (uint8_t)(g_active_event->criteria);
+        e_.condition_met = 0; e_.reserved = 0;
+        memcpy(e_.event_uuid, g_active_event->id, 16);
+        prox_capture_emit(CAP_ENFORCE, &e_, sizeof(e_));
+    }
+#endif
+
         // Condition became not-met → start enforcement
         g_enf.condition_met = false;
         Serial.println("[ENF] Condition not met — starting enforcement");
@@ -2995,12 +3097,32 @@ static void enter_enforcement(Event *e) {
     }
 
     g_enf.condition_met = is_enforcement_condition_met(e);
+#if PROX_CAPTURE_ENABLED
+    {
+        ProxCapEnforce e_;
+        e_.event = CAP_ENF_WINDOW_OPEN; e_.criteria = (uint8_t)(e->criteria);
+        e_.condition_met = g_enf.condition_met ? 1 : 0; e_.reserved = 0;
+        memcpy(e_.event_uuid, e->id, 16);
+        prox_capture_emit(CAP_ENFORCE, &e_, sizeof(e_));
+    }
+#endif
     if (!g_enf.condition_met) enforcement_start(e->profile);
     push_watch_status();
 }
 
 static void exit_enforcement() {
     Serial.println("[STATE] DORMANT");
+#if PROX_CAPTURE_ENABLED
+    if (g_active_event) {
+        ProxCapEnforce e_;
+        e_.event = CAP_ENF_WINDOW_CLOSE;
+        e_.criteria = (uint8_t)g_active_event->criteria;
+        e_.condition_met = g_enf.condition_met ? 1 : 0;
+        e_.reserved = 0;
+        memcpy(e_.event_uuid, g_active_event->id, 16);
+        prox_capture_emit(CAP_ENFORCE, &e_, sizeof(e_));
+    }
+#endif
     g_activity_state = STATE_DORMANT;
     batt_log("enforcement_exit");
     g_active_event   = nullptr;
@@ -5205,6 +5327,9 @@ void setup() {
     // Hardware pins first so buzzer works for crash reporting
     pinMode(BUZZER_PIN, OUTPUT);
     beep_player_init(buzz_pin);
+#if PROX_CAPTURE_ENABLED
+    prox_capture_init(CAP_ROLE_WATCH, capture_udp_sink);
+#endif
 #if !DISABLE_MOTOR
     pinMode(VIBRO_PIN,  OUTPUT);  // skipped when disabled so GPIO 10 is left for the LED ring
 #endif
@@ -5261,6 +5386,26 @@ void setup() {
     }
     uuid_to_str(g_watch_uuid, g_watch_uuid_str);
     Serial.printf("[SYS] Watch UUID: %s\n", g_watch_uuid_str);
+#if PROX_CAPTURE_ENABLED
+    {
+        // Provenance heads every session file. Without it a corpus silently
+        // mixes builds, and the first time a constant changes the whole archive
+        // becomes un-poolable with no way to tell which half is which. Emitted
+        // here rather than at prox_capture_init() because the identity and boot
+        // count it reports are not loaded until this point.
+        ProxCapSession sess;
+        memset(&sess, 0, sizeof(sess));
+        memcpy(sess.device_uuid, g_watch_uuid, 16);
+        prefs.begin("watch", true);
+        sess.boot_count = prefs.getULong("boots", 0);
+        prefs.end();
+        sess.engine_cfg_hash     = prox_capture_cfg_hash();
+        sess.v2_authoritative    = PROX_V2_AUTHORITATIVE;
+        sess.r2_offset_invariant = PROX_R2_OFFSET_INVARIANT;
+        strncpy(sess.fw_sha, PROX_FW_SHA, sizeof(sess.fw_sha) - 1);
+        prox_capture_emit(CAP_SESSION, &sess, sizeof(sess));
+    }
+#endif
 
 
     bp;
