@@ -18,7 +18,12 @@
 // WiFi APs are stationary, so we reuse cached scan results between queries and
 // only rescan when the cache is stale (a blocking, power-hungry scan). Re-homed
 // from the old src/proximity.h. See §8.2.
-#define PROX_WIFI_SCAN_INTERVAL_MS  300000  // 5 minutes
+#define PROX_WIFI_SCAN_INTERVAL_MS  300000  // 5 minutes between good scans
+// A scan that came back empty is retried on this interval instead. Short enough
+// that a starved scan costs one poll rather than five minutes of a blind vector,
+// long enough that a watch with the WiFi radio genuinely unavailable is not
+// re-scanning on every single query.
+#define PROX_WIFI_SCAN_RETRY_MS      20000  // 20 s
 
 // Bound on the blocking central connect to the anchor. NimBLE's default is 30 s;
 // that is far too long here. If a connect collides with the phone reconnecting
@@ -34,7 +39,23 @@
 // previously lived inside prox_build_scan_vector().
 static ProxDevice g_wifi_cache[PROX_MAX_DEVICES];
 static uint8_t    g_wifi_cache_count = 0;
-static uint32_t   g_wifi_cache_ms    = 0;  // millis() of last successful scan; 0 = never
+static uint32_t   g_wifi_cache_ms    = 0;  // millis() of last scan that FOUND APs; 0 = never
+static uint32_t   g_wifi_next_scan_ms = 0; // when to try again; 0 = at first opportunity
+static uint8_t    g_wifi_fail_streak   = 0; // consecutive scans that found nothing
+
+// Back off after a scan that returned nothing, doubling up to the normal
+// interval. An empty scan is cheap to retry once and pointless to retry forever:
+// on a blank watch with no credentials, every scan came back empty (measured
+// 2026-08-03, active AND passive, while 15-18 BLE devices were visible in the
+// same window), and a fixed short retry would then burn a blocking scan every
+// 20 s for the life of the device. Doubling settles to the normal interval while
+// still recovering within one poll of conditions improving.
+static void wifi_backoff(uint32_t now) {
+    if (g_wifi_fail_streak < 8) g_wifi_fail_streak++;
+    uint32_t wait = PROX_WIFI_SCAN_RETRY_MS << (g_wifi_fail_streak - 1);
+    if (wait > PROX_WIFI_SCAN_INTERVAL_MS) wait = PROX_WIFI_SCAN_INTERVAL_MS;
+    g_wifi_next_scan_ms = now + wait;
+}
 
 // Refresh / reuse the cached WiFi APs and feed them into the shared engine's
 // scan buffer. Preserves the exact behavior of the old prox_build_scan_vector:
@@ -63,21 +84,51 @@ void prox_feed_wifi_aps() {
     wifi_mode_t wmode;
     const bool wifi_driver_up = (esp_wifi_get_mode(&wmode) == ESP_OK) &&
                                 (wmode == WIFI_MODE_STA || wmode == WIFI_MODE_APSTA);
+    // An AP scan under BLE coexistence very often completes with ZERO results —
+    // the anchor's scan task documents the same effect, and the watch measured it
+    // on 2026-08-03: the first scan after boot returned 0 APs while 18 BLE
+    // devices were visible. Two things used to go wrong at that point, and both
+    // are worse than the starved scan itself:
+    //
+    //   1. g_wifi_cache_ms was stamped anyway, so one unlucky scan blinded the
+    //      vector for a full five minutes.
+    //   2. g_wifi_cache_count was zeroed BEFORE the results were read, so a
+    //      starved scan also threw away a perfectly good previous cache.
+    //
+    // A scan that returns nothing is not a refresh. Retry it on the short
+    // interval and keep whatever we already had.
     if (wifi_driver_up &&
-        (g_wifi_cache_ms == 0 || now - g_wifi_cache_ms > PROX_WIFI_SCAN_INTERVAL_MS)) {
+        (g_wifi_next_scan_ms == 0 || (int32_t)(now - g_wifi_next_scan_ms) >= 0)) {
         wifi_scan_config_t cfg = {};
         cfg.show_hidden = false;
-        cfg.scan_type   = WIFI_SCAN_TYPE_ACTIVE;
+        // PASSIVE, not active. An active scan transmits a probe request on every
+        // channel and waits for responses, which needs the shared radio to grant
+        // WiFi transmit slots — and under NimBLE coex on the C3 it very often
+        // does not. Measured on the watch 2026-08-03: active scans returned 0 APs
+        // repeatedly while 18 BLE devices were visible in the same window.
+        // A passive scan only listens for the beacons every AP already sends
+        // (~102 ms apart), so it needs receive time rather than transmit time,
+        // which is far cheaper to get from the arbiter. The dwell has to exceed
+        // one beacon interval or the channel is silent by construction.
+        cfg.scan_type = WIFI_SCAN_TYPE_PASSIVE;
+        cfg.scan_time.passive = 130;
         if (esp_wifi_scan_start(&cfg, true) == ESP_OK) { // blocking scan
             uint16_t ap_count = 0;
             esp_wifi_scan_get_ap_num(&ap_count);
+            // Bound the allocation by what we can actually store. A
+            // wifi_ap_record_t is several hundred bytes, so a block of flats
+            // returning 60 APs asked for tens of KB of contiguous heap to fill a
+            // cache that holds PROX_MAX_DEVICES — a failed malloc here silently
+            // costs the whole WiFi half of the vector for the next five minutes.
+            // get_ap_records() honours the count we pass and frees the rest.
+            if (ap_count > PROX_MAX_DEVICES) ap_count = PROX_MAX_DEVICES;
             wifi_ap_record_t *aps = (ap_count > 0)
                 ? (wifi_ap_record_t*)malloc(ap_count * sizeof(wifi_ap_record_t)) : nullptr;
-            g_wifi_cache_count = 0;
+            uint8_t found = 0;
             if (aps) {
                 esp_wifi_scan_get_ap_records(&ap_count, aps);
-                for (int i = 0; i < ap_count && g_wifi_cache_count < PROX_MAX_DEVICES; i++) {
-                    ProxDevice &pd = g_wifi_cache[g_wifi_cache_count++];
+                for (int i = 0; i < ap_count && found < PROX_MAX_DEVICES; i++) {
+                    ProxDevice &pd = g_wifi_cache[found++];
                     memcpy(pd.mac, aps[i].bssid, 6); // BSSID already big-endian
                     pd.type = PROX_TYPE_WIFI;
                     pd.rssi = (int8_t)aps[i].rssi;
@@ -85,9 +136,19 @@ void prox_feed_wifi_aps() {
                 free(aps);
             }
             esp_wifi_clear_ap_list();
-            g_wifi_cache_ms = now;
-            Serial.printf("[PROX] WiFi AP scan: %u cached\n",
-                          (unsigned)g_wifi_cache_count);
+            if (found) {
+                g_wifi_cache_count  = found;
+                g_wifi_cache_ms     = now;
+                g_wifi_fail_streak  = 0;
+                g_wifi_next_scan_ms = now + PROX_WIFI_SCAN_INTERVAL_MS;
+            } else {
+                wifi_backoff(now);
+            }
+            Serial.printf("[PROX] WiFi AP scan: %u found, %u cached, next in %us\n",
+                          (unsigned)found, (unsigned)g_wifi_cache_count,
+                          (unsigned)((g_wifi_next_scan_ms - now) / 1000));
+        } else {
+            wifi_backoff(now);
         }
     }
 
