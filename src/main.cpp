@@ -2574,13 +2574,49 @@ static bool is_enforcement_condition_met(const Event *e) {
         return true;
     }
     switch (e->criteria) {
-        case STAY_NEAR:
-        case GET_AWAY: {
+        case STAY_NEAR: {
             ProxProximity prox = query_anchor_proximity(e);
-            if (prox == PROX_AMBIGUOUS)  // fail-safe toward the compliant outcome
-                prox = (e->criteria == STAY_NEAR) ? PROX_NEAR : PROX_AWAY;
-            if (e->criteria == STAY_NEAR) return (prox == PROX_NEAR);
-            else                          return (prox == PROX_AWAY);
+            // Fail-safe toward the compliant outcome. Correct HERE and only
+            // here: an attenuating adversary makes things look FAR, so refusing
+            // to conclude far on a degraded link resists them (§13.0).
+            if (prox == PROX_AMBIGUOUS) prox = PROX_NEAR;
+            return (prox == PROX_NEAR);
+        }
+        case GET_AWAY: {
+            // getAway is the adversarial criterion: the user BENEFITS from
+            // appearing far, so the same fail-open that protects stayNear
+            // rewards an attacker here. Until §13.4-R2 lands, compliance takes
+            // two independent things, and the RF is only one of them.
+            ProxProximity prox = query_anchor_proximity(e);
+            const uint32_t now_s = (uint32_t)time(nullptr);
+
+            // Feed the gate first: the query just ran an IMU burst, so the
+            // motion state is as fresh as it ever gets.
+            prox_away_gate_note(now_s, prox_motion_state());
+
+            uint8_t  gate_armed = 0, gate_hits = 0;
+            prox_away_gate_state(&gate_armed, &gate_hits, nullptr);
+            const int admits = prox_away_gate_admits(now_s);
+            Serial.printf("[AWAYGATE] prox=%d motion=%u hits=%u/%d armed=%u admits=%d\n",
+                          (int)prox, (unsigned)prox_motion_state(),
+                          (unsigned)gate_hits, PROX_AWAY_ARM_HITS,
+                          (unsigned)gate_armed, admits);
+
+            // A confident NEAR is the engine saying you are in the room. No
+            // amount of walking makes that compliant, and it needs no
+            // corroboration — concluding NEAR is the cheap direction (§13.0).
+            if (prox == PROX_NEAR) return false;
+
+            // AWAY *and* AMBIGUOUS both now require corroboration. AMBIGUOUS
+            // used to resolve straight to compliant, which meant the attack
+            // never had to fool the engine at all — just degrade the link until
+            // it gave up, which is exactly what a pillow does.
+            //
+            // Note there is deliberately no reset on NEAR: a user who genuinely
+            // got up, came back for something, and left again should not have
+            // to re-earn the walk. The in-bed case is covered by liveness
+            // instead, which revokes after PROX_AWAY_LIVENESS_S of stillness.
+            return admits != 0;
         }
         case PHONE_AWAY: {
             // Mode B: the phone is docked at anchorId, so proximity to that anchor
@@ -2848,8 +2884,14 @@ static uint32_t enforcement_poll_interval_ms() {
     // STILL. Not polling here is *correct*, not merely cheap — a stationary user
     // cannot change proximity class, which is the HMM's whole premise, and the
     // IA1 interrupt restores full responsiveness the instant that premise breaks.
+    //
+    // GET_AWAY is deliberately NOT in this list any more (§13.4-R6). Its premise
+    // — a stationary user cannot change compliance — stopped being true the
+    // moment stillness itself became the thing that revokes an AWAY verdict. On
+    // getAway a motionless wrist is not a reason to stop looking; it is the
+    // observation we are waiting to accumulate.
     if (g_enf.condition_met && g_active_event &&
-        (g_active_event->criteria == STAY_NEAR || g_active_event->criteria == GET_AWAY ||
+        (g_active_event->criteria == STAY_NEAR ||
          g_active_event->criteria == PHONE_AWAY) &&
         prox_hmm_decision() != PROX_HMM_AMBIGUOUS &&
         prox_motion_state() == PROX_MOTION_STILL) {
@@ -2946,6 +2988,10 @@ static void enter_enforcement(Event *e) {
         // Same cold-start rule for the scan cache: history gathered before this
         // window was taken somewhere else entirely.
         prox_scan_cache_reset();
+        // §13.4-R6: the window opens with the user assumed to be where they
+        // sleep, so the locomotion gate starts disarmed. Getting out of bed is
+        // what arms it.
+        if (e->criteria == GET_AWAY) prox_away_gate_reset((uint32_t)time(nullptr));
     }
 
     g_enf.condition_met = is_enforcement_condition_met(e);
@@ -4302,6 +4348,18 @@ static void enter_enforcement_sleep() {
         uint32_t elapsed = (uint32_t)time(nullptr) - g_phone_near_since_ts;
         if (elapsed < (uint32_t)PHONE_AWAY_TOLERANCE_S) {
             uint64_t us_left = (uint64_t)(PHONE_AWAY_TOLERANCE_S - elapsed) * 1000000ULL;
+            if (us_left < sleep_us) sleep_us = us_left;
+        }
+    }
+    // §13.4-R6: same treatment for the locomotion gate's liveness timeout. This
+    // path runs while compliant, and on getAway "compliant" can expire purely by
+    // the passage of still time — with nothing to wake us, since stillness
+    // generates no interrupt. Sleeping past it would let someone who went back
+    // to bed keep the silence for a whole poll interval past the deadline.
+    if (g_active_event && g_active_event->criteria == GET_AWAY) {
+        uint32_t ttl = prox_away_gate_ttl_s((uint32_t)time(nullptr));
+        if (ttl > 0) {
+            uint64_t us_left = (uint64_t)ttl * 1000000ULL;
             if (us_left < sleep_us) sleep_us = us_left;
         }
     }
