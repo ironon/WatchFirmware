@@ -1205,6 +1205,31 @@ static void update_seen_anchor(const uint8_t *uuid, const uint8_t *mac_be,
     }
 }
 
+#if PROX_CAPTURE_ENABLED
+// Drain the capture ring whenever the radio is genuinely free.
+//
+// There used to be exactly one flush point, at the end of
+// prox_aligned_active_scan(). The reasoning was sound — never transmit inside
+// the BLE scan that builds the vector, because on the C3 one radio serves both
+// — but the conclusion was too narrow, and it cost the entire 2026-08-03
+// overnight capture. That single point only fires during a poll, and through an
+// enforcement window the watch spends nearly all its time light-sleeping
+// between polls, with the WiFi association dropped and (see loop()) no
+// reconnect path outside DORMANT. Every record from the window we actually
+// cared about was buffered against a sink that could not succeed.
+//
+// The coex constraint is really "not while a scan is in flight" — a condition
+// we can test directly rather than approximate by choice of call site. So:
+// flush from anywhere, provided no scan is running.
+static void capture_service(uint8_t state) {
+    if (g_ble_scan && g_ble_scan->isScanning()) return;
+    const uint32_t nowt = (uint32_t)time(nullptr);
+    if (nowt > 1700000000u) prox_capture_set_wall(nowt);
+    prox_capture_health_tick(g_wifi_connected ? 1 : 0, state);
+    prox_capture_flush();
+}
+#endif
+
 // Ensure an AnchorRecord exists for the given anchor UUID, creating one in a
 // free slot if necessary. This decouples record existence from the app's IP
 // push (§3.3): any anchor the schedule references becomes a first-class record
@@ -1425,16 +1450,12 @@ static void prox_aligned_active_scan(uint32_t duration_ms) {
     prox_scan_window_close();
 
 #if PROX_CAPTURE_ENABLED
-    // THE flush point on the watch. Records were timestamped when taken, so
-    // shipping them here costs nothing; shipping them any earlier would put a
-    // WiFi transmit inside the BLE scan that builds the vector, and on the C3
-    // one radio serves both. Capture that shrinks the vector it is capturing is
-    // worse than no capture, because the corpus would look authoritative.
-    {
-        const uint32_t nowt = (uint32_t)time(nullptr);
-        if (nowt > 1700000000u) prox_capture_set_wall(nowt);
-        prox_capture_flush();
-    }
+    // The scan has stopped, so the radio is free and this is still the single
+    // best moment to drain — the vector's own records are freshly buffered and
+    // the next scan is a poll interval away. It is no longer the ONLY moment
+    // (see capture_service), which is what the overnight capture proved it had
+    // to stop being.
+    capture_service((uint8_t)g_activity_state);
 #endif
 
     // Restore the low-power passive enforcement scan configuration.
@@ -4336,6 +4357,13 @@ static void enter_dormant_sleep() {
 
     batt_log("pre_sleep");
 
+#if PROX_CAPTURE_ENABLED
+    // Last chance: light sleep costs the WiFi association, so anything still
+    // buffered here is not going anywhere for at least a sleep interval and may
+    // age out of the ring before the link returns.
+    capture_service((uint8_t)g_activity_state);
+#endif
+
     // Analog clock stays lit through DORMANT_SLEEP (§5.7.4): the SK6805 ring
     // latches whatever frame it was last sent, so paint the current time now and
     // it remains visible for the whole sleep. led_update() renders the clock
@@ -4508,6 +4536,12 @@ static void enter_enforcement_sleep() {
 #endif
 
     batt_log("enf_pre_sleep");
+
+#if PROX_CAPTURE_ENABLED
+    // The enforcement window is the whole reason a capture run exists, and this
+    // is where it used to go dark. Drain before sleeping.
+    capture_service((uint8_t)g_activity_state);
+#endif
 
     // Ring off through enforcement sleep too (§5.7 priority 1).
     led_off();
@@ -5767,8 +5801,29 @@ void loop() {
         g_last_activity_ms = now_ms;
     }
 
+#if PROX_CAPTURE_ENABLED
+    // Every loop pass is a flush opportunity; capture_service() no-ops while a
+    // scan is in flight and prox_capture_flush() returns immediately on an empty
+    // ring, so the common case costs a comparison. Placed after the reconnect
+    // detector above so a freshly-restored association is used on the same pass
+    // that established it, rather than a poll interval later.
+    capture_service((uint8_t)g_activity_state);
+#endif
+
     // ---- WiFi scan / reconnect (DORMANT) ----
+    // PROX_CAPTURE_ENABLED also lets this run during ENFORCEMENT. Normally WiFi
+    // is deliberately abandoned once a window opens — nothing in enforcement
+    // needs it and the association costs current. But that is precisely the
+    // window a capture run exists to record, and without a reconnect the sink is
+    // dead for its entire duration: light sleep drops the association, DORMANT
+    // never comes round again, and the records pile up unsent. This is a
+    // diagnostic-build behaviour and a deliberate battery cost; PROX_CAPTURE_ENABLED
+    // is what the shipping build turns off.
+#if PROX_CAPTURE_ENABLED
+    if (g_activity_state == STATE_DORMANT || g_activity_state == STATE_ENFORCEMENT) {
+#else
     if (g_activity_state == STATE_DORMANT) {
+#endif
         if (!g_wifi_connected &&
             (now_ms - g_last_wifi_retry_ms) > (uint32_t)ANCHOR_WIFI_RETRY_INTERVAL_S * 1000UL) {
             g_last_wifi_retry_ms = now_ms;
