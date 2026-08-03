@@ -45,11 +45,25 @@ void prox_feed_wifi_aps() {
     uint32_t now = millis();
 
     // WiFi APs: stationary, so we reuse cached scan results and only rescan when
-    // the cache is stale (§8.2). The scan is skipped entirely when WiFi is not
-    // associated — anchor proximity then runs on BLE alone. This removes the
-    // single largest per-query radio cost when WiFi is in use, and all of it
-    // when WiFi is off.
-    if (WiFi.status() == WL_CONNECTED &&
+    // the cache is stale (§8.2). This keeps the single largest per-query radio
+    // cost down to once per PROX_WIFI_SCAN_INTERVAL_MS.
+    //
+    // The scan used to require WL_CONNECTED, and that was the bug: an AP scan
+    // needs the WiFi DRIVER, not an association. Through an enforcement window
+    // the watch light-sleeps between polls and loses the link, so the condition
+    // was false exactly when it mattered, the cache aged past its 2x window, and
+    // the APs were dropped. The 2026-08-03 overnight corpus is the evidence —
+    // 1470 watch vector entries, every one of them BLE, in a room whose BLE
+    // population is 7 enrollable emitters at the noise floor.
+    //
+    // Access points are what that room is short of: BSSIDs do not rotate, they
+    // are mains-powered so a scan catches them deterministically, and they
+    // transmit ~20 dBm against a beacon's ~0 dBm. Gating them on an association
+    // the watch deliberately drops threw away the best emitters available.
+    wifi_mode_t wmode;
+    const bool wifi_driver_up = (esp_wifi_get_mode(&wmode) == ESP_OK) &&
+                                (wmode == WIFI_MODE_STA || wmode == WIFI_MODE_APSTA);
+    if (wifi_driver_up &&
         (g_wifi_cache_ms == 0 || now - g_wifi_cache_ms > PROX_WIFI_SCAN_INTERVAL_MS)) {
         wifi_scan_config_t cfg = {};
         cfg.show_hidden = false;
@@ -72,6 +86,8 @@ void prox_feed_wifi_aps() {
             }
             esp_wifi_clear_ap_list();
             g_wifi_cache_ms = now;
+            Serial.printf("[PROX] WiFi AP scan: %u cached\n",
+                          (unsigned)g_wifi_cache_count);
         }
     }
 
