@@ -4,6 +4,8 @@ ESP32-C3 firmware for the Impulse watch — the wearable that holds the schedule
 
 Full specification: **[firmware_spec_v2.md](firmware_spec_v2.md)** (§5 is the watch). Product framing: **[impulse_overview.md](impulse_overview.md)**.
 
+> **The watch hardware is moving off the ESP32-C3.** A board was ordered 2026-08-07 built on Fanstel BM20C (nRF54LM20A) + WM02E, which means Zephyr rather than Arduino, SWD rather than USB, and a proximity engine replaced by channel sounding. **Everything in this repo still runs, and is still the only firmware that exists** — but check [§1.3 of the spec](firmware_spec_v2.md) and [`docs/agent-notes.md`](../../vault/docs/agent-notes.md) before starting anything large here, because the port may be a better place to spend it.
+
 ---
 
 ## What it is
@@ -46,7 +48,7 @@ UNPAIRED  ──first BLE connection──►  DORMANT  ◄──►  DORMANT_SL
 | [src/imu.cpp](src/imu.cpp) | LIS3DH over SPI: motion interrupt config and the per-poll accelerometer burst. |
 | [src/led_status.cpp](src/led_status.cpp) | Status ring. Never affects enforcement logic. |
 | [firmware_spec_v2.md](firmware_spec_v2.md) | The specification for watch **and** anchor, including the pin map, GATT contract, and wire formats. |
-| [firmware_spec_v0.9_amendment.md](firmware_spec_v0.9_amendment.md) | Proximity-v2 delta: beacon schedule, vector trailer, phase map. |
+| [firmware_spec_v2.md §4.12, §5.4.5, §10-A](firmware_spec_v2.md) | Proximity-v2: beacon schedule, motion channel, vector trailer, phase map. Merged in from the former v0.9 amendment (archived at `vault/docs/archive/`); each block is marked shipped / partly shipped / planned. |
 
 The proximity algorithms are **not** in this repo. They live in [`proximity_engine`](../proximity_engine/README.md), symlinked in as a PlatformIO library and built with `-DPROXIMITY_ROLE_WATCH`. Nothing here should contain proximity logic; this side only supplies platform seams and calls the public API.
 
@@ -71,4 +73,4 @@ Firmware v0.8 shipped; v0.9 (proximity v2) is in progress on `prox-v2-p1`, now m
 Two things to know before touching hardware:
 
 - **The build tree is tracked in git.** A CMake `build/` directory is under version control and generates spurious diffs on every local build. It should be gitignored and untracked.
-- **The LED ring shares GPIO 10 with the vibration motor** on the current hardware revision, where the motor is disabled by a PCB switch. The next revision moves the ring and restores the motor. The data pin is a single named constant for exactly this reason — see the spec's LED note before wiring anything.
+- **The LED ring shares GPIO 10 with the vibration motor** on every board that exists, where the motor is disabled by a PCB switch. The data pin is a single named constant for exactly this reason — see the spec's LED note before wiring anything. The fix is not another ESP32 revision: the pin share is designed out on the nRF board ordered 2026-08-07 (ring `P0.02`, motor `P1.02`, spec §1.3), which hasn't arrived. Until it does, **this constraint still governs every demo and every piece of marketing copy** — `launch-plan.md` §10 forbids showing vibration and the ring on one unit.

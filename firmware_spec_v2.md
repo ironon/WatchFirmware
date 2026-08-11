@@ -1,1 +1,1 @@
-../../docs/specs/firmware_spec_v2.md
+../../vault/docs/specs/firmware_spec_v2.md

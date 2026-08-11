@@ -140,6 +140,28 @@
 // enforcement kicks in — "a quick check is fine." Uses wall-clock (time()) so it
 // survives enforcement light sleep. (Tunable; could become a per-event field.)
 #define PHONE_AWAY_TOLERANCE_S                     60
+
+// Dock-watch scan (§5.4.1). During a phoneAway window the watch runs a short
+// passive scan on this cadence, independent of the enforcement poll, purely to
+// catch the dock anchor's ANCHOR_ADV_FLAG_UNDOCKED bit (§4.11.1) while it is
+// still in range of it.
+//
+// It cannot ride the enforcement poll. That poll runs every 180 s while
+// compliant and every 600 s once the HMM is confident and the wrist is STILL —
+// and phoneAway is in that third tier — whereas the window in which the watch is
+// still near enough to hear the anchor is however long it takes the user to pick
+// up their phone and leave the room. The poll would miss it essentially always.
+//
+// Cheap enough to run at this cadence because it is nothing like a poll: no
+// engine scan vector, no WiFi scan, no BLE connect, no phone-link eviction. One
+// short passive listen for an advertisement the anchor is already sending.
+#define DOCK_WATCH_SCAN_INTERVAL_MS              10000
+#define DOCK_WATCH_SCAN_MS                         600   // ~5 anchor ad windows
+
+// Anchor advertised status flags — must match ANCHOR_ADV_FLAG_* in
+// AnchorFirmware/src/main.cpp. Byte 25 of the manufacturer payload, appended
+// past the 25-byte iBeacon layout (§4.11.1).
+#define ANCHOR_ADV_FLAG_UNDOCKED                  0x01
 #define MINIMUM_BLE_DELAY_DORMANT               5000  // ms before re-arming IMU interrupt in DORMANT
 #define MINIMUM_BLE_DELAY_ENFORCEMENT           3000  // ms before re-arming IMU interrupt in ENFORCEMENT
 #define WIFI_SCAN_INTERVAL_S             120
@@ -490,6 +512,34 @@ static uint32_t g_last_wifi_retry_ms    = 0;
 // phoneAway tolerance: wall-clock time() the watch first went NEAR the docked
 // phone in the active event (0 = currently away/compliant). See PHONE_AWAY_TOLERANCE_S.
 static uint32_t g_phone_near_since_ts   = 0;
+
+// ── phoneAway undock latch (§5.4.1) ──────────────────────────────────────────
+// True once the watch has observed the active event's dock anchor ADVERTISING
+// that the phone left it (ANCHOR_ADV_FLAG_UNDOCKED, §4.11.1). Cleared only by
+// observing the same anchor advertise docked again, or by leaving the window.
+//
+// The latch is the whole point, and it is not a cache. The dock signal the watch
+// reads over a connection is only available while the watch is in radio range of
+// the anchor — and the violation this criterion exists to catch is "the user
+// picked the phone up and walked off with it", which ends that range within
+// seconds. Once out of range the two states the watch must distinguish,
+//
+//     walked away, phone still docked   → compliant
+//     walked away carrying the phone    → violation
+//
+// are indistinguishable: both read as "anchor unreachable", which
+// query_anchor_proximity() reports as dock == -1 and the criterion fail-opens to
+// docked. So the watch has one opportunity to see the undock — the few seconds
+// it is still standing at the dock — and it must hold on to what it saw. The
+// dock-watch scan below is what makes sure it is looking.
+//
+// Deliberately NOT cleared by distance or by time. Walking further away, or
+// waiting, must never end an enforcement; the only exit is putting the phone
+// back, which requires returning to the anchor and is exactly the behaviour the
+// commitment is asking for.
+static bool     g_phone_undock_latched  = false;
+// millis() of the last dock-watch scan (0 = none this window).
+static uint32_t g_dock_watch_last_ms    = 0;
 // Donning grace (§5.4.4): wall-clock time() at which the active event's donning
 // grace expires (0 = no grace active). Uses time() so it survives light sleep,
 // like the phoneAway tolerance. While now < deadline the condition short-circuits
@@ -1304,6 +1354,42 @@ void beep(int count) {
     }
 }
 
+// Apply an anchor's advertised dock flag (§4.11.1) to the phoneAway latch.
+//
+// Scoped hard to the active event's own anchor. Any device can advertise Major
+// 0x4A0F (§5.5.3 names this as the security boundary for anchor-sourced data),
+// so a flag from an anchor that is not the one this commitment names must not be
+// able to start an enforcement — otherwise a stranger's beacon is a remote alarm
+// trigger. The reverse direction is equally scoped: only the real dock anchor
+// saying "docked" can clear the latch, so a spoofed clear needs the same UUID.
+//
+// Latching is edge-safe and idempotent: this runs once per received
+// advertisement, several times a second during a dock-watch scan.
+static void note_anchor_dock_flag(const uint8_t *anchor_uuid, bool undocked) {
+    if (g_activity_state != STATE_ENFORCEMENT) return;
+    if (!g_active_event || g_active_event->criteria != PHONE_AWAY) return;
+    if (!uuid_eq(anchor_uuid, g_active_event->anchorId)) return;
+
+    if (undocked) {
+        if (!g_phone_undock_latched) {
+            g_phone_undock_latched = true;
+            Serial.println("[DOCK] anchor advertises UNDOCKED — latching violation "
+                           "(cleared only by re-docking)");
+            // Force the next loop iteration to re-evaluate rather than waiting
+            // out the poll boundary, which is 180 s away at best and 600 s away
+            // on the STILL tier that phoneAway sits in. Scanning every 10 s and
+            // then sitting on the answer for ten minutes would defeat the point.
+            // A single aligned 32-bit store; this runs on the NimBLE scan task
+            // and the loop task only ever compares the value.
+            g_last_enf_poll_ms = 0;
+        }
+    } else if (g_phone_undock_latched) {
+        g_phone_undock_latched = false;
+        Serial.println("[DOCK] anchor advertises docked again — latch cleared");
+        g_last_enf_poll_ms = 0;
+    }
+}
+
 class WatchScanCallbacks : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override {
         int8_t rssi = (int8_t)dev->getRSSI();
@@ -1349,6 +1435,19 @@ class WatchScanCallbacks : public NimBLEScanCallbacks {
         // be handed over unconditionally.
         const uint16_t minor = (uint16_t)(((uint8_t)mfr[22] << 8) | (uint8_t)mfr[23]);
         prox_obs_note(mac_be, minor, rssi);
+
+        // Advertised status flags (§4.11.1), byte 25 — appended past the iBeacon
+        // layout, so an anchor on older firmware simply stops short and reports
+        // nothing rather than mis-parsing.
+        //
+        // Handled HERE, above the LO-slot return below, on purpose. That return
+        // exists because a reduced-power slot's RSSI does not describe distance,
+        // which has no bearing on a status bit: dropping LO ads would throw away
+        // half the advertisements carrying the flag and double the time the watch
+        // needs to notice an undock, during the one window it has to notice it.
+        if (mfr.size() >= 26)
+            note_anchor_dock_flag(anchor_uuid,
+                                  ((uint8_t)mfr[25] & ANCHOR_ADV_FLAG_UNDOCKED) != 0);
 
         // Is this a reduced-power slot? Everything below that records an RSSI as
         // if it described the anchor's distance must ignore those, because a LO
@@ -2824,8 +2923,24 @@ static bool is_enforcement_condition_met(const Event *e) {
             //    is allowed; only sustained access past PHONE_AWAY_TOLERANCE_S enforces.
             int8_t dock = -1;
             ProxProximity prox = query_anchor_proximity(e, &dock);
-            bool undocked   = (dock == 0);
+            // The latch (§5.4.1) is the out-of-range half of the dock signal: the
+            // connected read above only answers while the anchor is reachable,
+            // and it reports dock == -1 → "docked" the moment it is not. Without
+            // the latch, walking out of the room carrying the phone is the single
+            // most compliant-looking thing a user can do on this criterion.
+            bool undocked   = (dock == 0) || g_phone_undock_latched;
             bool near_phone = undocked || (prox == PROX_NEAR);
+            // A connected read is a first-hand observation and outranks a
+            // remembered advertisement: if the anchor is reachable and says the
+            // phone is back on it, the violation is over regardless of what was
+            // latched. This is the same clearing rule as note_anchor_dock_flag(),
+            // just over the connection instead of the air.
+            if (dock == 1 && g_phone_undock_latched) {
+                g_phone_undock_latched = false;
+                Serial.println("[DOCK] connected read says docked — latch cleared");
+                undocked   = false;
+                near_phone = (prox == PROX_NEAR);
+            }
             if (!near_phone) { g_phone_near_since_ts = 0; return true; }  // compliant; reset grace
 
             uint32_t now_ts = (uint32_t)time(nullptr);
@@ -3176,6 +3291,31 @@ static void check_enforcement_condition() {
     }
 }
 
+// Dock-watch (§5.4.1): during a phoneAway window, listen for the dock anchor's
+// advertised undock flag on DOCK_WATCH_SCAN_INTERVAL_MS, independent of the
+// enforcement poll. The scan is asynchronous — WatchScanCallbacks::onResult runs
+// note_anchor_dock_flag() on each advertisement received — so this returns
+// immediately and costs the loop nothing.
+//
+// Runs only while compliant. Once the latch has fired and enforcement is
+// running, the poll cadence is already the fast ENFORCEMENT_POLL_INTERVAL_S tier
+// and the connected read is both authoritative and available (the user has to be
+// back at the anchor to re-dock anyway), so there is nothing left for a
+// background scan to add.
+static void dock_watch_tick() {
+    if (!g_active_event || g_active_event->criteria != PHONE_AWAY) return;
+    if (!g_enf.condition_met) return;
+    if (grace_active()) return;                 // donning grace suppresses everything
+    if (g_ble_scan && g_ble_scan->isScanning()) return;
+
+    uint32_t now_ms = millis();
+    if (g_dock_watch_last_ms != 0 &&
+        (now_ms - g_dock_watch_last_ms) < DOCK_WATCH_SCAN_INTERVAL_MS) return;
+    g_dock_watch_last_ms = now_ms;
+
+    start_ble_scan(DOCK_WATCH_SCAN_MS);
+}
+
 // ============================================================
 //  State transitions
 // ============================================================
@@ -3192,6 +3332,11 @@ static void enter_enforcement(Event *e) {
     batt_log("enforcement_enter");
     g_active_event   = e;
     g_phone_near_since_ts = 0;   // reset phoneAway tolerance grace for the new event
+    // A latched violation belongs to the window it was observed in and must not
+    // be inherited by the next one — a phone left off the dock at the end of
+    // Monday's block is not a violation of Tuesday's.
+    g_phone_undock_latched = false;
+    g_dock_watch_last_ms   = 0;
 
     // §5.4.4 window-start worn check: if this event beeps anchors and the watch
     // is already unworn at window start, notify beepAnchors immediately — do not
@@ -4612,6 +4757,19 @@ static void enter_enforcement_sleep() {
     if (grace_active()) {
         uint64_t us_to_grace = (uint64_t)(g_grace_deadline - time(nullptr)) * 1000000ULL;
         if (us_to_grace < sleep_us) sleep_us = us_to_grace;
+    }
+    // Never sleep past the next dock-watch scan (§5.4.1). This path runs while
+    // compliant, which is exactly when the dock-watch is the thing doing the
+    // work — sleeping the 180 s (or 600 s) poll interval through it would leave
+    // the watch deaf for the entire window in which the anchor is advertising the
+    // undock and still in range, which is the only window there is. Costs one
+    // short passive scan per 10 s for the duration of a phoneAway window.
+    if (g_active_event && g_active_event->criteria == PHONE_AWAY) {
+        uint32_t since = millis() - g_dock_watch_last_ms;
+        uint64_t us_left = since >= DOCK_WATCH_SCAN_INTERVAL_MS
+                               ? 0ULL
+                               : (uint64_t)(DOCK_WATCH_SCAN_INTERVAL_MS - since) * 1000ULL;
+        if (us_left < sleep_us) sleep_us = us_left;
     }
     // Same cap for phoneAway's tolerance. The early return above already keeps the
     // watch awake for the whole window, so this only matters if the user drifts
@@ -6175,6 +6333,11 @@ void loop() {
         if (g_active_event && now_min >= g_active_event->endTime) {
             exit_enforcement();
         } else {
+            // phoneAway dock-watch (§5.4.1) — runs on its own 10 s cadence
+            // between polls, which is the only way the undock is seen before the
+            // user carries the phone out of range.
+            dock_watch_tick();
+
             // Periodic condition poll (adaptive cadence — §8.2)
             if ((now_ms - g_last_enf_poll_ms) > enforcement_poll_interval_ms()) {
                 g_last_enf_poll_ms = now_ms;

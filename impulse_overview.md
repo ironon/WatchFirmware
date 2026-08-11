@@ -1,1 +1,1 @@
-../../docs/specs/impulse_overview.md
+../../vault/docs/specs/impulse_overview.md

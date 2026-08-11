@@ -1,1 +1,1 @@
-../../../docs/hardware-notes/version_bump.md
+../../../vault/docs/hardware-notes/version_bump.md
