@@ -450,6 +450,20 @@ static char     g_current_ssid[64] = {};
 static UnreachableNotification g_unreachable_queue[MAX_UNREACHABLE_QUEUE];
 static int                     g_unreachable_count = 0;
 
+// Last effective proximity verdict and when it was reached, for the LED ring
+// (§5.7.5). This is the verdict enforcement actually ACTED ON — after the NEAR
+// floor and after PROX_V2_AUTHORITATIVE has picked a side — not the raw v0.8
+// score and not the HMM's own decision, either of which would show the user
+// something the watch did not do. Written by every path that produces a verdict;
+// see prox_note_verdict().
+static ProxProximity g_prox_last_verdict = PROX_AMBIGUOUS;
+static uint32_t      g_prox_last_ms      = 0;   // millis(); 0 = never queried
+// A verdict older than this is shown as "undecided" rather than as fact. Sized
+// off the slowest poll tier (ENFORCEMENT_POLL_INTERVAL_MET_S) plus a margin, so a
+// window polling normally never flickers to stale, but one whose polls have
+// stopped — a hung query, a window that just opened — admits it.
+#define PROX_VERDICT_FRESH_MS   ((uint32_t)(ENFORCEMENT_POLL_INTERVAL_MET_S + 60) * 1000UL)
+
 // Worn detection
 static bool    g_worn                                    = false;
 static uint8_t g_worn_buffer[IR_WORN_DEBOUNCE_SAMPLES]   = {};
@@ -802,6 +816,9 @@ static LedStatusInput led_status_input() {
     in.in_grace          = tolerance_grace_active(&in.grace_progress_u8);
     in.output_active     = g_out_any_on;
     in.output_since_ms   = g_out_edge_ms;
+    in.prox_verdict      = (LedProxVerdict)g_prox_last_verdict;
+    in.prox_fresh        = g_prox_last_ms != 0 &&
+                           (millis() - g_prox_last_ms) < PROX_VERDICT_FRESH_MS;
     time_t lt = local_now();
     struct tm ti;
     gmtime_r(&lt, &ti);
@@ -1693,10 +1710,24 @@ static void try_connect_saved_wifi() {
 // idle wake from busy-waiting up to WIFI_CONNECT_TIMEOUT_MS × creds.
 static uint8_t g_wifi_try_idx = 0;
 static void try_connect_saved_wifi_async() {
-    if (g_wifi_cred_count == 0) return;
+    // Say something on every path. This function used to be entirely silent,
+    // including on the `no saved credentials` early return — so a watch that
+    // could never reach an anchor looked exactly like a watch that was simply
+    // choosing not to, and the only visible symptom was an anchor that never
+    // beeped (§5.5.1 makes anchor escalation UDP-only, so no WiFi = no
+    // escalation, ever). Diagnosed on the bench 2026-08-10 by finding the anchor
+    // in the host's ARP table and the watch absent from it.
+    if (g_wifi_cred_count == 0) {
+        Serial.println("[WiFi] no saved credentials — cannot reach anchors "
+                       "(anchor beeping is UDP-only, §5.5.1)");
+        return;
+    }
     if (WiFi.status() == WL_CONNECTED) return;
     uint8_t i = g_wifi_try_idx % g_wifi_cred_count;
     g_wifi_try_idx++;
+    Serial.printf("[WiFi] async connect attempt -> \"%s\" (cred %u/%u, status=%d)\n",
+                  g_wifi_creds[i].ssid, (unsigned)(i + 1),
+                  (unsigned)g_wifi_cred_count, (int)WiFi.status());
     WiFi.begin(g_wifi_creds[i].ssid, g_wifi_creds[i].pass);
 }
 
@@ -2036,6 +2067,12 @@ static void notify_seen_anchors() {
 // PROX_V2_AUTHORITATIVE is 0 the v0.8 verdict remains binding, so an evening of
 // field logging can show what v2 *would* have done before it is allowed to do
 // it. Flipping the constant to 1 is the whole of the cutover.
+static void prox_note_verdict(ProxProximity p) {
+    g_prox_last_verdict = p;
+    g_prox_last_ms      = millis();
+    if (g_prox_last_ms == 0) g_prox_last_ms = 1;   // 0 is reserved for "never"
+}
+
 static ProxProximity prox_decide(ProxProximity v08, ProxDecision v2, const char *what,
                                  int score = -1, int thr = -1) {
     static const char *kName[] = { "NEAR", "AWAY", "AMBIG" };
@@ -2072,8 +2109,46 @@ static ProxProximity prox_decide(ProxProximity v08, ProxDecision v2, const char 
                   emit, pdr,
                   (v08 != v2p) ? "  <-- DIVERGED" : "");
 #if PROX_V2_AUTHORITATIVE
+    // NEAR floor (§13.0). A confident v0.8 NEAR binds even when the filter has
+    // not got there yet; every other verdict is still the HMM's to make.
+    //
+    // Measured on the bench 2026-08-10, watch ~1 m from its anchor, motionless:
+    //
+    //   v0.8=NEAR v2=AWAY   p_near=16  lam=-731  score=209/170 emit=+152
+    //   v0.8=NEAR v2=AMBIG  p_near=120 lam=-34   score=213/170 emit=+184
+    //   v0.8=NEAR v2=AMBIG  p_near=120 lam=-34   score=205/170 emit=+120
+    //
+    // lam is FROZEN across consecutive polls. That is the still-window ceiling in
+    // hmm_fold() doing its job — a motionless wrist earns no fresh fading draw, so
+    // the window's evidence is capped at one observation's worth and re-reading the
+    // same strong score adds nothing. Correct as a defence against a parked wrist
+    // marching to false confidence; wrong as the last word here, because it leaves
+    // the posterior wherever the window's *first* observation happened to put it and
+    // no amount of subsequent agreement can move it.
+    //
+    // The engine's own asymmetry says which way to break the tie. Passive
+    // attenuation can fabricate AWAY but never NEAR — a body, a pillow or a pocket
+    // only ever removes signal — so a score that clears the anchor's calibrated
+    // cutoff plus hysteresis cannot be an artefact of a degraded link. Concluding
+    // NEAR is the cheap direction and needs no corroboration; concluding AWAY is
+    // the expensive one and still goes the long way round through the filter.
+    //
+    // This is deliberately NOT a revert of the v2 cutover. AWAY, AMBIGUOUS, the
+    // connect-failure channel, PDR and the locomotion gate are all untouched — the
+    // only thing that changes is that the filter can no longer talk the watch out
+    // of a NEAR it can see directly. Without it getAway silently goes compliant
+    // while the user stands next to the anchor, which is the criterion's whole
+    // failure mode (§13.4-R6 guards the opposite direction).
+    if (v08 == PROX_NEAR && v2p != PROX_NEAR) {
+        Serial.printf("[PROXv2] %s: NEAR floor — v0.8 NEAR binds over v2 %s (§13.0)\n",
+                      what, kName[v2p]);
+        prox_note_verdict(PROX_NEAR);
+        return PROX_NEAR;
+    }
+    prox_note_verdict(v2p);
     return v2p;
 #else
+    prox_note_verdict(v08);
     return v08;
 #endif
 }
@@ -2165,6 +2240,7 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
         static const char *kName[] = { "NEAR", "AWAY", "AMBIG" };
         Serial.printf("[V0] STUB ENGINE: forcing %s (no scan, no connect) — "
                       "every commitment is noncompliant\n", kName[forced]);
+        prox_note_verdict(forced);
         return forced;
     }
 #endif
@@ -2216,6 +2292,7 @@ static ProxProximity query_anchor_proximity(const Event *e, int8_t *out_dock = n
     }
     if (!rec || !rec->bleMacValid) {
         Serial.println("[PROX] Anchor MAC unknown after scan — AMBIGUOUS");
+        prox_note_verdict(PROX_AMBIGUOUS);
         return PROX_AMBIGUOUS;
     }
 
@@ -3011,8 +3088,41 @@ static uint32_t enforcement_poll_interval_ms() {
     return s * 1000UL;
 }
 
+// Re-assert the anchor escalation for an unworn watch (§5.5.1).
+//
+// WATCH_REMOVED was edge-triggered and sent exactly once — at the worn→removed
+// transition, or at window start if the watch was already off. Three ways that
+// loses the escalation outright, all of them observed or reachable on the bench:
+//
+//   * No WiFi at the instant of the edge. send_to_anchors() logs "NOT SENT" and
+//     gives up; the association coming back a minute later changes nothing,
+//     because the edge is gone. A watch that spends a window unworn and offline
+//     never escalates at all.
+//   * A dropped datagram. This is UDP with no acknowledgement — the retry loop
+//     covers a busy socket, not a lost packet, and endPacket() reports success
+//     either way.
+//   * The anchor stopping on its own. ANCHOR_MAX_BEEP_MINUTES_DEFAULT is 30, and
+//     an anchor that reboots mid-window comes back with no active alarm. Nothing
+//     ever told it to start again.
+//
+// So the state is re-asserted every poll instead of announced once. It is
+// idempotent by construction: the anchor replies "already beeping" and does
+// nothing (handle_udp, cmd 0x01), and every one of its own guards — window,
+// negation, beep list, schedule — is re-evaluated on each packet, so this can
+// only ever restart an alarm that *should* be running. The cost is one 33-byte
+// datagram per enforcement poll.
+static void reassert_anchor_escalation() {
+    if (g_activity_state != STATE_ENFORCEMENT || !g_active_event) return;
+    if (g_active_event->beepAnchorCount == 0) return;
+    if (g_worn) return;                 // worn watch: the watch itself enforces
+    if (grace_active()) return;         // donning grace suppresses output entirely
+    Serial.println("[GRACE] Still unworn in window — re-asserting WATCH_REMOVED");
+    send_watch_removed_to_anchors(g_active_event);
+}
+
 static void check_enforcement_condition() {
     if (!g_active_event) return;
+    reassert_anchor_escalation();
     uint32_t t0 = millis();
     bool met = is_enforcement_condition_met(g_active_event);
     // One line per poll, always — a poll that quietly returned "met" is exactly
@@ -4550,8 +4660,15 @@ static void enter_enforcement_sleep() {
     capture_service((uint8_t)g_activity_state);
 #endif
 
-    // Ring off through enforcement sleep too (§5.7 priority 1).
-    led_off();
+    // Keep the proximity pilot lit through enforcement sleep (§5.7.5) instead of
+    // clearing the ring. An enforcement window is mostly asleep, so a ring that
+    // goes dark at every sleep is dark almost the whole window — which is what
+    // made "what does the watch currently think?" unanswerable without a serial
+    // cable. Two LEDs, latched by the SK6805 with the CPU asleep, at the same
+    // standing cost DORMANT already pays for its analog clock.
+    led_show_prox_pilot((LedProxVerdict)g_prox_last_verdict,
+                        g_prox_last_ms != 0 &&
+                        (millis() - g_prox_last_ms) < PROX_VERDICT_FRESH_MS);
 
 #if MEASURE_USAGE
     usage_before_sleep();
@@ -5806,6 +5923,10 @@ void loop() {
         recalculate_and_rearm();
         push_watch_status();
         g_last_activity_ms = now_ms;
+        // An escalation that was dropped for want of WiFi is owed immediately,
+        // not at the next poll boundary up to ENFORCEMENT_POLL_INTERVAL_MET_S
+        // away. This is the exact moment the missing precondition arrives.
+        reassert_anchor_escalation();
     }
 
 #if PROX_CAPTURE_ENABLED
@@ -5817,20 +5938,30 @@ void loop() {
     capture_service((uint8_t)g_activity_state);
 #endif
 
-    // ---- WiFi scan / reconnect (DORMANT) ----
-    // PROX_CAPTURE_ENABLED also lets this run during ENFORCEMENT. Normally WiFi
-    // is deliberately abandoned once a window opens — nothing in enforcement
-    // needs it and the association costs current. But that is precisely the
-    // window a capture run exists to record, and without a reconnect the sink is
-    // dead for its entire duration: light sleep drops the association, DORMANT
-    // never comes round again, and the records pile up unsent. This is a
-    // diagnostic-build behaviour and a deliberate battery cost; PROX_CAPTURE_ENABLED
-    // is what the shipping build turns off.
+    // ---- WiFi scan / reconnect (DORMANT, and enforcement windows that need it) ----
+    //
+    // "WiFi is deliberately abandoned once a window opens — nothing in enforcement
+    // needs it" was the rule here, and it is not true. §5.5.1 makes anchor
+    // escalation UDP-only, so an event with beepAnchors needs the association for
+    // the whole window: enforcement light sleep drops it, DORMANT never comes
+    // round again to rebuild it, and send_to_anchors() then refuses every
+    // WATCH_REMOVED for the rest of the window with "NOT SENT: no WiFi". The
+    // anchor stays silent through an entire commitment and nothing says why.
+    //
+    // Until now the reconnect only survived because PROX_CAPTURE_ENABLED happened
+    // to switch it on for capture builds — i.e. the shipping build was the broken
+    // one, and the diagnostic build could not reproduce it. So the need is stated
+    // directly instead: reconnect during enforcement when the active event beeps
+    // anchors (it needs the socket), or when a capture run needs the sink.
+    const bool enf_needs_wifi = (g_activity_state == STATE_ENFORCEMENT) &&
+                                g_active_event && g_active_event->beepAnchorCount > 0;
 #if PROX_CAPTURE_ENABLED
-    if (g_activity_state == STATE_DORMANT || g_activity_state == STATE_ENFORCEMENT) {
+    const bool enf_wifi_wanted = (g_activity_state == STATE_ENFORCEMENT);
+    (void)enf_needs_wifi;   // capture builds want it for every window, not just these
 #else
-    if (g_activity_state == STATE_DORMANT) {
+    const bool enf_wifi_wanted = enf_needs_wifi;
 #endif
+    if (g_activity_state == STATE_DORMANT || enf_wifi_wanted) {
         if (!g_wifi_connected &&
             (now_ms - g_last_wifi_retry_ms) > (uint32_t)ANCHOR_WIFI_RETRY_INTERVAL_S * 1000UL) {
             g_last_wifi_retry_ms = now_ms;
@@ -5965,6 +6096,88 @@ void loop() {
             nvs_flash_erase();
             delay(100);
             ESP.restart();
+        }
+        // 0xB0 → set WiFi credentials.  [0xB0][ssid_len][ssid][pass_len][pass]
+        //
+        // Both of the watch's provisioning paths — WiFi credentials and the
+        // clock — are BLE-only, which makes them unreachable from a bench that
+        // has a cable but no working BLE central. That is not hypothetical: on
+        // 2026-08-10 this watch sat with no credentials at all, and because WiFi
+        // is what feeds SNTP it also sat with a 1952 clock. Between them that is
+        // every anchor escalation (UDP needs the association) and every window
+        // boundary (matched on the local minute) broken at once, with a serial
+        // console right there unable to fix either.
+        //
+        // Same bargain as 0xAF above: a cable is already required, so this grants
+        // no escape a reflash would not, and it is compiled out of any build that
+        // is not a bench build.
+        else if (cmd == 0xB0) {
+            char ssid[64] = {0}, pass[64] = {0};
+            Serial.setTimeout(2000);
+            uint8_t sl = 0, pl = 0;
+            if (Serial.readBytes(&sl, 1) != 1 || sl >= sizeof(ssid)) {
+                Serial.println("BENCH_WIFI_SET: bad ssid length"); continue;
+            }
+            if (Serial.readBytes((uint8_t *)ssid, sl) != sl) {
+                Serial.println("BENCH_WIFI_SET: short ssid"); continue;
+            }
+            if (Serial.readBytes(&pl, 1) != 1 || pl >= sizeof(pass)) {
+                Serial.println("BENCH_WIFI_SET: bad pass length"); continue;
+            }
+            if (Serial.readBytes((uint8_t *)pass, pl) != pl) {
+                Serial.println("BENCH_WIFI_SET: short pass"); continue;
+            }
+            g_wifi_cred_count = 1;
+            strlcpy(g_wifi_creds[0].ssid, ssid, sizeof(g_wifi_creds[0].ssid));
+            strlcpy(g_wifi_creds[0].pass, pass, sizeof(g_wifi_creds[0].pass));
+            save_wifi_creds();
+            // Password deliberately not echoed — this log is routinely pasted
+            // into issues and agent transcripts.
+            Serial.printf("BENCH_WIFI_SET: ssid=\"%s\" (%u-char password) — connecting\n",
+                          g_wifi_creds[0].ssid, (unsigned)pl);
+            try_connect_saved_wifi();
+            Serial.printf("BENCH_WIFI_SET: %s\n",
+                          g_wifi_connected ? "CONNECTED" : "FAILED");
+            if (g_wifi_connected) recalculate_and_rearm();
+        }
+        // 0xB1 → set the clock.  [0xB1][utc_epoch u32 LE][tz_offset_min i16 LE]
+        //
+        // The BLE Time characteristic's §9.7 guard (a clock write may not escape
+        // the active enforcement window) is deliberately NOT applied here. That
+        // guard defends a commitment against its owner holding the phone; this
+        // opcode is only reachable with a cable and only in a bench build, and
+        // its whole purpose is repositioning the clock to line a window up for a
+        // test or a take. Enforcing it would make the opcode useless in exactly
+        // the case it exists for.
+        else if (cmd == 0xB1) {
+            uint8_t b[6];
+            Serial.setTimeout(2000);
+            if (Serial.readBytes(b, 6) != 6) {
+                Serial.println("BENCH_TIME_SET: short payload"); continue;
+            }
+            uint32_t epoch = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                             ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+            int16_t  tz    = (int16_t)((uint16_t)b[4] | ((uint16_t)b[5] << 8));
+
+            g_tz_offset_min = tz;
+            prefs.begin("watch", false);
+            prefs.putShort("tz_off", g_tz_offset_min);
+            prefs.end();
+            configTime((long)g_tz_offset_min * 60, 0, "pool.ntp.org");
+
+            struct timeval tv;
+            tv.tv_sec  = (time_t)epoch;
+            tv.tv_usec = 0;
+            settimeofday(&tv, nullptr);
+
+            time_t lt = local_now();
+            struct tm ti;
+            gmtime_r(&lt, &ti);
+            Serial.printf("BENCH_TIME_SET: epoch=%lu tz=%d → local %04d-%02d-%02d %02d:%02d:%02d\n",
+                          (unsigned long)epoch, (int)tz,
+                          ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                          ti.tm_hour, ti.tm_min, ti.tm_sec);
+            recalculate_and_rearm();
         }
 #endif
 #if MEASURE_USAGE

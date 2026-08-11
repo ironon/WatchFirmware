@@ -76,7 +76,28 @@ static void led_set_defaults() {
     s_cfg.slots[LED_SLOT_WAKE_TIMER]    = {  0, 180, 255, 0, 0};                                  // light blue
     s_cfg.slots[LED_SLOT_WAKE_BLE]      = {255, 255, 255, 0, 0};                                  // white
     s_cfg.slots[LED_SLOT_ENFORCE_GRACE] = {255, 200,   0, 0, 0};                                  // yellow, progress bar (timings unused)
+    // Proximity verdict. Magenta/green rather than red/green: red is the alarm and
+    // must not also mean "near", and the pair has to stay separable on camera and
+    // for the red-green colour blind, which a red/green pair is not. Timings unused
+    // (both render steady).
+    s_cfg.slots[LED_SLOT_PROX_NEAR]     = {255,   0, 120, 0, 0};                                  // magenta
+    s_cfg.slots[LED_SLOT_PROX_AWAY]     = {  0, 255,  60, 0, 0};                                  // green
 }
+
+// Colour for a proximity verdict. AMBIG — and anything stale — borrows
+// ENFORCE_IDLE's orange, so "I have not decided" reads as the same neutral the
+// ring has always used for a quiet enforcement window, and is never mistaken for
+// a decision.
+static CRGB prox_color(LedProxVerdict v, bool fresh) {
+    const LedSlotCfg &c =
+        (!fresh || v == LED_PROX_AMBIG) ? s_cfg.slots[LED_SLOT_ENFORCE_IDLE]
+      : (v == LED_PROX_NEAR)            ? s_cfg.slots[LED_SLOT_PROX_NEAR]
+                                        : s_cfg.slots[LED_SLOT_PROX_AWAY];
+    return CRGB(c.r, c.g, c.b);
+}
+
+// How many LEDs the sleep/alarm-gap pilot lights.
+#define LED_PROX_PILOT_LEDS  2
 
 void led_load_config() {
     led_set_defaults();
@@ -163,6 +184,11 @@ void led_off() {
     if (!s_inited) return;
     led_show_color(CRGB::Black);
 }
+void led_show_prox_pilot(LedProxVerdict verdict, bool fresh) {
+    if (!s_inited) return;
+    led_show_progress(prox_color(verdict, fresh), LED_PROX_PILOT_LEDS);
+}
+
 void led_actual_off() {
     if (!s_inited) return;
     FastLED.clear(true);
@@ -284,7 +310,18 @@ void led_update(const LedStatusInput &in) {
             // Phase from the output's own rising edge, so the first ON coincides
             // with the buzzer's. Unsigned subtraction is millis()-rollover safe.
             uint32_t phase  = (now - in.output_since_ms) % period;
-            if (phase >= a.on_ms) col = CRGB::Black;
+            if (phase >= a.on_ms) {
+                // Dark half of the blink carries the proximity pilot instead of
+                // going fully black. An alarm is the one moment the user most
+                // needs to know WHY it is ringing — on getAway a red ring means
+                // "you are still in the room", and that is only actionable if the
+                // ring also says the watch can actually see the anchor rather
+                // than having failed to reach it. Two LEDs against twelve, so the
+                // red blink still reads as the dominant signal.
+                led_show_progress(prox_color(in.prox_verdict, in.prox_fresh),
+                                  LED_PROX_PILOT_LEDS);
+                return;
+            }
         }
         led_show_color(col);
         return;
@@ -320,8 +357,20 @@ void led_update(const LedStatusInput &in) {
         return;
     }
 
-    // Enforcement, condition met: no dedicated output (retain prior behaviour).
-    if (in.enforcing) { s_clock_dirty = true; return; }
+    // Priority 3b: enforcement, condition met. This used to render nothing at all
+    // — the ring simply held whatever the last state left on it, and after
+    // led_show_prox_pilot() at the previous sleep that meant two dim LEDs. So the
+    // compliant half of a window, which is most of it, said nothing.
+    //
+    // Now it states the verdict the watch is complying on. On getAway a green ring
+    // is "I can see you are out of the room, and that is why I am quiet", orange is
+    // "I cannot tell" — two very different things that were previously the same
+    // silence, and the difference between a demo that works and one that mystifies.
+    if (in.enforcing) {
+        s_clock_dirty = true;
+        led_show_color(prox_color(in.prox_verdict, in.prox_fresh));
+        return;
+    }
 
     // Priority 4: DORMANT (paired) → keep the analog clock lit, always on. Repaint
     // only when the shown minute changes, or after another state clobbered the
