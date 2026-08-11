@@ -1688,8 +1688,14 @@ static void try_connect_saved_wifi() {
     if (g_wifi_cred_count == 0) return;
     // Attempt each saved credential
     for (int i = 0; i < g_wifi_cred_count; i++) {
-        Serial.printf("[WiFi] Attempting to connect to saved SSID \"%s\"\n", g_wifi_creds[i].ssid);
-        Serial.printf("[WiFi] Password: \"%s\"\n", g_wifi_creds[i].pass);
+        // The password's LENGTH is the diagnostic — it distinguishes "stored
+        // empty", "truncated at 63" and "stored fine" — and printing the value
+        // itself buys nothing beyond that. These logs are routinely pasted into
+        // issues, agent transcripts and the capture corpus, so the secret must
+        // not be in them. (Removed 2026-08-10 after `serial wifi` echoed a live
+        // home network's PSK straight into a session transcript.)
+        Serial.printf("[WiFi] Attempting to connect to saved SSID \"%s\" (%u-char password)\n",
+                      g_wifi_creds[i].ssid, (unsigned)strlen(g_wifi_creds[i].pass));
         WiFi.begin(g_wifi_creds[i].ssid, g_wifi_creds[i].pass);
         uint32_t t = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t < WIFI_CONNECT_TIMEOUT_MS) delay(50);
@@ -4890,8 +4896,9 @@ class WatchWifiCredCallback : public NimBLECharacteristicCallbacks {
         save_wifi_creds();
 
         // Attempt connection immediately
-        Serial.printf("[WIFI] Attempting connection to SSID: %s\n", ssid);
-        Serial.printf("[WIFI] Password: %s\n", pass);
+        // Length, not the value — same reason as try_connect_saved_wifi().
+        Serial.printf("[WIFI] Attempting connection to SSID: %s (%u-char password)\n",
+                      ssid, (unsigned)strlen(pass));
         WiFi.begin(ssid, pass);
         uint32_t t = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t < 8000) delay(50);
@@ -5795,6 +5802,145 @@ void setup() {
 // Midnight tracking
 static int g_last_mday = -1;
 
+// ============================================================
+//  Serial command handler
+// ============================================================
+// 0xAB → dump the battery log as CSV     0xAC → clear it
+// 0xAD → usage report                    0xAE → reset usage counters
+// 0xAF → wipe NVS and reboot             0xB0 → set WiFi credentials
+// 0xB1 → set the clock                   (0xAF-0xB1 are BENCH_NO_SLEEP only)
+//
+// Called from loop() BEFORE the UNPAIRED early return, and deliberately so. This
+// lived at the bottom of loop(), below that return, which meant *no* serial
+// opcode worked on a factory-blank watch — the exact state a freshly wiped bench
+// board is in, and the exact state in which you most need to provision WiFi and
+// the clock. Worse, 0xAF (wipe NVS) was unreachable on a watch that had just been
+// wiped, so the recovery path could not be re-run. Found 2026-08-10 when 0xB0 to
+// a blank watch produced no reply at all. Same reasoning as bench_tick() above
+// the same return: a tethered board is usually an unpaired one.
+static void serial_command_tick() {
+
+while (Serial.available() > 0) {
+    uint8_t cmd = (uint8_t)Serial.read();
+    if (cmd == 0xAB) {
+        batt_log_dump_serial();
+    } else if (cmd == 0xAC) {
+        batt_log_clear();
+        Serial.println("BATTLOG_CLEARED");
+    }
+#if BENCH_NO_SLEEP
+    // 0xAF → wipe NVS and reboot. Bench builds only.
+    //
+    // Needed because the §9 integrity gate is doing its job: a test harness
+    // that pushes a fresh schedule every run is, from the watch's point of
+    // view, deleting yesterday's commitment — a loosening, quarantined for
+    // 24 h. Without a wipe every repeat run inherits the previous run's
+    // schedule, pending queue and settle state, and the second test of an
+    // evening measures something other than what it thinks. A cable is
+    // already required to read this log, so this grants no escape a
+    // reflash would not.
+    else if (cmd == 0xAF) {
+        Serial.println("BENCH_NVS_ERASE — wiping NVS and rebooting");
+        Serial.flush();
+        nvs_flash_deinit();
+        nvs_flash_erase();
+        delay(100);
+        ESP.restart();
+    }
+    // 0xB0 → set WiFi credentials.  [0xB0][ssid_len][ssid][pass_len][pass]
+    //
+    // Both of the watch's provisioning paths — WiFi credentials and the
+    // clock — are BLE-only, which makes them unreachable from a bench that
+    // has a cable but no working BLE central. That is not hypothetical: on
+    // 2026-08-10 this watch sat with no credentials at all, and because WiFi
+    // is what feeds SNTP it also sat with a 1952 clock. Between them that is
+    // every anchor escalation (UDP needs the association) and every window
+    // boundary (matched on the local minute) broken at once, with a serial
+    // console right there unable to fix either.
+    //
+    // Same bargain as 0xAF above: a cable is already required, so this grants
+    // no escape a reflash would not, and it is compiled out of any build that
+    // is not a bench build.
+    else if (cmd == 0xB0) {
+        char ssid[64] = {0}, pass[64] = {0};
+        Serial.setTimeout(2000);
+        uint8_t sl = 0, pl = 0;
+        if (Serial.readBytes(&sl, 1) != 1 || sl >= sizeof(ssid)) {
+            Serial.println("BENCH_WIFI_SET: bad ssid length"); continue;
+        }
+        if (Serial.readBytes((uint8_t *)ssid, sl) != sl) {
+            Serial.println("BENCH_WIFI_SET: short ssid"); continue;
+        }
+        if (Serial.readBytes(&pl, 1) != 1 || pl >= sizeof(pass)) {
+            Serial.println("BENCH_WIFI_SET: bad pass length"); continue;
+        }
+        if (Serial.readBytes((uint8_t *)pass, pl) != pl) {
+            Serial.println("BENCH_WIFI_SET: short pass"); continue;
+        }
+        g_wifi_cred_count = 1;
+        strlcpy(g_wifi_creds[0].ssid, ssid, sizeof(g_wifi_creds[0].ssid));
+        strlcpy(g_wifi_creds[0].pass, pass, sizeof(g_wifi_creds[0].pass));
+        save_wifi_creds();
+        // Password deliberately not echoed — this log is routinely pasted
+        // into issues and agent transcripts.
+        Serial.printf("BENCH_WIFI_SET: ssid=\"%s\" (%u-char password) — connecting\n",
+                      g_wifi_creds[0].ssid, (unsigned)pl);
+        try_connect_saved_wifi();
+        Serial.printf("BENCH_WIFI_SET: %s\n",
+                      g_wifi_connected ? "CONNECTED" : "FAILED");
+        if (g_wifi_connected) recalculate_and_rearm();
+    }
+    // 0xB1 → set the clock.  [0xB1][utc_epoch u32 LE][tz_offset_min i16 LE]
+    //
+    // The BLE Time characteristic's §9.7 guard (a clock write may not escape
+    // the active enforcement window) is deliberately NOT applied here. That
+    // guard defends a commitment against its owner holding the phone; this
+    // opcode is only reachable with a cable and only in a bench build, and
+    // its whole purpose is repositioning the clock to line a window up for a
+    // test or a take. Enforcing it would make the opcode useless in exactly
+    // the case it exists for.
+    else if (cmd == 0xB1) {
+        uint8_t b[6];
+        Serial.setTimeout(2000);
+        if (Serial.readBytes(b, 6) != 6) {
+            Serial.println("BENCH_TIME_SET: short payload"); continue;
+        }
+        uint32_t epoch = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                         ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+        int16_t  tz    = (int16_t)((uint16_t)b[4] | ((uint16_t)b[5] << 8));
+
+        g_tz_offset_min = tz;
+        prefs.begin("watch", false);
+        prefs.putShort("tz_off", g_tz_offset_min);
+        prefs.end();
+        configTime((long)g_tz_offset_min * 60, 0, "pool.ntp.org");
+
+        struct timeval tv;
+        tv.tv_sec  = (time_t)epoch;
+        tv.tv_usec = 0;
+        settimeofday(&tv, nullptr);
+
+        time_t lt = local_now();
+        struct tm ti;
+        gmtime_r(&lt, &ti);
+        Serial.printf("BENCH_TIME_SET: epoch=%lu tz=%d → local %04d-%02d-%02d %02d:%02d:%02d\n",
+                      (unsigned long)epoch, (int)tz,
+                      ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                      ti.tm_hour, ti.tm_min, ti.tm_sec);
+        recalculate_and_rearm();
+    }
+#endif
+#if MEASURE_USAGE
+    else if (cmd == 0xAD) {
+        usage_report();
+    } else if (cmd == 0xAE) {
+        usage_reset();
+        Serial.println("USAGE_RESET");
+    }
+#endif
+}
+}
+
 void loop() {
     uint32_t now_ms  = millis();
     uint32_t now_min = local_minutes_now();
@@ -5882,6 +6028,9 @@ void loop() {
     // factory-blank watch, which is exactly the state a tethered board is in.
     bench_tick();
 #endif
+
+    // Serial opcodes work in every state, including UNPAIRED (see above).
+    serial_command_tick();
 
     if (g_activity_state == STATE_UNPAIRED) {
         led_update(led_status_input());  // ring stays off until paired (§5.7)
@@ -6066,129 +6215,6 @@ void loop() {
         // Returns here after wakeup (already transitioned back to DORMANT)
     }
 
-    // ---- Serial command handler ----
-    // 0xAB  → dump full battery log as CSV over serial
-    // 0xAC  → clear the battery log
-    
-    while (Serial.available() > 0) {
-        uint8_t cmd = (uint8_t)Serial.read();
-        if (cmd == 0xAB) {
-            batt_log_dump_serial();
-        } else if (cmd == 0xAC) {
-            batt_log_clear();
-            Serial.println("BATTLOG_CLEARED");
-        }
-#if BENCH_NO_SLEEP
-        // 0xAF → wipe NVS and reboot. Bench builds only.
-        //
-        // Needed because the §9 integrity gate is doing its job: a test harness
-        // that pushes a fresh schedule every run is, from the watch's point of
-        // view, deleting yesterday's commitment — a loosening, quarantined for
-        // 24 h. Without a wipe every repeat run inherits the previous run's
-        // schedule, pending queue and settle state, and the second test of an
-        // evening measures something other than what it thinks. A cable is
-        // already required to read this log, so this grants no escape a
-        // reflash would not.
-        else if (cmd == 0xAF) {
-            Serial.println("BENCH_NVS_ERASE — wiping NVS and rebooting");
-            Serial.flush();
-            nvs_flash_deinit();
-            nvs_flash_erase();
-            delay(100);
-            ESP.restart();
-        }
-        // 0xB0 → set WiFi credentials.  [0xB0][ssid_len][ssid][pass_len][pass]
-        //
-        // Both of the watch's provisioning paths — WiFi credentials and the
-        // clock — are BLE-only, which makes them unreachable from a bench that
-        // has a cable but no working BLE central. That is not hypothetical: on
-        // 2026-08-10 this watch sat with no credentials at all, and because WiFi
-        // is what feeds SNTP it also sat with a 1952 clock. Between them that is
-        // every anchor escalation (UDP needs the association) and every window
-        // boundary (matched on the local minute) broken at once, with a serial
-        // console right there unable to fix either.
-        //
-        // Same bargain as 0xAF above: a cable is already required, so this grants
-        // no escape a reflash would not, and it is compiled out of any build that
-        // is not a bench build.
-        else if (cmd == 0xB0) {
-            char ssid[64] = {0}, pass[64] = {0};
-            Serial.setTimeout(2000);
-            uint8_t sl = 0, pl = 0;
-            if (Serial.readBytes(&sl, 1) != 1 || sl >= sizeof(ssid)) {
-                Serial.println("BENCH_WIFI_SET: bad ssid length"); continue;
-            }
-            if (Serial.readBytes((uint8_t *)ssid, sl) != sl) {
-                Serial.println("BENCH_WIFI_SET: short ssid"); continue;
-            }
-            if (Serial.readBytes(&pl, 1) != 1 || pl >= sizeof(pass)) {
-                Serial.println("BENCH_WIFI_SET: bad pass length"); continue;
-            }
-            if (Serial.readBytes((uint8_t *)pass, pl) != pl) {
-                Serial.println("BENCH_WIFI_SET: short pass"); continue;
-            }
-            g_wifi_cred_count = 1;
-            strlcpy(g_wifi_creds[0].ssid, ssid, sizeof(g_wifi_creds[0].ssid));
-            strlcpy(g_wifi_creds[0].pass, pass, sizeof(g_wifi_creds[0].pass));
-            save_wifi_creds();
-            // Password deliberately not echoed — this log is routinely pasted
-            // into issues and agent transcripts.
-            Serial.printf("BENCH_WIFI_SET: ssid=\"%s\" (%u-char password) — connecting\n",
-                          g_wifi_creds[0].ssid, (unsigned)pl);
-            try_connect_saved_wifi();
-            Serial.printf("BENCH_WIFI_SET: %s\n",
-                          g_wifi_connected ? "CONNECTED" : "FAILED");
-            if (g_wifi_connected) recalculate_and_rearm();
-        }
-        // 0xB1 → set the clock.  [0xB1][utc_epoch u32 LE][tz_offset_min i16 LE]
-        //
-        // The BLE Time characteristic's §9.7 guard (a clock write may not escape
-        // the active enforcement window) is deliberately NOT applied here. That
-        // guard defends a commitment against its owner holding the phone; this
-        // opcode is only reachable with a cable and only in a bench build, and
-        // its whole purpose is repositioning the clock to line a window up for a
-        // test or a take. Enforcing it would make the opcode useless in exactly
-        // the case it exists for.
-        else if (cmd == 0xB1) {
-            uint8_t b[6];
-            Serial.setTimeout(2000);
-            if (Serial.readBytes(b, 6) != 6) {
-                Serial.println("BENCH_TIME_SET: short payload"); continue;
-            }
-            uint32_t epoch = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
-                             ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
-            int16_t  tz    = (int16_t)((uint16_t)b[4] | ((uint16_t)b[5] << 8));
-
-            g_tz_offset_min = tz;
-            prefs.begin("watch", false);
-            prefs.putShort("tz_off", g_tz_offset_min);
-            prefs.end();
-            configTime((long)g_tz_offset_min * 60, 0, "pool.ntp.org");
-
-            struct timeval tv;
-            tv.tv_sec  = (time_t)epoch;
-            tv.tv_usec = 0;
-            settimeofday(&tv, nullptr);
-
-            time_t lt = local_now();
-            struct tm ti;
-            gmtime_r(&lt, &ti);
-            Serial.printf("BENCH_TIME_SET: epoch=%lu tz=%d → local %04d-%02d-%02d %02d:%02d:%02d\n",
-                          (unsigned long)epoch, (int)tz,
-                          ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
-                          ti.tm_hour, ti.tm_min, ti.tm_sec);
-            recalculate_and_rearm();
-        }
-#endif
-#if MEASURE_USAGE
-        else if (cmd == 0xAD) {
-            usage_report();
-        } else if (cmd == 0xAE) {
-            usage_reset();
-            Serial.println("USAGE_RESET");
-        }
-#endif
-    }
 
     // ---- Commitment-integrity tick (§9.2/§9.4) ----
     // Settle promotion + autonomous pending promotion. The loop runs after
